@@ -362,7 +362,7 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 | Сценарий | Результат |
 |---|---|
 | один забег Swordsman/Prontera/D1 | победа; 2 358 убийств, 58 704 зеньги, 13 001 XP, 1 Ymir, 2 карты, 8 elu + 10 ori; keep 3 предмета; `phase=done` |
-| endless 1 мин / 2 MVP | первый MVP → `continue_endless`, второй MVP → `ENDLESS_DONE`, победа, keep 3; без ложных срабатываний `raid.state` |
+| endless 1 мин / 2 MVP | финальная сборка `51770c…`: `ENDLESS_START n=1` → `STALE_VICTORY close` (меню от прошлого MVP) → `BOSS_WON mvps=2` → `ENDLESS_DONE`, `SETTLE victory=true`; 5 598 убийств, 137 575 z, 38 857 XP, keep 3 |
 | party Thief + Acolyte + Archer/D6 | `job=assassin_cross`, пати `high_priest` (путь 0) и `bard` (путь 1), 8/9 скиллов, 5 995 убийств за 300 game-sec, без смертей |
 | maintenance на endgame-профиле | апгрейд Kafra, Sage, fuse +43, альбом 4 карты, loadout 4 слота, питомец, 3 ролла Potential; награды забега считаются до трат |
 | stop по `max_minutes` | STOP → `_end_run(false)` → settle/keep → FINISH; частичные награды забанкованы, `run.sh` вернул 0 |
