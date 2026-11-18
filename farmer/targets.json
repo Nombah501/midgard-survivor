@@ -1,0 +1,69 @@
+{
+  "characters": {
+    "sinx": {
+      "class": "thief",
+      "job_path": 0,
+      "label": "Assassin Cross (SinX)"
+    },
+    "sniper": {
+      "class": "archer",
+      "job_path": 0,
+      "label": "Sniper"
+    },
+    "bard": {
+      "class": "archer",
+      "job_path": 1,
+      "label": "Bard"
+    },
+    "knight": {
+      "class": "swordsman",
+      "job_path": 0,
+      "label": "Knight"
+    },
+    "crusader": {
+      "class": "swordsman",
+      "job_path": 1,
+      "label": "Crusader"
+    },
+    "high_priest": {
+      "class": "acolyte",
+      "job_path": 0,
+      "label": "High Priest"
+    },
+    "professor": {
+      "class": "mage",
+      "job_path": 0,
+      "label": "Professor"
+    },
+    "blacksmith": {
+      "class": "merchant",
+      "job_path": 0,
+      "label": "Blacksmith"
+    }
+  },
+  "stages": {
+    "prontera": "Prontera Field",
+    "payon": "Payon Forest",
+    "pay_cave": "Payon Cave",
+    "orc": "Orc Village",
+    "orc_dun": "Orc Dungeon",
+    "glast": "Glast Heim",
+    "nameless": "Nameless Island",
+    "abbey": "Cursed Abbey",
+    "culvert": "Prontera Culvert",
+    "byalan": "Byalan Island",
+    "turtle": "Turtle Island",
+    "pyramid": "Pyramid",
+    "anthell": "Ant Hell",
+    "mjolnir": "Mjolnir Dead Pit",
+    "clock_tower": "Clock Tower",
+    "niflheim": "Niflheim",
+    "juperos": "Juperos",
+    "toy_factory": "Toy Factory",
+    "thanatos": "Thanatos Tower",
+    "biolab": "Bio Laboratory",
+    "ice_dun": "Ice Cave",
+    "ra_san": "Rachel Sanctuary",
+    "thor": "Thor Volcano"
+  }
+}
