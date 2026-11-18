@@ -1,9 +1,9 @@
 # Фермер для Midgard Survivors 0.2.3
 
-Автономный фарм-раннер: играет настоящие одиночные забеги (при желании — с
-двумя AI-саппортами), сам ведёт draft, меняет профессию, добивает MVP, забирает
-добычу, тратит ресурсы на постоянное усиление и запускает следующий забег.
-Награды начисляет штатный `_end_run()` игры; профиль не редактируется напрямую.
+Автономный соло-фарм-раннер: играет настоящие одиночные забеги, сам ведёт
+draft, меняет профессию, добивает MVP, забирает добычу и запускает следующий
+забег. Награды начисляет штатный `_end_run()` игры; профиль не редактируется
+напрямую.
 
 Патчатся два скрипта: `scripts/autoload/save.gdc` (bootstrap-хук) и
 `scripts/core/player.gdc` (`next_job` уважает `Save` meta `farmer_job_paths`,
@@ -17,6 +17,7 @@ cd /home/n501/orca/projects/midgard-survivor/farmer
 ./build.sh                 # собрать патч из текущего официального патча
 ./install.sh               # поставить в слот обновления игры
 ./run.sh presets/one-run.json   # проверка: один забег, Prontera, danger 1
+./run.sh presets/synx-hell.json # solo SinX, Prontera D25 (hell 10), 30-40 min
 ./run.sh presets/steady.json    # бесконечный авто-фарм
 ```
 
@@ -59,7 +60,7 @@ SHA официального патча и установленного ферм
 | `presets/steady.json` | авто-класс, авто-стадия/danger, апгрейды, карты, loadout, питомец |
 | `presets/zeny.json` | цель — зеньги; авто-подбор danger по измеренной доходности |
 | `presets/crumbs.json` | цель — Star Crumb: danger 25+, endless до 6 минут / 8 MVP |
-| `presets/party.json` | Thief + High Priest + Bard на Prontera D15 |
+| `presets/synx-hell.json` | соло SinX, Prontera danger 25 (hell 10), cap 23 game-min (≈30-40 real min при speed 1.3), профильные приоритеты, без трат |
 | `presets/progress.json` | продавливание максимального danger, rebirth |
 | `presets/night.json` | ночной сбалансированный фарм, 8 часов, короткий endless |
 
@@ -74,11 +75,10 @@ SHA официального патча и установленного ферм
 3. Движение игрока заменяется своим `HeroInput`: приоритеты — механики MVP →
    Golden Poring → ценный пикап → алтарь → квест → бой/отступление.
 4. Level-up: `offered_choices()` → собственный планировщик → `apply_choice()`
-   без UI. Для героев пати — то же с их саппорт-билдом.
+   без UI. Приоритеты берутся из профиля (`pick_order`/`pick_limits`), если
+   конфиг не задаёт `builds` явно.
 5. Job change: микро-патч `Player.next_job` читает `Save` meta
-   `farmer_job_paths`, поэтому и штатное меню (оно выбирает путь в том же
-   кадре), и пати получают заданную ветку. Игрок дополнительно вызывает
-   `world.do_job_change(path)`; стартовый скилл — из приоритета билда.
+   `farmer_job_paths`, поэтому штатное меню выбирает заданную ветку.
 6. Победа: `raid.state=="won"` своей арены или `menus._mode=="victory"`.
    Игра не завершает забег сама (мета `GameData.karma_test`), поэтому фермер
    решает: `continue_endless()` или `_end_run(true)`.
@@ -99,7 +99,6 @@ SHA официального патча и установленного ферм
 | `objective` | `balanced` | `zeny`, `ores`, `crumbs`, `xp`, `cards`, `pets`, `coins`, `progress`, `balanced` |
 | `weights` | см. код | ценность единицы ресурса для выбора руки |
 | `class`/`classes`/`class_rotate` | `""`/`[]`/`false` | класс игрока |
-| `party` | `[]` | AI-саппорты (до 2; каждый +60% спавна и −XP) |
 | `builds` | `{}` | билды по классам: `job_path`, `skills`, `stats`, `caps`, `junk` |
 | `stage`/`danger` | `""`/`auto` | фиксация цели; `danger`: `auto`, число, `best`, `max` |
 | `danger_ceiling` | 30 | верхняя граница автоподбора |
@@ -131,7 +130,7 @@ SHA официального патча и установленного ферм
 `profile` (зеньги, склад, материалы) и `game` (hp/level/time).
 
 `farmer_runs.jsonl` — по строке на забег: победа, время (wall/game), убийства,
-зеньги, XP, дельты материалов/карт/питомцев/coins/ymir, keep, `job`, `party_state`.
+зеньги, XP, дельты материалов/карт/питомцев/coins/ymir, keep, `job`.
 `farmer_status.json.run` показывает незавершённую победу (`won_at`, `boss_won`,
 `endless_*`) — это отладочный срез, а не результат забега.
 
@@ -157,9 +156,11 @@ SHA официального патча и установленного ферм
 - На danger 26–30 кумулятивные механики Hell могут убивать: автоподбор отступит
   по метрикам, но гарантий выживания нет.
 - Онлайн-функции отключены при `offline:true` (лидерборды/Epic/cloud).
-- Trans-ветка пати зависит от профиля (`Save.is_reborn(class)`); фермер не
-  подменяет rebirth пати-героям. `presets/party.json` проверен на профиле, где
-  acolyte уже reborn (High Priest).
+- `synx-hell` рассчитан на профиль с уже собранным SinX: фермер не покупает
+  снаряжение и не перекладывает loadout, только играет забеги и забирает лут.
+  Автопилот на D25 умирает около 25.5 game-min, поэтому пресет заканчивает
+  забег на 23 game-min и запускает следующий: смертей нет, ~30-40 реальных
+  минут на забег при `speed:1.3`.
 
 ## Обновление игры
 

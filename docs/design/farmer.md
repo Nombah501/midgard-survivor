@@ -40,8 +40,6 @@
   loot; финальный экран; keep; следующий забег;
 - адаптация danger/стадии по измеренной доходности (зеньги, ore, XP, карты,
   питомцы, coins, crumbs);
-- партия из конфига (до 2 саппортов), их draft/job/поддержка — легально, через
-  тот же draft;
 - город без входа в город: апгрейды Kafra/Sage, rebirth, классовые статы,
   достижения, fusion карт, альбом, loadout, питомец, Star Smith (опция),
   очистка склада (опция);
@@ -88,8 +86,8 @@ farmer/
 
 | Решение | Механизм |
 |---|---|
-| draft | `player.offered_choices()` → свой выбор → `apply_choice`; `offer=[]`, `pending_levels-=1` (и для героев пати) |
-| job | `Save` meta `farmer_job_paths` + micro-patch `Player.next_job` (штатный UI выбирает случайный путь в том же кадре; polling проигрывает гонку); пати — тот же seam |
+| draft | `player.offered_choices()` → свой выбор → `apply_choice`; `offer=[]`, `pending_levels-=1` |
+| job | `Save` meta `farmer_job_paths` + micro-patch `Player.next_job` (штатный UI выбирает случайный путь в том же кадре; polling проигрывает гонку) |
 | стартовый скилл | `h.set_job_skill(id)` из легальных `job_start_options()` |
 | движение | `player.input = FarmerInput.new(brain)` (наследник `HeroInput`); autopilot остаётся включённым для прочих эффектов |
 | loot roll | `menus.auto_pick=true` (игра сама зовёт `LootRoll.auto_pick`) |
@@ -163,8 +161,8 @@ rate = value / wall_seconds
 5. `potion` — последним.
 
 Применяем циклом до `pending_levels==0` (без UI и без паузы); хомуна кулус
-подхватываем как игра (`homun_pick`). Для героев пати — их `build` (саппорт).
-`pick_limits`/`run_bans` не используем: не нужны, т.к. выбор делаем сами.
+подхватываем как игра (`homun_pick`). Приоритеты скиллов/статов берём из
+профиля (`pick_order`/`pick_limits`), если конфиг не задаёт `builds` явно.
 
 ### 5.4 Бой и движение
 
@@ -179,7 +177,7 @@ rate = value / wall_seconds
    HP≥70%, не в арене; Hypnotist не трогаем (autopilot его подавляет).
 6. `quest.autopilot_goal()` если не INF.
 7. Иначе `Bot.steer(self, INF, hero)` — штатное уклонение/сближение.
-8. HP<25% и нет пати-хилера → `Bot.steer` к позиции «прочь от ближайшей пачки».
+8. HP<25% → `Bot.steer` к позиции «прочь от ближайшей пачки».
 
 Атаки игра делает сама (`Player.tick`), менять их не нужно.
 
@@ -278,7 +276,6 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
   "objective": "balanced",          // zeny|ores|crumbs|xp|cards|pets|coins|progress|balanced
   "weights": {"zeny":1,"ore":2500,"crumb":60000,"tear":200000,"xp":1,"card":50000,"pet":200000,"coin":20000,"ymir":100000},
   "class": "", "classes": [], "class_rotate": false,
-  "party": [], "party_builds": {"acolyte":"support_priest","archer":"bard"},
   "stage": "", "stage_pool": [], "danger": "auto", "danger_ceiling": 30,
   "auto_danger": true, "explore_every": 5, "danger_step": 1,
   "featured_bonus": true,
@@ -317,7 +314,7 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 {
  "session":"20261119-015500-ab12","pid":1234,"phase":"run","heartbeat":1763...,
  "uptime_s":3600,"build":{"patch_sha":"…","game":"0.2.3","api":3},
- "objective":"balanced","target":{"stage":"thanatos","danger":11,"class":"thief","party":[]},
+ "objective":"balanced","target":{"stage":"thanatos","danger":11,"class":"thief"},
  "totals":{"runs":12,"wins":10,"losses":2,"deaths":2,"timeouts":0,
            "zeny":12345678,"kills":123456,"class_xp":987654,
            "materials":{...},"coins":42,"ymir":3},
@@ -342,12 +339,17 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 3. `./tools/verify.sh` — sandbox-матрица `one-run`, `stop`, `endless`; у каждого
    сценария свой timeout; проверяются exit 0, `phase=done`, победа/частичный
    банк/`ENDLESS_DONE`; результат — `farmer/logs/verify-*/summary.json`.
-4. Sandbox: `max_runs:3` на целевой руке → нет двойного банка, нет потери loot,
+4. `./run.sh presets/synx-hell.json` — solo SinX, Prontera D25 (hell 10),
+   профильные `pick_order`/`pick_limits`; `speed:1.3`, cap 23 game-min
+   (≈30-40 реальных минут) до наблюдённой смерти автопилота на ~25.5 game-min;
+   проверить `PROFILE_BUILD`, `job=assassin_cross`, `died=false` и дельты
+   зеньги/руды/крошек.
+5. Sandbox: `max_runs:3` на целевой руке → нет двойного банка, нет потери loot,
    rate считается, stop-файл завершает штатно.
-5. Ночной прогон (`max_minutes:120`) → нет утечек/зависаний, статус живой,
+6. Ночной прогон (`max_minutes:120`) → нет утечек/зависаний, статус живой,
    бэкапы не перезаписаны, профиль читается игрой.
-6. Отдельно: поражение (danger+10) → defeat, банк частичных наград, danger−1.
-7. Отдельно: полный склад → keep делает swap/пропуск, не теряет предметы.
+7. Отдельно: поражение (danger+10) → defeat, банк частичных наград, danger−1.
+8. Отдельно: полный склад → keep делает swap/пропуск, не теряет предметы.
 
 ## 11. Риски
 
@@ -370,14 +372,19 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 |---|---|---|
 | один забег Swordsman/Prontera/D1 | `cb571a15` | победа; 2 136 убийств, 59 670 z, 15 220 XP, 2 карты, keep 3; `PAUSE_STALL` через 45 с → продолжение; `phase=done` |
 | endless 1 мин / 2 MVP | `cb571a15` | `PAUSE_STALL` → `ENDLESS_START n=1` → `STALE_VICTORY close` (меню от прошлого MVP) → `BOSS_WON mvps=2` → `ENDLESS_DONE`, `SETTLE victory=true`; 4 105 убийств, 108 236 z, 42 406 XP, 6 карт, keep 3 |
-| party Thief + Acolyte + Archer/D6 | ранее | `job=assassin_cross`, пати `high_priest` (путь 0) и `bard` (путь 1), 8/9 скиллов, 5 995 убийств за 300 game-sec, без смертей |
 | maintenance на endgame-профиле | ранее | апгрейд Kafra, Sage, fuse +43, альбом 4 карты, loadout 4 слота, питомец, 3 ролла Potential; награды забега считаются до трат |
 | stop по `max_minutes` | `cb571a15` | `PAUSE_STALL` через 10 с → `STOP max_minutes` → `_end_run(false)` → settle/keep → FINISH; 2 146 убийств, 38 601 z, 10 401 XP, 1 карта; `run.sh` вернул 0 |
+| solo SinX Prontera D25 (hell 10), 2 min smoke | `267a2584` | `PROFILE_BUILD` прочитан и не перезаписан; `job=assassin_cross`; 6 220 убийств, 612 561 z, 15 elu + 10 ori + 1 enriched + 1 legend coin, 1 347 711 XP; `died=false`; остановлен `max_minutes`, не смертью |
+| solo SinX Prontera D25, полный забег | `267a2584` | 8 MVP, 27 489 убийств, 4 484 515 z, 62 elu + 62 ori + 8 enriched elu + 8 enriched ori + 1 HD ori + 4 legend coin + 8 star crumb, 8 Ymir, 9 918 258 XP; `died=true` на 1 527 game-s (25.5 game-min, 716 s wall), забег закрыт как endless victory |
 | install/uninstall | ранее | state.json переключается на `patch_farmer.pck` и обратно; SHA проверяются; профиль/логи сохраняются |
 | `-- --endless` | — | **не использовать**: Updater видит `--...` и не монтирует патчи; endless включается метой `karma_test` |
 
-Строки `cb571a15` получены `./tools/verify.sh`; источник чисел —
-`farmer/logs/verify-*/summary.json`. Партия и maintenance проверялись на
-предыдущих сборках и на `cb571a15` не перепроверялись.
+Строки `cb571a15` получены `./tools/verify.sh`; источники чисел —
+`farmer/logs/verify-*/summary.json`. Строки `267a2584` — solo SinX на профиле:
+короткий smoke и полный забег; последний умер на 25.5 game-min, поэтому
+`synx-hell` теперь ставит cap 23 game-min и `speed:1.3` (~30-40 реальных минут)
+и перезапускает забег до смерти. Maintenance проверялся на предыдущих сборках;
+партия удалена. Финальная сборка после удаления партии — `fbd0597a`; короткий
+cap-smoke на ней был заблокирован запущенной игрой.
 
 Все прогоны — на копии профиля; основной профиль не изменялся.

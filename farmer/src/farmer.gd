@@ -57,7 +57,6 @@ var total_materials: Dictionary = {}
 var active_class := ""
 var active_stage := ""
 var active_danger := 1
-var active_party: Array = []
 var next_arm_hint := ""
 
 var run_state: Dictionary = {}
@@ -231,7 +230,6 @@ func _prepare_run() -> void:
 	active_stage = str(target.get("stage", ""))
 	active_danger = int(target.get("danger", 1))
 	active_class = str(target.get("class", ""))
-	active_party = (target.get("party", []) as Array).duplicate()
 	if active_class == "" or active_stage == "":
 		_finish("no_target")
 		return
@@ -240,7 +238,6 @@ func _prepare_run() -> void:
 	run_state["class"] = active_class
 	run_state["stage"] = active_stage
 	run_state["danger"] = active_danger
-	run_state["party"] = active_party.duplicate()
 	run_state["stage_min_danger"] = _stage_min_danger(active_stage)
 	run_state["victory"] = false
 	run_state["forced"] = false
@@ -265,18 +262,11 @@ func _prepare_run() -> void:
 	world.set_stage(active_stage)
 	world.danger = active_danger
 	world.speed = clampi(int(cfg.get("game_speed", 3)), 1, 3)
-	world.coop_classes.clear()
-	for c in active_party:
-		var cid := str(c)
-		if GameData.CLASSES.has(cid):
-			world.coop_classes.append(cid)
 	Save.set_setting("onboarded", true)
 	Save.set_setting("endless_auto_pick", false)
 	var job_paths := {}
-	for jc in [active_class] + active_party:
-		var jcid := str(jc)
-		if GameData.CLASSES.has(jcid):
-			job_paths[jcid] = _job_path(jcid)
+	if GameData.CLASSES.has(active_class):
+		job_paths[active_class] = _job_path(active_class)
 	Save.set_meta("farmer_job_paths", job_paths)
 	world.start_run(active_class)
 	_replace_player_input()
@@ -284,8 +274,8 @@ func _prepare_run() -> void:
 	Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
 	runs_started += 1
 	phase = "run"
-	_log("START #%d class=%s stage=%s danger=%d party=%s speed=%.1f" % [
-		runs_started, active_class, active_stage, active_danger, str(active_party), float(cfg.get("speed", 4.0))])
+	_log("START #%d class=%s stage=%s danger=%d speed=%.1f" % [
+		runs_started, active_class, active_stage, active_danger, float(cfg.get("speed", 4.0))])
 	_write_status()
 
 
@@ -306,7 +296,6 @@ func _tick_run(now: int) -> void:
 	_replace_player_input()
 	_handle_job_change(world.player)
 	_draft_player()
-	_party_control()
 	_handle_victory(now)
 	if world == null or not is_instance_valid(world):
 		return
@@ -597,21 +586,6 @@ func _draft_player() -> void:
 				get_tree().paused = false
 
 
-func _party_control() -> void:
-	if world == null or not is_instance_valid(world):
-		return
-	var heroes: Array = world.heroes
-	for h in heroes:
-		if h == null or not is_instance_valid(h):
-			continue
-		if h == world.player:
-			continue
-		if bool(h.downed) or bool(h.fell):
-			continue
-		_handle_job_change(h)
-		_draft_hero(h, 8)
-
-
 func _draft_hero(h, limit: int) -> void:
 	if h == null or not is_instance_valid(h):
 		return
@@ -820,7 +794,7 @@ func _steer_goal(hero) -> Vector3:
 		if qg != Vector3.INF:
 			return qg
 	var hp_ratio := float(hero.hp) / maxf(1.0, float(hero.max_hp))
-	if hp_ratio < 0.25 and not _party_has_healer():
+	if hp_ratio < 0.25:
 		var away := _retreat_point(hero)
 		if away != Vector3.INF:
 			return away
@@ -915,17 +889,6 @@ func _best_altar(hero) -> Vector3:
 			best_dist = dist
 			best = pos
 	return best
-
-
-func _party_has_healer() -> bool:
-	if world == null or not is_instance_valid(world):
-		return false
-	for h in world.heroes:
-		if h == null or not is_instance_valid(h) or bool(h.downed):
-			continue
-		if h.skills.has("heal") or h.skills.has("sanctuary") or h.skills.has("gospel"):
-			return true
-	return false
 
 
 func _retreat_point(hero) -> Vector3:
@@ -1158,8 +1121,6 @@ func _do_maintenance() -> void:
 		_do_rebirth(cid)
 	if bool(cfg.get("auto_stats", true)):
 		_auto_stats(cid)
-		for c in active_party:
-			_auto_stats(str(c))
 	if bool(cfg.get("auto_fuse", true)):
 		_auto_fuse()
 	if bool(cfg.get("auto_cards", true)):
@@ -1423,14 +1384,7 @@ func _auto_loadout(cid: String) -> void:
 		return
 	if world.menus == null or not is_instance_valid(world.menus):
 		return
-	var classes: Array = [cid]
-	for c in active_party:
-		var pcid := str(c)
-		if GameData.CLASSES.has(pcid) and not classes.has(pcid):
-			classes.append(pcid)
-	var changes := 0
-	for cc in classes:
-		changes += _loadout_for(str(cc))
+	var changes := _loadout_for(cid)
 	if changes > 0:
 		last_maint["loadout"] = changes
 		_log("LOADOUT changes=%d" % changes)
@@ -1684,10 +1638,9 @@ func _choose_target() -> Dictionary:
 	if stage == "":
 		return {}
 	var cid := _choose_class()
-	var party := _choose_party()
 	danger = clampi(danger, _stage_min_danger(stage), mini(_stage_max_danger(stage), int(cfg.get("danger_ceiling", 30))))
-	_log("TARGET stage=%s danger=%d class=%s party=%s" % [stage, danger, cid, str(party)])
-	return {"stage": stage, "danger": danger, "class": cid, "party": party}
+	_log("TARGET stage=%s danger=%d class=%s" % [stage, danger, cid])
+	return {"stage": stage, "danger": danger, "class": cid}
 
 
 func _pick_arm() -> Dictionary:
@@ -1871,18 +1824,6 @@ func _class_ok(cid: String) -> bool:
 	return bool(Save.class_unlocked(cid))
 
 
-func _choose_party() -> Array:
-	var out: Array = []
-	var list: Array = cfg.get("party", [])
-	for c in list:
-		var cid := str(c)
-		if GameData.CLASSES.has(cid) and not out.has(cid):
-			out.append(cid)
-		if out.size() >= 2:
-			break
-	return out
-
-
 func _goal_stage() -> String:
 	var cards: Array = _goal_cards()
 	var pets: Array = _goal_pets()
@@ -1992,6 +1933,25 @@ func _build_for(cid: String) -> Dictionary:
 	var builds = cfg.get("builds", {})
 	if builds is Dictionary and builds.get(cid) is Dictionary:
 		return builds[cid]
+	# The game stores the player's level-up order in Save; use it unless the
+	# config explicitly provides a build. This keeps a customized SinX build.
+	var orders = Save.setting("pick_order", {})
+	if orders is Dictionary:
+		var raw_order = orders.get(cid, [])
+		if raw_order is Array and not raw_order.is_empty():
+			var pskills: Array = []
+			var pstats: Array = []
+			for id in raw_order:
+				var sid := str(id)
+				if GameData.STATS.has(sid):
+					pstats.append(sid)
+				else:
+					pskills.append(sid)
+			var pcaps: Dictionary = {}
+			var limits = Save.setting("pick_limits", {})
+			if limits is Dictionary and limits.get(cid) is Dictionary:
+				pcaps = (limits[cid] as Dictionary).duplicate()
+			return {"skills": pskills, "stats": pstats, "caps": pcaps}
 	var out := {"skills": [], "stats": []}
 	var d: Dictionary = GameData.CLASSES.get(cid, {})
 	if d.is_empty():
@@ -2052,10 +2012,18 @@ func _job_path(cid: String) -> int:
 
 func _apply_build_settings(cid: String) -> void:
 	var b: Dictionary = _build_for(cid)
-	var order: Array = b.get("skills", [])
 	var orders: Dictionary = Save.setting("pick_order", {})
 	if not (orders is Dictionary):
 		orders = {}
+	var existing = orders.get(cid, [])
+	if existing is Array and not existing.is_empty() and not bool(cfg.get("override_pick_order", false)):
+		var limits = Save.setting("pick_limits", {})
+		var mine = limits.get(cid, {}) if limits is Dictionary else {}
+		_log("PROFILE_BUILD class=%s order=%s limits=%s" % [cid, str(existing), str(mine)])
+		return
+	var order: Array = b.get("pick_order", [])
+	if order.is_empty():
+		order = (b.get("skills", []) as Array) + (b.get("stats", []) as Array)
 	orders[cid] = order
 	Save.set_setting("pick_order", orders)
 	var limits: Dictionary = b.get("caps", {})
@@ -2165,7 +2133,6 @@ func _build_result() -> Dictionary:
 		"class": active_class,
 		"stage": active_stage,
 		"danger": active_danger,
-		"party": active_party.duplicate(),
 		"victory": bool(run_state.get("victory", false)),
 		"died": bool(run_state.get("died", false)),
 		"forced": bool(run_state.get("forced", false)),
@@ -2190,7 +2157,6 @@ func _build_result() -> Dictionary:
 		"class_ups": maxi(0, level_now - int(run_state.get("class_level", level_now))) + maxi(0, rlv_now - int(run_state.get("class_rlv", rlv_now))) * 50,
 		"player_level": int(p.level) if p != null and is_instance_valid(p) else 0,
 		"job": str(p.job2.get("id", "")) if p != null and is_instance_valid(p) else "",
-		"party_state": _party_state_snapshot(),
 		"max_danger": int(Save.max_danger()) if Save.has_method("max_danger") else 0,
 		"kept": run_state.get("kept", []),
 		"value": 0.0,
@@ -2199,24 +2165,6 @@ func _build_result() -> Dictionary:
 	result["value"] = _run_value(result)
 	result["rate"] = float(result["value"]) / maxf(1.0, wall)
 	return result
-
-
-func _party_state_snapshot() -> Array:
-	var out: Array = []
-	if world == null or not is_instance_valid(world):
-		return out
-	var heroes: Array = world.heroes
-	for h in heroes:
-		if h == null or not is_instance_valid(h) or h == world.player:
-			continue
-		out.append({
-			"class": str(h.class_id),
-			"job": str(h.job2.get("id", "")),
-			"level": int(h.level),
-			"downed": bool(h.downed),
-			"skills": (h.skills.keys() as Array).size(),
-		})
-	return out
 
 
 func _run_value(r: Dictionary) -> float:
@@ -2295,7 +2243,7 @@ func _load_cfg() -> bool:
 		"objective": "balanced",
 		"weights": {},
 		"class": "", "classes": [], "class_rotate": false,
-		"party": [], "party_builds": {}, "builds": {},
+		"builds": {},
 		"stage": "", "danger": "auto", "danger_ceiling": 30,
 		"auto_danger": true, "explore_every": 5, "danger_step": 1,
 		"featured_bonus": true,
@@ -2338,8 +2286,6 @@ func _load_cfg() -> bool:
 		errors.append("weights must be an object")
 	if not (cfg.get("builds") is Dictionary):
 		errors.append("builds must be an object")
-	if not (cfg.get("party") is Array):
-		errors.append("party must be an array")
 	if not (cfg.get("classes") is Array):
 		errors.append("classes must be an array")
 	if not (cfg.get("goals") is Dictionary):
@@ -2395,7 +2341,7 @@ func _write_status() -> void:
 		"api": API_VERSION,
 		"build": _build_info(),
 		"objective": str(cfg.get("objective", "")),
-		"target": {"stage": active_stage, "danger": active_danger, "class": active_class, "party": active_party},
+		"target": {"stage": active_stage, "danger": active_danger, "class": active_class},
 		"totals": {
 			"started": runs_started, "runs": runs_done, "wins": wins, "losses": losses,
 			"zeny": total_zeny, "kills": total_kills, "xp": total_xp,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Force the configured job path during a farmer session.
 
-The game's job-change menu (auto_pick) and its party AI call `Player.next_job()`
+The game's job-change menu (auto_pick) calls `Player.next_job()`
 with a random path. The farmer cannot win that same-frame race by polling, so
 this tiny seam reads `Save` meta `farmer_job_paths` when it exists. Normal play
 (no meta) is byte-for-byte the original behavior.
