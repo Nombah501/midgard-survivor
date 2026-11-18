@@ -1,0 +1,9 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="Main.qml">Main.qml</file>
+        <file alias="TargetPanel.qml">TargetPanel.qml</file>
+        <file alias="StatusPanel.qml">StatusPanel.qml</file>
+        <file alias="StatCard.qml">StatCard.qml</file>
+        <file alias="LogPanel.qml">LogPanel.qml</file>
+    </qresource>
+</RCC>

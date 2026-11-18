@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Midgard Farm
+Comment=Control the Midgard Survivors farmer
+Comment[ru]=Управление автономным фармом Midgard Survivors
+Exec=midgardfarm
+Icon=midgardfarm
+Terminal=false
+Categories=Game;Utility;
+StartupWMClass=midgardfarm

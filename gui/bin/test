@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+mkdir -p "$ROOT/build/tests" "$ROOT/build/test-tmp"
+cd "$ROOT/build/tests"
+export TMPDIR="$ROOT/build/test-tmp"
+
+qmake6 "$ROOT/tests/midgardfarm_tests.pro"
+make -j"$(nproc)"
+QT_QPA_PLATFORM=offscreen ./midgardfarm_tests
