@@ -2,12 +2,16 @@
 # Build patch_farmer.pck from the installed official patch.
 #
 # The game's own updater mounts user://patches/<file> from state.json. We build
-# a copy of the current official patch with exactly two files added/replaced:
+# a copy of the current official patch with exactly three files added/replaced:
 #   scripts/autoload/save.gdc  - official Save + an inert bootstrap hook
+#   scripts/core/player.gdc    - next_job micro-patch
 #   scripts/core/farmer.gdc    - the farming driver
 #
 # Requirements: Python 3, curl, unzip, ~500 MB RAM, the game installed.
 # GDRE Tools v2.7.4 is downloaded to .build/gdre unless GDRE is set.
+#
+# Usage: ./build.sh [--clean]
+#   --clean  discard the decompiled-script cache and rebuild everything.
 set -euo pipefail
 
 FARMER_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -22,6 +26,15 @@ INFO="$FARMER_DIR/patch_farmer.info"
 BUILD_JSON="$FARMER_DIR/farmer_build.json"
 
 die() { echo "build: $*" >&2; exit 1; }
+
+CLEAN=0
+for arg in "$@"; do
+	case "$arg" in
+		--clean) CLEAN=1 ;;
+		-h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+		*) die "unknown argument: $arg" ;;
+	esac
+done
 
 [[ -x "$GAME_DIR/MidgardSurvivors.x86_64" ]] || die "game not found at $GAME_DIR"
 [[ -f "$STATE" ]] || die "no state.json at $STATE (launch the game once)"
@@ -72,8 +85,23 @@ if [[ ! -x "$GDRE" ]]; then
 fi
 [[ -x "$GDRE" ]] || die "GDRE not available (set GDRE=/path/to/gdre_tools.x86_64)"
 
+if [[ "$CLEAN" == "1" ]]; then
+	rm -rf "$WORK/cache"
+fi
 rm -rf "$WORK/extract" "$WORK/src" "$WORK/player_src" "$WORK/out"
 mkdir -p "$WORK/extract" "$WORK/src" "$WORK/player_src" "$WORK/out"
+
+# Decompiling save/player is the slow part of a rebuild. Cache the result by
+# every input that can change it; the hook/player patches and farmer.gd still
+# run from source on every build.
+BASE_ID="none"
+if [[ -f "$BASE_PCK" ]]; then
+	BASE_ID="$(stat -c '%s-%Y' "$BASE_PCK" 2>/dev/null || echo unknown)"
+fi
+GDRE_ID="$(stat -c '%s-%Y' "$GDRE" 2>/dev/null || echo unknown)"
+CACHE_KEY="$(printf '%s\n' "$PATCH_SHA" "$BRIDGE_SHA" "$BASE_ID" "$BYTECODE" "$GDRE_ID" \
+	| sha256sum | cut -c1-16)"
+CACHE_DIR="$WORK/cache/$CACHE_KEY"
 
 extract_script() {
 	local pck="$1" label="$2" res="$3" name="$4"
@@ -99,19 +127,31 @@ extract_effective() {
 	fi
 }
 
-extract_effective 'res://scripts/autoload/save.gdc' save.gdc 'save.gdc'
-extract_effective 'res://scripts/core/player.gdc' player.gdc 'player.gdc'
+if [[ -s "$CACHE_DIR/save.gd" && -s "$CACHE_DIR/player.gd" ]]; then
+	echo "build: cache hit $CACHE_KEY"
+	cp "$CACHE_DIR/save.gd" "$WORK/src/save.gd"
+	cp "$CACHE_DIR/player.gd" "$WORK/player_src/player.gd"
+else
+	echo "build: cache miss $CACHE_KEY"
+	extract_effective 'res://scripts/autoload/save.gdc' save.gdc 'save.gdc'
+	extract_effective 'res://scripts/core/player.gdc' player.gdc 'player.gdc'
 
-"$GDRE" --headless --decompile="$WORK/extract/save.gdc" --bytecode="$BYTECODE" \
-	--output="$WORK/src" >/dev/null 2>&1
-[[ -f "$WORK/src/save.gd" ]] || die "could not decompile save.gdc"
+	"$GDRE" --headless --decompile="$WORK/extract/save.gdc" --bytecode="$BYTECODE" \
+		--output="$WORK/src" >/dev/null 2>&1
+	[[ -f "$WORK/src/save.gd" ]] || die "could not decompile save.gdc"
+
+	"$GDRE" --headless --decompile="$WORK/extract/player.gdc" --bytecode="$BYTECODE" \
+		--output="$WORK/player_src" >/dev/null 2>&1
+	[[ -f "$WORK/player_src/player.gd" ]] || die "could not decompile player.gdc"
+
+	mkdir -p "$CACHE_DIR"
+	cp "$WORK/src/save.gd" "$CACHE_DIR/save.gd"
+	cp "$WORK/player_src/player.gd" "$CACHE_DIR/player.gd"
+fi
 
 python3 "$FARMER_DIR/tools/inject_hook.py" \
 	"$WORK/src/save.gd" "$FARMER_DIR/src/save_hook.gd" "$WORK/src/save_hooked.gd"
 
-"$GDRE" --headless --decompile="$WORK/extract/player.gdc" --bytecode="$BYTECODE" \
-	--output="$WORK/player_src" >/dev/null 2>&1
-[[ -f "$WORK/player_src/player.gd" ]] || die "could not decompile player.gdc"
 python3 "$FARMER_DIR/tools/patch_player.py" \
 	"$WORK/player_src/player.gd" "$WORK/player_src/player_patched.gd"
 
@@ -169,7 +209,10 @@ json.dump({
 }, open(sys.argv[1], "w"), indent=2)
 PY
 
-rm -rf "$WORK/extract" "$WORK/src" "$WORK/out"
+rm -rf "$WORK/extract" "$WORK/src" "$WORK/player_src" "$WORK/out"
+if [[ -d "$WORK/cache" ]]; then
+	ls -1dt "$WORK/cache"/*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf || true
+fi
 echo "Built $OUT"
 echo "  base patch: $PATCH_FILE"
 echo "  size:       $(du -h "$OUT" | cut -f1)"

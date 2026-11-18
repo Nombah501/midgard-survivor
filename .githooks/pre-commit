@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Run the farmer's static checks before every commit.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/farmer/tools/check.sh"

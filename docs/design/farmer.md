@@ -70,6 +70,9 @@ farmer/
   src/save_hook.gd     # bootstrap, добавляется в Save autoload
   tools/inject_hook.py # идемпотентная вставка хука в save.gd
   tools/patch_player.py # next_job: путь профессии из Save meta
+  tools/check.sh       # статические проверки
+  tools/verify.sh      # bounded one-run/stop/endless в sandbox
+  tools/install_hooks.sh # git core.hooksPath=.githooks
   build.sh install.sh run.sh uninstall.sh
   presets/*.json
   README.md
@@ -332,15 +335,19 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 
 ## 10. Проверка
 
-1. `build.sh` → pck содержит 2 файла, SHA/bytecode в info.
-2. Sandbox: `XDG_DATA_HOME=<копия профиля>` + headless, `max_runs:1`,
-   Prontera D1, swordsman → победа, keep, статус `done`, профиль изменился.
-3. `max_runs:3` на целевой руке → нет двойного банка, нет потери loot,
+1. `./tools/check.sh` — `check_api`, синтаксис bash/python, `git diff --check`.
+   Pre-commit hook: `./tools/install_hooks.sh`.
+2. `build.sh` → pck содержит 3 файла (`save.gdc`, `player.gdc`, `farmer.gdc`),
+   SHA/bytecode в info. Повторная сборка должна дать cache hit и тот же SHA.
+3. `./tools/verify.sh` — sandbox-матрица `one-run`, `stop`, `endless`; у каждого
+   сценария свой timeout; проверяются exit 0, `phase=done`, победа/частичный
+   банк/`ENDLESS_DONE`; результат — `farmer/logs/verify-*/summary.json`.
+4. Sandbox: `max_runs:3` на целевой руке → нет двойного банка, нет потери loot,
    rate считается, stop-файл завершает штатно.
-4. Ночной прогон (`max_minutes:120`) → нет утечек/зависаний, статус живой,
+5. Ночной прогон (`max_minutes:120`) → нет утечек/зависаний, статус живой,
    бэкапы не перезаписаны, профиль читается игрой.
-5. Отдельно: поражение (danger+10) → defeat, банк частичных наград, danger−1.
-6. Отдельно: полный склад → keep делает swap/пропуск, не теряет предметы.
+6. Отдельно: поражение (danger+10) → defeat, банк частичных наград, danger−1.
+7. Отдельно: полный склад → keep делает swap/пропуск, не теряет предметы.
 
 ## 11. Риски
 
@@ -359,14 +366,18 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 Профиль-копия, `XDG_DATA_HOME` в отдельном каталоге, headless, `FARMER_SESSION=1`,
 собранный `patch_farmer.pck` против официального 0.2.3.
 
-| Сценарий | Результат |
-|---|---|
-| один забег Swordsman/Prontera/D1 | победа; 2 358 убийств, 58 704 зеньги, 13 001 XP, 1 Ymir, 2 карты, 8 elu + 10 ori; keep 3 предмета; `phase=done` |
-| endless 1 мин / 2 MVP | финальная сборка `51770c…`: `ENDLESS_START n=1` → `STALE_VICTORY close` (меню от прошлого MVP) → `BOSS_WON mvps=2` → `ENDLESS_DONE`, `SETTLE victory=true`; 5 598 убийств, 137 575 z, 38 857 XP, keep 3 |
-| party Thief + Acolyte + Archer/D6 | `job=assassin_cross`, пати `high_priest` (путь 0) и `bard` (путь 1), 8/9 скиллов, 5 995 убийств за 300 game-sec, без смертей |
-| maintenance на endgame-профиле | апгрейд Kafra, Sage, fuse +43, альбом 4 карты, loadout 4 слота, питомец, 3 ролла Potential; награды забега считаются до трат |
-| stop по `max_minutes` | STOP → `_end_run(false)` → settle/keep → FINISH; частичные награды забанкованы, `run.sh` вернул 0 |
-| install/uninstall | state.json переключается на `patch_farmer.pck` и обратно; SHA проверяются; профиль/логи сохраняются |
-| `-- --endless` | **не использовать**: Updater видит `--...` и не монтирует патчи; endless включается метой `karma_test` |
+| Сценарий | Сборка | Результат |
+|---|---|---|
+| один забег Swordsman/Prontera/D1 | `cb571a15` | победа; 2 136 убийств, 59 670 z, 15 220 XP, 2 карты, keep 3; `PAUSE_STALL` через 45 с → продолжение; `phase=done` |
+| endless 1 мин / 2 MVP | `cb571a15` | `PAUSE_STALL` → `ENDLESS_START n=1` → `STALE_VICTORY close` (меню от прошлого MVP) → `BOSS_WON mvps=2` → `ENDLESS_DONE`, `SETTLE victory=true`; 4 105 убийств, 108 236 z, 42 406 XP, 6 карт, keep 3 |
+| party Thief + Acolyte + Archer/D6 | ранее | `job=assassin_cross`, пати `high_priest` (путь 0) и `bard` (путь 1), 8/9 скиллов, 5 995 убийств за 300 game-sec, без смертей |
+| maintenance на endgame-профиле | ранее | апгрейд Kafra, Sage, fuse +43, альбом 4 карты, loadout 4 слота, питомец, 3 ролла Potential; награды забега считаются до трат |
+| stop по `max_minutes` | `cb571a15` | `PAUSE_STALL` через 10 с → `STOP max_minutes` → `_end_run(false)` → settle/keep → FINISH; 2 146 убийств, 38 601 z, 10 401 XP, 1 карта; `run.sh` вернул 0 |
+| install/uninstall | ранее | state.json переключается на `patch_farmer.pck` и обратно; SHA проверяются; профиль/логи сохраняются |
+| `-- --endless` | — | **не использовать**: Updater видит `--...` и не монтирует патчи; endless включается метой `karma_test` |
+
+Строки `cb571a15` получены `./tools/verify.sh`; источник чисел —
+`farmer/logs/verify-*/summary.json`. Партия и maintenance проверялись на
+предыдущих сборках и на `cb571a15` не перепроверялись.
 
 Все прогоны — на копии профиля; основной профиль не изменялся.

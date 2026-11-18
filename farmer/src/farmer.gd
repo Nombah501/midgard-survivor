@@ -70,6 +70,8 @@ var _time_change_ms := 0
 var _clock_last := -1.0
 var _clock_change_ms := 0
 var _stall_tries := 0
+var _paused_since_ms := 0
+var _pause_tries := 0
 var _settle_ms := 0
 var _stop_after_settle := false
 var _soft_stop := false
@@ -257,6 +259,8 @@ func _prepare_run() -> void:
 	_clock_last = -1.0
 	_clock_change_ms = _now()
 	_stall_tries = 0
+	_paused_since_ms = 0
+	_pause_tries = 0
 	_set_autopilot_flags(true)
 	world.set_stage(active_stage)
 	world.danger = active_danger
@@ -476,7 +480,33 @@ func _check_watchdog(now: int) -> void:
 	if world == null or not is_instance_valid(world):
 		return
 	if get_tree().paused:
+		if _paused_since_ms == 0:
+			_paused_since_ms = now
+		var mode := ""
+		if world.menus != null and is_instance_valid(world.menus):
+			mode = str(world.menus._mode)
+		# These menus are owned by the phase handlers; closing them here would
+		# race the draft/victory logic.
+		if mode == "level_up" or mode == "job_change" or mode == "victory" \
+				or mode == "end" or mode == "start_skill":
+			_paused_since_ms = now
+			return
+		var pause_stall_s := float(cfg.get("stall_seconds", 45.0))
+		if pause_stall_s <= 0.0:
+			return
+		if now - _paused_since_ms <= int(pause_stall_s * 1000.0):
+			return
+		_pause_tries += 1
+		_log("PAUSE_STALL mode=%s tries=%d t=%.1f" % [mode, _pause_tries, float(world.time)])
+		if world.menus != null and is_instance_valid(world.menus):
+			world.menus.close()
+		get_tree().paused = false
+		_paused_since_ms = 0
+		if _pause_tries >= 3:
+			run_state["forced"] = true
+			_end_run_safe(false)
 		return
+	_paused_since_ms = 0
 	var clock := float(world.clock)
 	var t := float(world.time)
 	if _clock_last < 0.0 or not is_equal_approx(clock, _clock_last):
@@ -2387,6 +2417,8 @@ func _write_status() -> void:
 		"game": {
 			"running": bool(world.running) if world != null and is_instance_valid(world) else false,
 			"mode": str(world.menus._mode) if world != null and is_instance_valid(world) and world.menus != null else "",
+			"paused": get_tree().paused,
+			"fps": Engine.get_frames_per_second(),
 			"time": float(world.time) if world != null and is_instance_valid(world) else 0.0,
 			"kills": int(world.kills) if world != null and is_instance_valid(world) else 0,
 			"hp": float(p.hp) if p != null and is_instance_valid(p) else 0.0,

@@ -37,6 +37,20 @@ tail -f "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer.log"
 SHA официального патча и установленного фермерского патча; при обновлении игры
 нужно пересобрать (`./build.sh && ./install.sh`).
 
+## Проверка
+
+```bash
+./tools/check.sh                 # статический чек; один раз: ./tools/install_hooks.sh
+./tools/verify.sh --one-run      # быстрый smoke в sandbox
+./tools/verify.sh                # one-run + stop + endless, у каждого свой timeout
+```
+
+`verify.sh` читает реальный `user://`, но запускает игру на копии профиля в
+`.sandbox/verify-*`; реальный профиль не изменяется. Артефакты —
+`farmer/logs/verify-*`: `summary.json`, `*.log`, `*.status.json`. Сценарий
+считается пройденным только при exit 0, `phase=done` и выполненных assert'ах;
+таймаут — FAIL.
+
 ## Пресеты
 
 | Файл | Что делает |
@@ -154,10 +168,10 @@ SHA официального патча и установленного ферм
 ```
 
 `build.sh` берёт текущий официальный патч из `user://patches/state.json`,
-пересобирает `save.gdc` с хуком и `farmer.gdc`, проверяет наличие обоих файлов
-в pck и пишет `patch_farmer.info` (SHA/bytecode/API). Если якоря в `save.gd`
-изменились, сборка упадёт с понятной ошибкой — тогда нужно обновить
-`tools/inject_hook.py`.
+пересобирает `save.gdc` с хуком, `player.gdc` с micro-patch и `farmer.gdc`,
+проверяет наличие всех трёх файлов в pck и пишет `patch_farmer.info`
+(SHA/bytecode/API). Если якоря в `save.gd` изменились, сборка упадёт с понятной
+ошибкой — тогда нужно обновить `tools/inject_hook.py`.
 
 ## Файлы
 
@@ -166,6 +180,9 @@ src/farmer.gd        драйвер (один файл, один патч)
 src/save_hook.gd     bootstrap, добавляется в Save
 tools/inject_hook.py идемпотентная вставка хука
 tools/patch_player.py next_job: путь профессии из Save meta
+tools/check.sh       статические проверки
+tools/verify.sh      bounded one-run/stop/endless в sandbox
+tools/install_hooks.sh  git core.hooksPath=.githooks
 presets/*.json       конфиги
 patch_farmer.pck     собранный патч
 patch_farmer.info    манифест (SHA, bytecode, API)
