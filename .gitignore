@@ -1,0 +1,8 @@
+/analysis/
+.sandbox/
+farmer/.build/
+farmer/logs/
+farmer/backups/
+farmer/patch_farmer.pck
+farmer/patch_farmer.info
+farmer/farmer_build.json

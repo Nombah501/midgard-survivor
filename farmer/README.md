@@ -1,0 +1,175 @@
+# Фермер для Midgard Survivors 0.2.3
+
+Автономный фарм-раннер: играет настоящие одиночные забеги (при желании — с
+двумя AI-саппортами), сам ведёт draft, меняет профессию, добивает MVP, забирает
+добычу, тратит ресурсы на постоянное усиление и запускает следующий забег.
+Награды начисляет штатный `_end_run()` игры; профиль не редактируется напрямую.
+
+Патчатся два скрипта: `scripts/autoload/save.gdc` (bootstrap-хук) и
+`scripts/core/player.gdc` (`next_job` уважает `Save` meta `farmer_job_paths`,
+иначе поведение байт-в-байт штатное). Добавляется `scripts/core/farmer.gdc`.
+Никаких изменений в `bot`, `altars`, `auto_pick`, `debug_menu` нет.
+
+## Быстрый старт
+
+```bash
+cd /home/n501/orca/projects/midgard-survivor/farmer
+./build.sh                 # собрать патч из текущего официального патча
+./install.sh               # поставить в слот обновления игры
+./run.sh presets/one-run.json   # проверка: один забег, Prontera, danger 1
+./run.sh presets/steady.json    # бесконечный авто-фарм
+```
+
+Остановка:
+
+```bash
+touch "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer_stop"
+```
+
+Статус и лог:
+
+```bash
+cat  "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer_status.json"
+tail -f "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer.log"
+```
+
+Игра должна быть закрыта перед `install.sh`/`run.sh`. `run.sh` сам проверяет
+SHA официального патча и установленного фермерского патча; при обновлении игры
+нужно пересобрать (`./build.sh && ./install.sh`).
+
+## Пресеты
+
+| Файл | Что делает |
+|---|---|
+| `presets/one-run.json` | один забег Swordsman/Prontera/D1, без трат — smoke-тест |
+| `presets/steady.json` | авто-класс, авто-стадия/danger, апгрейды, карты, loadout, питомец |
+| `presets/zeny.json` | цель — зеньги; авто-подбор danger по измеренной доходности |
+| `presets/crumbs.json` | цель — Star Crumb: danger 25+, endless до 6 минут / 8 MVP |
+| `presets/party.json` | Thief + High Priest + Bard на Prontera D15 |
+| `presets/progress.json` | продавливание максимального danger, rebirth |
+| `presets/night.json` | ночной сбалансированный фарм, 8 часов, короткий endless |
+
+## Как это работает
+
+1. `Save._process` вызывает `_farmer_tick()`; только при `FARMER_SESSION=1`,
+   `user://farmer.cfg` и headless/`display:true` создаётся узел `Farmer`.
+   `run.sh` не передаёт пользовательских аргументов вида `--...`: Updater игры
+   при таком аргументе отключает все патчи (`updater.gd:_enabled`).
+2. Фермер ждёт `World`, включает `world.autopilot` (для авто-refine/стрел и
+   подавления лишних событий) и `menus.auto_pick` (для loot roll).
+3. Движение игрока заменяется своим `HeroInput`: приоритеты — механики MVP →
+   Golden Poring → ценный пикап → алтарь → квест → бой/отступление.
+4. Level-up: `offered_choices()` → собственный планировщик → `apply_choice()`
+   без UI. Для героев пати — то же с их саппорт-билдом.
+5. Job change: микро-патч `Player.next_job` читает `Save` meta
+   `farmer_job_paths`, поэтому и штатное меню (оно выбирает путь в том же
+   кадре), и пати получают заданную ветку. Игрок дополнительно вызывает
+   `world.do_job_change(path)`; стартовый скилл — из приоритета билда.
+6. Победа: `raid.state=="won"` своей арены или `menus._mode=="victory"`.
+   Игра не завершает забег сама (мета `GameData.karma_test`), поэтому фермер
+   решает: `continue_endless()` или `_end_run(true)`.
+7. Экран конца: keep по ценности (до 3 бесплатных после победы; 1 платный после
+   поражения), затем штатная уборка невзятых worn/legendary (зеньги/legend_coin).
+8. Между забегами: достижения, апгрейды Kafra/Sage, rebirth, статы, fusion карт,
+   альбом, loadout, питомец, (опционально) Star Smith и очистка склада.
+9. Метрики каждого забега пишутся в `farmer_status.json` и
+   `farmer_runs.jsonl`; выбор (stage, danger) адаптируется по фактической
+   доходности, а не по «максимальной сложности».
+
+## Конфиг
+
+`$DATA/farmer.cfg` — JSON. Все поля необязательны. Основные:
+
+| Поле | По умолчанию | Смысл |
+|---|---|---|
+| `objective` | `balanced` | `zeny`, `ores`, `crumbs`, `xp`, `cards`, `pets`, `coins`, `progress`, `balanced` |
+| `weights` | см. код | ценность единицы ресурса для выбора руки |
+| `class`/`classes`/`class_rotate` | `""`/`[]`/`false` | класс игрока |
+| `party` | `[]` | AI-саппорты (до 2; каждый +60% спавна и −XP) |
+| `builds` | `{}` | билды по классам: `job_path`, `skills`, `stats`, `caps`, `junk` |
+| `stage`/`danger` | `""`/`auto` | фиксация цели; `danger`: `auto`, число, `best`, `max` |
+| `danger_ceiling` | 30 | верхняя граница автоподбора |
+| `explore_every` | 5 | как часто пробовать соседнюю руку |
+| `speed` | 4.0 | `Engine.time_scale` (реальное ускорение) |
+| `game_speed` | 3 | штатный режим игры 1–3 (frenzy/game_fast) |
+| `run_minutes` | 12 | таймаут забега по игровому времени |
+| `arena_wall_max` | 180 | таймаут арены MVP по реальному времени |
+| `stall_seconds` | 45 | watchdog: часы игры не идут |
+| `endless` | false | продолжать после MVP |
+| `endless_minutes`/`endless_mvps` | 4/0 | бюджет endless |
+| `max_runs`/`max_minutes`/`stop_after_wins` | 0 | лимиты сессии |
+| `auto_keep`/`keep_on_defeat`/`keep_max_pct` | true/false/0.05 | политика Kafra |
+| `auto_stats`/`auto_rebirth`/`auto_rebirth_lv` | true/false/false | прокачка |
+| `auto_upgrades`/`upgrade_reserve`/`storage_target` | true/500000/120 | Kafra |
+| `auto_sage` | true | Sage-апгрейды |
+| `auto_fuse`/`fuse_keep`/`auto_cards` | true/{}/true | карты |
+| `auto_loadout`/`auto_pet`/`pet_priority` | true/true/[] | снаряжение и питомец |
+| `auto_potential`/`potential_reserve`/`potential_max_rolls` | false/20/0 | Star Smith |
+| `auto_storage_prune` | false | удалять мусор при полном складе |
+| `offline`/`display`/`hard_exit` | true/false/true | режим запуска |
+| `goals`/`goal_stop` | `{}`/false | остановка по целям (карты/питомцы/зеньги) |
+
+## Статус
+
+`farmer_status.json` содержит: `session`, `phase`, `target`, `totals`, `rates`
+(зеньги/час, убийства/мин, руда/час, крошки/час), `arms` (статистика по
+`stage|danger`), `last` (последний забег), `maint` (что куплено/слито),
+`profile` (зеньги, склад, материалы) и `game` (hp/level/time).
+
+`farmer_runs.jsonl` — по строке на забег: победа, время (wall/game), убийства,
+зеньги, XP, дельты материалов/карт/питомцев/coins/ymir, keep, `job`, `party_state`.
+`farmer_status.json.run` показывает незавершённую победу (`won_at`, `boss_won`,
+`endless_*`) — это отладочный срез, а не результат забега.
+
+## Безопасность
+
+- `install.sh`/`run.sh` делают уникальные бэкапы `profile.json`,
+  `profile.bak.json`, `profile.run` в `farmer/backups/` (10 последних +
+  `official-state.json`).
+- `run.sh` держит `flock`, проверяет отсутствие второго процесса игры, сверяет
+  SHA официального патча и собранного фермера.
+- Фермер держит `user://farmer.lock`, пишет статус атомарно, а при
+  `hard_exit` убивает процесс только после `Save.flush()`.
+- `uninstall.sh` возвращает официальный патч и удаляет только фермерский pck;
+  профиль/конфиг/логи остаются.
+
+## Ограничения
+
+- Endless Tower, Hel Tower и Emperium Festival **не автоматизируются** в v1:
+  это отдельные режимы со своим UI и сохранёнными билдами.
+- Karma-маршруты через портал не запускаются (autopilot подавляет Morroc;
+  маршрут требует выхода из арены).
+- Гача, town-refine с риском слома, grades/sockets и ролл traits не трогаются.
+- На danger 26–30 кумулятивные механики Hell могут убивать: автоподбор отступит
+  по метрикам, но гарантий выживания нет.
+- Онлайн-функции отключены при `offline:true` (лидерборды/Epic/cloud).
+- Trans-ветка пати зависит от профиля (`Save.is_reborn(class)`); фермер не
+  подменяет rebirth пати-героям. `presets/party.json` проверен на профиле, где
+  acolyte уже reborn (High Priest).
+
+## Обновление игры
+
+```bash
+./build.sh && ./install.sh
+```
+
+`build.sh` берёт текущий официальный патч из `user://patches/state.json`,
+пересобирает `save.gdc` с хуком и `farmer.gdc`, проверяет наличие обоих файлов
+в pck и пишет `patch_farmer.info` (SHA/bytecode/API). Если якоря в `save.gd`
+изменились, сборка упадёт с понятной ошибкой — тогда нужно обновить
+`tools/inject_hook.py`.
+
+## Файлы
+
+```
+src/farmer.gd        драйвер (один файл, один патч)
+src/save_hook.gd     bootstrap, добавляется в Save
+tools/inject_hook.py идемпотентная вставка хука
+tools/patch_player.py next_job: путь профессии из Save meta
+presets/*.json       конфиги
+patch_farmer.pck     собранный патч
+patch_farmer.info    манифест (SHA, bytecode, API)
+backups/             профили и baseline state.json
+docs/design/farmer.md   дизайн
+docs/analysis/*.md      исследование игры 0.2.3
+```
