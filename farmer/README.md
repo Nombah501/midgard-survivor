@@ -17,7 +17,10 @@ cd /home/n501/orca/projects/midgard-survivor/farmer
 ./build.sh                 # собрать патч из текущего официального патча
 ./install.sh               # поставить в слот обновления игры
 ./run.sh presets/one-run.json   # проверка: один забег, Prontera, danger 1
-./run.sh presets/synx-hell.json # solo SinX, Prontera D25 (hell 10), 30-40 min
+./tools/farm.py --list          # персонажи и локации
+./tools/farm.py --char sinx --stage prontera --danger 25
+./tools/farm.py --char sniper --stage payon --danger 20
+./run.sh presets/synx-hell.json # solo SinX, Prontera D25 (hell 10)
 ./run.sh presets/steady.json    # бесконечный авто-фарм
 ```
 
@@ -60,9 +63,32 @@ SHA официального патча и установленного ферм
 | `presets/steady.json` | авто-класс, авто-стадия/danger, апгрейды, карты, loadout, питомец |
 | `presets/zeny.json` | цель — зеньги; авто-подбор danger по измеренной доходности |
 | `presets/crumbs.json` | цель — Star Crumb: danger 25+, endless до 6 минут / 8 MVP |
-| `presets/synx-hell.json` | соло SinX, Prontera danger 25 (hell 10), cap 23 game-min (≈30-40 real min при speed 1.3), профильные приоритеты, без трат |
+| `presets/synx-hell.json` | соло SinX, Prontera danger 25 (hell 10), speed 4, AFK-цикл |
+| `presets/sniper-hell.json` | соло Sniper (archer/0), те же настройки; включится после прокачки archer |
 | `presets/progress.json` | продавливание максимального danger, rebirth |
 | `presets/night.json` | ночной сбалансированный фарм, 8 часов, короткий endless |
+
+## Выбор персонажа и локации
+
+`tools/farm.py` берёт базу `presets/synx-hell.json`, подставляет выбранного
+персонажа и стадию и запускает `run.sh`:
+
+```bash
+./tools/farm.py --list
+./tools/farm.py --char sinx --stage prontera --danger 25
+./tools/farm.py --char sniper --stage payon --danger 20
+./tools/farm.py --class archer --job-path 0 --stage orc --danger 15
+./tools/farm.py --char sinx --stage prontera --dry-run
+```
+
+Персонажи и стадии — в `targets.json`; `--list` печатает id и названия.
+Профильные приоритеты скиллов/статов берутся для выбранного класса. Если
+класс или стадия ещё не открыты, фермер пишет `CLASS_LOCKED`/`STAGE_LOCKED`
+и не подменяет выбор другим классом/локацией.
+
+AFK-цикл: забег идёт до смерти/победы (на SinX D25 обычно ~25 game-min),
+награды банкуются, следующий забег стартует сам. Гарантии 30–40 минут без
+смерти нет — это осознанно не критично.
 
 ## Как это работает
 
@@ -99,6 +125,7 @@ SHA официального патча и установленного ферм
 | `objective` | `balanced` | `zeny`, `ores`, `crumbs`, `xp`, `cards`, `pets`, `coins`, `progress`, `balanced` |
 | `weights` | см. код | ценность единицы ресурса для выбора руки |
 | `class`/`classes`/`class_rotate` | `""`/`[]`/`false` | класс игрока |
+| `job_paths` | `{}` | ветка класса; для archer `0`=Sniper, `1`=Bard; thief `0`=SinX |
 | `builds` | `{}` | билды по классам: `job_path`, `skills`, `stats`, `caps`, `junk` |
 | `stage`/`danger` | `""`/`auto` | фиксация цели; `danger`: `auto`, число, `best`, `max` |
 | `danger_ceiling` | 30 | верхняя граница автоподбора |
@@ -158,9 +185,9 @@ SHA официального патча и установленного ферм
 - Онлайн-функции отключены при `offline:true` (лидерборды/Epic/cloud).
 - `synx-hell` рассчитан на профиль с уже собранным SinX: фермер не покупает
   снаряжение и не перекладывает loadout, только играет забеги и забирает лут.
-  Автопилот на D25 умирает около 25.5 game-min, поэтому пресет заканчивает
-  забег на 23 game-min и запускает следующий: смертей нет, ~30-40 реальных
-  минут на забег при `speed:1.3`.
+  Автопилот на D25 умирает около 25.5 game-min; забег закрывается как endless
+  victory, банкуется и перезапускается. Это AFK-цикл, а не гарантия 30–40 минут
+  без смертей.
 
 ## Обновление игры
 

@@ -1613,7 +1613,8 @@ func _choose_target() -> Dictionary:
 	if str(cfg.get("stage", "")) != "":
 		stage = str(cfg.get("stage", ""))
 		if not _stage_ok(stage):
-			stage = ""
+			_log("STAGE_LOCKED %s" % stage)
+			return {}
 	if stage != "":
 		danger = _danger_for(stage)
 		if obj == "progress":
@@ -1638,6 +1639,9 @@ func _choose_target() -> Dictionary:
 	if stage == "":
 		return {}
 	var cid := _choose_class()
+	if cid == "":
+		_log("TARGET_FAIL class")
+		return {}
 	danger = clampi(danger, _stage_min_danger(stage), mini(_stage_max_danger(stage), int(cfg.get("danger_ceiling", 30))))
 	_log("TARGET stage=%s danger=%d class=%s" % [stage, danger, cid])
 	return {"stage": stage, "danger": danger, "class": cid}
@@ -1785,11 +1789,17 @@ func _danger_for(sid: String) -> int:
 func _choose_class() -> String:
 	var b: Dictionary = cfg.get("builds", {})
 	var bclass := str(b.get("class", "")) if b.has("class") else ""
-	if bclass != "" and _class_ok(bclass):
-		return bclass
+	if bclass != "":
+		if _class_ok(bclass):
+			return bclass
+		_log("CLASS_LOCKED %s" % bclass)
+		return ""
 	var fixed := str(cfg.get("class", ""))
-	if fixed != "" and _class_ok(fixed):
-		return fixed
+	if fixed != "":
+		if _class_ok(fixed):
+			return fixed
+		_log("CLASS_LOCKED %s" % fixed)
+		return ""
 	var list: Array = cfg.get("classes", [])
 	var cands: Array = []
 	for c in list:
