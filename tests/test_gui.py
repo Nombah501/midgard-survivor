@@ -234,8 +234,11 @@ def test_service_start_uses_only_the_platform_service_tool(farm, monkeypatch):
     farm.state(updated_at=1)
     assert model.poll().service_missing
     assert not model.start_service()
-    expected = (["schtasks.exe", "/Run", "/TN", "Midgard Farm"] if farm.platform.release_os == "windows"
-                else ["systemctl", "--user", "start", "midgard-farm.service"])
+    if farm.platform.release_os == "windows":
+        tool = Path(os.environ["SystemRoot"]) / "System32" / "schtasks.exe"
+        expected = [str(tool), "/Run", "/TN", "Midgard Farm"]
+    else:
+        expected = ["systemctl", "--user", "start", "midgard-farm.service"]
     assert calls == [expected]
     assert "Not registered" in model.poll().action_error
     assert not commands.directory(farm.platform).exists()

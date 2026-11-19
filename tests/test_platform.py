@@ -303,8 +303,14 @@ def fake_game(tmp_path: Path) -> list[str]:
 
 def test_game_pids_see_the_game_by_executable_name(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    # By pid: the operator's real game may be running on this machine.
+    def unexpected_spawn(*args, **kwargs):
+        pytest.fail("Windows process discovery must not start a subprocess")
+
+    # Check our fake's PID: the operator's real game may be running on this machine.
     with OS.spawn_tree(fake_game(tmp_path), stdout=subprocess.DEVNULL) as game:
+        if sys.platform == "win32":
+            monkeypatch.setattr(subprocess, "run", unexpected_spawn)
+            monkeypatch.setattr(subprocess, "Popen", unexpected_spawn)
         deadline = time.monotonic() + 10
         while game.popen.pid not in OS.game_pids():
             assert time.monotonic() < deadline, "running game not seen"
@@ -447,6 +453,7 @@ def test_windows_task_xml_and_registration_commands(tmp_path, monkeypatch):
             return subprocess.CompletedProcess(argv, 0, stdout=f'"PC\\user","{sid}"\r\n')
         assert tool == "schtasks.exe"
         calls.append(argv[1:])
+        assert Path(argv[0]) == Path(os.environ["SystemRoot"]) / "System32" / "schtasks.exe"
         assert kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW
         if argv[1] == "/Create":
             registered.append(Path(argv[argv.index("/XML") + 1]).read_text(encoding="utf-16"))
@@ -487,6 +494,23 @@ def test_windows_task_xml_and_registration_commands(tmp_path, monkeypatch):
     assert calls[1:] == [["/Run", "/TN", "Midgard Farm"], ["/Delete", "/TN", "Midgard Farm", "/F"]]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Task Scheduler")
+@pytest.mark.parametrize("winerror", [2, 5])
+def test_windows_unregister_ignores_only_missing_tasks(monkeypatch, winerror):
+    import ctypes
+
+    def run(argv, **kwargs):
+        assert argv[1:] == ["/Delete", "/TN", "Midgard Farm", "/F"]
+        raise subprocess.CalledProcessError(1, argv, stderr=f"ERROR: {ctypes.FormatError(winerror)}\r\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    if winerror == 2:
+        OS.unregister_service()
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            OS.unregister_service()
+
+
 @pytest.mark.skipif(not WINDOWS_CI, reason="real Task Scheduler round trip on Windows CI only")
 def test_windows_scheduler_accepts_and_deletes_the_task(monkeypatch):
     from midgard_farm.platform import windows
@@ -510,6 +534,7 @@ def test_windows_scheduler_accepts_and_deletes_the_task(monkeypatch):
         if subprocess.run(query, capture_output=True, timeout=20).returncode == 0:
             OS.unregister_service()
     assert subprocess.run(query, capture_output=True, timeout=20).returncode != 0
+    OS.unregister_service()  # Removing an already absent task also succeeds.
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows desktop notifications")

@@ -59,9 +59,12 @@ _TASK_XML = """\
 </Task>
 """
 
+ERROR_FILE_NOT_FOUND = 2
 ERROR_ACCESS_DENIED = 5
+ERROR_NO_MORE_FILES = 18
 ERROR_SHARING_VIOLATION = 32
 ERROR_LOCK_VIOLATION = 33
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 LOCKFILE_FAIL_IMMEDIATELY = 0x1
 LOCKFILE_EXCLUSIVE_LOCK = 0x2
 MOVEFILE_REPLACE_EXISTING = 0x1
@@ -71,6 +74,7 @@ MOVEFILE_WRITE_THROUGH = 0x8
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TH32CS_SNAPPROCESS = 0x2
 # A reader (the window polling a status file) may briefly hold the target open.
 REPLACE_RETRY_SECONDS = 2.0
 
@@ -130,6 +134,21 @@ class _JOB_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
     ]
 
 
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
 _LockFileEx = _kernel32.LockFileEx
 _LockFileEx.argtypes = [
     wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
@@ -159,6 +178,15 @@ _TerminateJobObject.restype = wintypes.BOOL
 _CloseHandle = _kernel32.CloseHandle
 _CloseHandle.argtypes = [wintypes.HANDLE]
 _CloseHandle.restype = wintypes.BOOL
+_CreateToolhelp32Snapshot = _kernel32.CreateToolhelp32Snapshot
+_CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+_CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+_Process32FirstW = _kernel32.Process32FirstW
+_Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+_Process32FirstW.restype = wintypes.BOOL
+_Process32NextW = _kernel32.Process32NextW
+_Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+_Process32NextW.restype = wintypes.BOOL
 _OpenProcess = _kernel32.OpenProcess
 _OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _OpenProcess.restype = wintypes.HANDLE
@@ -312,11 +340,16 @@ class WindowsPlatform(Platform):
             _system_tool("schtasks.exe", "/Create", "/TN", SERVICE_TASK_NAME, "/XML", str(path), "/F")
 
     def unregister_service(self) -> None:
-        _system_tool("schtasks.exe", "/Delete", "/TN", SERVICE_TASK_NAME, "/F")
+        try:
+            _system_tool("schtasks.exe", "/Delete", "/TN", SERVICE_TASK_NAME, "/F")
+        except subprocess.CalledProcessError as exc:
+            # schtasks reports several errors as exit 1; use the system's localized message.
+            missing = ctypes.FormatError(ERROR_FILE_NOT_FOUND).strip().casefold()
+            if exc.returncode != 1 or not missing or not (exc.stderr or "").strip().casefold().endswith(missing):
+                raise
 
     def start_service(self) -> None:
-        subprocess.run(["schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME], creationflags=CREATE_NO_WINDOW,
-                       check=True, capture_output=True, text=True, errors="replace", timeout=5)
+        _system_tool("schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME)
 
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
         audio = '<audio silent="true"/>' if priority == "low" else ""
@@ -329,13 +362,25 @@ class WindowsPlatform(Platform):
                        creationflags=CREATE_NO_WINDOW, check=True, capture_output=True, timeout=10)
 
     def game_pids(self) -> set[int]:
-        out = _system_tool("tasklist.exe", "/FI", f"IMAGENAME eq {self.game_exe_name}", "/FO", "CSV", "/NH")
-        # One `"name","pid",...` row per match; otherwise an "INFO: No tasks" line.
-        return {
-            int(row[1])
-            for row in csv.reader(out.splitlines())
-            if len(row) > 1 and row[0].lower() == self.game_exe_name.lower()
-        }
+        snapshot = _CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        _check(snapshot != INVALID_HANDLE_VALUE)
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            pointer = ctypes.byref(entry)
+            expected_name = self.game_exe_name.casefold()
+            pids: set[int] = set()
+            found = _Process32FirstW(snapshot, pointer)
+            while found:
+                if entry.szExeFile.casefold() == expected_name:
+                    pids.add(entry.th32ProcessID)
+                found = _Process32NextW(snapshot, pointer)
+            error = ctypes.get_last_error()
+            if error != ERROR_NO_MORE_FILES:
+                raise ctypes.WinError(error)
+            return pids
+        finally:
+            _CloseHandle(snapshot)
 
     def game_running(self) -> bool:
         pids = self.game_pids()

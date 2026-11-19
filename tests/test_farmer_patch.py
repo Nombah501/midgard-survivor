@@ -1,3 +1,4 @@
+import builtins
 import hashlib
 import json
 import os
@@ -92,6 +93,42 @@ def test_build_uses_patch_then_bridge_then_base_and_records_inputs(farm):
     second = build(os_, profile, gdre=gdre)
     assert second.result_sha256 != manifest.result_sha256
     assert "# bridge" in json.loads(built_pack_path(os_).read_bytes())[PLAYER]
+
+
+def test_compile_receives_identical_lf_bytes_from_lf_and_crlf_injectors(farm, monkeypatch):
+    os_, profile, _, _, _, _, gdre = farm
+    inputs = {}
+    newline = "\n"
+    real_open = builtins.open
+    real_run = Gdre.run
+    injected = {"save_hooked.gd", "player_patched.gd"}
+
+    def injector_open(file, mode="r", *args, **kwargs):
+        if mode == "w" and isinstance(file, str) and Path(file).name in injected:
+            kwargs["newline"] = newline
+        return real_open(file, mode, *args, **kwargs)
+
+    def capture_compile(self, work, *args):
+        if args[0].startswith("--compile="):
+            path = Path(args[0].removeprefix("--compile="))
+            inputs[path.name] = path.read_bytes()
+        return real_run(self, work, *args)
+
+    monkeypatch.setattr(builtins, "open", injector_open)
+    monkeypatch.setattr(Gdre, "run", capture_compile)
+    lf = build(os_, profile, gdre=gdre)
+    expected = inputs.copy()
+    assert injected <= expected.keys()
+    assert all(b"\n" in data and b"\r\n" not in data for data in expected.values())
+
+    newline = "\r\n"
+    inputs.clear()
+    crlf = build(os_, profile, gdre=gdre)
+    assert inputs.keys() == expected.keys()
+    for name, data in inputs.items():
+        assert hashlib.sha256(data).digest() == hashlib.sha256(expected[name]).digest(), name
+    assert crlf.farmer_hash == lf.farmer_hash
+    assert crlf.result_sha256 == lf.result_sha256
 
 
 def test_decompile_cache_tracks_effective_bytes(farm, tmp_path, monkeypatch):

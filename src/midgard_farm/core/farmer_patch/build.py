@@ -162,6 +162,11 @@ def _build(
     player_patched = work / "player_patched.gd"
     _inject(work / "tools/inject_hook.py", log, save_script, work / "src/save_hook.gd", save_hooked)
     _inject(work / "tools/patch_player.py", log, player_script, player_patched)
+    # The bundled injectors use the platform's text-mode newline.
+    for output in (save_hooked, player_patched):
+        data = output.read_bytes()
+        if b"\r\n" in data:
+            output.write_bytes(data.replace(b"\r\n", b"\n"))
     resources = (_SAVE, _PLAYER, _FARMER)
     compiled = []
     for source in (save_hooked, player_patched, work / "src/farmer.gd"):
