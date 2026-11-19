@@ -19,18 +19,6 @@ JOURNAL_TOTALS = {
     "ymir": lambda r: int(r.get("ymir_gain") or 0),
 }
 
-# Legacy night preset, kept here so verification will not need farmer/presets at cutover.
-NIGHT_CONFIG = {
-    "objective": "balanced", "class": "", "stage": "", "danger": "auto", "auto_danger": True,
-    "explore_every": 6, "danger_ceiling": 20, "speed": 5.0, "game_speed": 3, "run_minutes": 14,
-    "arena_wall_max": 180, "stall_seconds": 45, "endless": True, "endless_minutes": 3, "endless_mvps": 4,
-    "max_runs": 0, "max_minutes": 480, "restart_seconds": 2, "auto_keep": False, "auto_stats": True,
-    "auto_achievements": True, "auto_upgrades": True, "upgrade_reserve": 200000, "storage_target": 120,
-    "auto_sage": True, "auto_fuse": True, "auto_cards": True, "auto_loadout": True, "auto_pet": True,
-    "auto_rebirth": False, "auto_rebirth_lv": True, "display": False, "offline": True, "hard_exit": True,
-}
-
-
 def _heartbeat_gap(samples: list[dict]) -> float | None:
     """Longest gap since the first heartbeat, ignoring missing boot/restart status."""
     gap, last_t, last_seq = 0.0, None, None

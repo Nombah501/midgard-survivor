@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
+from ...assets import farmer_inputs
 from ...platform import Platform
 from .. import patch_info
 from ..patch_info import INSTALLED_PACK, PatchInfo
@@ -18,7 +19,7 @@ from ._state import OFFICIAL_STATE, STATE, bridge_name, official_pack, patch_ver
 from .gdre import Gdre, sha256
 
 BYTECODE = "ebc36a7"
-_SOURCE_DIR = Path(__file__).resolve().parents[4] / "farmer"
+_SOURCE_DIR = farmer_inputs()
 _SOURCE_FILES = ("src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py")
 _SAVE = "scripts/autoload/save.gdc"
 _PLAYER = "scripts/core/player.gdc"

@@ -11,6 +11,7 @@ dependencies = ["PySide6>=6.8"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+freeze = ["PyInstaller==6.22.3"]
 
 [project.scripts]
 midgard-farm-service = "midgard_farm.service:main"
@@ -18,8 +19,22 @@ midgard-farm-service = "midgard_farm.service:main"
 [project.gui-scripts]
 midgard-farm = "midgard_farm.gui:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+# Map the data-only package to the canonical sources without copying into the checkout.
+package-dir = {"" = "src", "midgard_farm._farmer" = "farmer"}
+packages = [
+    "midgard_farm", "midgard_farm._farmer", "midgard_farm.core",
+    "midgard_farm.core.farmer_patch", "midgard_farm.gui", "midgard_farm.platform",
+    "midgard_farm.verify",
+]
+include-package-data = false
+
+[tool.setuptools.package-data]
+"midgard_farm._farmer" = [
+    "src/farmer.gd", "src/save_hook.gd",
+    "tools/inject_hook.py", "tools/patch_player.py",
+    "presets/*.json", "targets.json",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

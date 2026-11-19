@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from ..assets import presets_dir
 from ..platform import Platform
 from . import farmer_patch
 from .patch_info import INSTALLED_PACK
@@ -23,15 +24,6 @@ _STOP_REASON = "service stopped during smoke"
 _SCRIPT_ERROR = re.compile(rb"SCRIPT ERROR|Parse Error|Invalid call|Cannot call method")
 _FINISH = re.compile(rb"^(?:FARMER \S+ )?FINISH\b")
 
-# The built-in verify.sh --one-run preset; independent of the operator's preset.
-_ONE_RUN = {
-    "objective": "balanced", "class": "swordsman", "stage": "prontera", "danger": 1,
-    "speed": 10.0, "game_speed": 3, "max_runs": 1, "run_minutes": 12, "restart_seconds": 1,
-    "auto_keep": False, "auto_stats": True, "auto_achievements": True, "auto_fuse": False,
-    "auto_cards": False, "auto_upgrades": False, "auto_sage": False, "auto_loadout": False,
-    "auto_pet": False, "auto_rebirth": False, "auto_rebirth_lv": False, "endless": False,
-    "display": False, "offline": True, "hard_exit": True,
-}
 _STALE = {
     "farmer.cfg", "farmer_command", "farmer_command.claimed", "farmer_stop", "farmer_status.json",
     "farmer.log", "farmer.log.prev", "farmer.run.lock", "farmer_runs.jsonl", "farmer_session.json",
@@ -40,7 +32,10 @@ _STALE = {
 
 
 def one_run_config() -> dict[str, object]:
-    return _ONE_RUN.copy()
+    # Run at verify speed, independently of the selectable preset's speed.
+    config: dict[str, object] = json.loads((presets_dir() / "one-run.json").read_bytes())
+    config["speed"] = 10.0
+    return config
 
 
 class SmokeOutcome(Enum):
@@ -157,7 +152,7 @@ def _attempt(
     data_home = Path(tempfile.mkdtemp(dir=app_dir, prefix="smoke-"))
     try:
         sandbox, env = prepare_sandbox(os_, profile, data_home, stop_requested=stop_requested)
-        os_.write_atomic(sandbox / "farmer.cfg", json.dumps(_ONE_RUN).encode())
+        os_.write_atomic(sandbox / "farmer.cfg", json.dumps(one_run_config()).encode())
         env["FARMER_SESSION"] = "1"
         env.pop("FARMER_SESSION_ID", None)
         if os_.game_running():

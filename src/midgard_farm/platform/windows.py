@@ -12,6 +12,7 @@ from ctypes import wintypes
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from ..assets import checkout_root
 from ..core.config import read_config
 from . import InstanceLock, LockHeld, NotificationPriority, Platform, ProcessTree, check_argv
 
@@ -326,7 +327,8 @@ class WindowsPlatform(Platform):
         identity = next(rows, [])
         if len(identity) != 2 or not identity[1].startswith("S-1-"):
             raise RuntimeError("could not identify the current Windows user")
-        directory = Path(command).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
+        root = checkout_root()
+        directory = root / "src" if root is not None else Path(command).parent
         arguments = f"      <Arguments>{escape(subprocess.list2cmdline(args))}</Arguments>\n" if args else ""
         return _TASK_XML.format(sid=escape(identity[1]), command=escape(command),
                                 arguments=arguments, directory=escape(str(directory)))

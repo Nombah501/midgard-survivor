@@ -4,13 +4,12 @@ import json
 import math
 import subprocess
 import time
-import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
+from .. import assets
 from ..core import commands, game_update
 from ..core.history import read_history
 from ..core.profile import ProfileNotFound, find_profile
@@ -44,9 +43,7 @@ def _character(class_id: object, job_path: object) -> commands.Character | None:
 
 
 def _catalog(os_: Platform) -> tuple[dict[commands.Character, str], list[_Preset], dict[str, str]]:
-    # Ticket 11 will bundle the farmer assets. Until then both catalogs live in the checkout.
-    assets = Path(__file__).resolve().parents[3] / "farmer"
-    targets = _object(os_, assets / "targets.json")
+    targets = _object(os_, assets.targets_path())
     characters: dict[commands.Character, str] = {}
     for value in _mapping(targets.get("characters")).values():
         row = _mapping(value)
@@ -55,7 +52,7 @@ def _catalog(os_: Platform) -> tuple[dict[commands.Character, str], list[_Preset
             characters[character] = label
     stages = {key: value for key, value in _mapping(targets.get("stages")).items() if isinstance(value, str)}
     presets = []
-    for path in sorted((assets / "presets").glob("*.json")):
+    for path in sorted(assets.presets_dir().glob("*.json")):
         if not (data := _object(os_, path)):
             continue
         class_id = data.get("class")
@@ -110,19 +107,6 @@ def _text(value: object) -> str:
 
 def _label(value: object) -> str:
     return _text(value).replace("_", " ").capitalize()
-
-
-def _app_version() -> str:
-    try:
-        return version("midgard-farm")
-    except PackageNotFoundError:
-        # A checkout run from src has not necessarily installed distribution metadata.
-        try:
-            with (Path(__file__).resolve().parents[3] / "pyproject.toml").open("rb") as file:
-                project = _mapping(tomllib.load(file).get("project"))
-                return _text(project.get("version")) or "Version unavailable"
-        except (OSError, ValueError):
-            return "Version unavailable"
 
 
 def _update_outcome(row: dict[str, Any]) -> str:
@@ -307,7 +291,7 @@ class SessionModel:
         self._pending_start = False
         self._action_error = ""
         self._patch_request: tuple[commands.PatchCommand, Path] | None = None
-        self._app_version = _app_version()
+        self._app_version = assets.version()
         self._history_rows: list[dict[str, Any]] = []
         self._history = HistoryView()
         self._last_update: tuple[str, str] = ("No outcome yet", "")

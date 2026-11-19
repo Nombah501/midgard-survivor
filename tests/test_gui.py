@@ -320,12 +320,13 @@ def test_updates_describes_the_classification_and_activity(farm, classification,
 def test_updates_shows_package_version_in_an_uninstalled_checkout(farm, monkeypatch):
     from importlib.metadata import PackageNotFoundError, version
 
+    from midgard_farm import assets
     from midgard_farm.gui import model
 
     def unavailable(package):
         raise PackageNotFoundError(package)
 
-    monkeypatch.setattr(model, "version", unavailable)
+    monkeypatch.setattr(assets, "distribution_version", unavailable)
     assert model.SessionModel(farm.platform).poll().updates.app_version == version("midgard-farm")
 
 

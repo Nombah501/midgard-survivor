@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
+from ..assets import presets_dir
 from ..core import farmer_patch, patch_info, smoke
 from ..core.supervisor import Policy
 from ..platform import Platform
@@ -114,7 +115,7 @@ def run_scenario(os_: Platform, source: Path, candidate: Path, work: Path, out: 
     if name == "soak":
         if not math.isfinite(hours * 3600) or hours <= 0:
             raise ValueError("--soak needs a positive, finite number of hours")
-        preset = json.loads(soak_preset.read_bytes()) if soak_preset else soak.NIGHT_CONFIG
+        preset = json.loads((soak_preset or presets_dir() / "night.json").read_bytes())
         if not isinstance(preset, dict):
             raise ValueError("soak preset must be a JSON object")
         config = preset | {"max_minutes": hours * 60, "max_runs": 0, "hard_exit": True, "display": False}
