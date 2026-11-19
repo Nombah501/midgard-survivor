@@ -123,3 +123,19 @@ def test_desktop_failure_is_logged_and_does_not_suppress_ntfy(notification_data,
     notifier.drain()
     assert delivered.is_set()
     assert "desktop notification failed" in capsys.readouterr().out
+
+
+def test_config_fields_are_validated_independently(notification_data, tmp_path):
+    os_ = notification_data
+    path = config_path(os_)
+    path.parent.mkdir(parents=True)
+    game_dir = tmp_path / "Midgard Survivors"
+    path.write_text(json.dumps({"ntfy_url": "not a URL", "game_dir": str(game_dir)}))
+    config = read_config(os_)
+    assert config.ntfy_url == ""
+    assert config.game_dir == game_dir
+
+    path.write_text(json.dumps({"ntfy_url": "https://example.invalid/night", "game_dir": "relative"}))
+    config = read_config(os_)
+    assert config.ntfy_url == "https://example.invalid/night"
+    assert config.game_dir is None

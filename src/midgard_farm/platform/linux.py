@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Never
 
 from . import InstanceLock, LockHeld, NetworkIsolationError, NotificationPriority, Platform, ProcessTree, check_argv
+from ._systemd import UNIT_NAME, render_unit
 
 _GODOT_DATA_HOME = "XDG_DATA_HOME"
 _GODOT_USER_DATA = Path("godot", "app_userdata")
@@ -70,12 +71,35 @@ class LinuxPlatform(Platform):
     def app_data_dir(self) -> Path:
         return _xdg_data_home() / "midgard-farm"
 
-    def default_game_dir(self) -> Path:
-        return Path.home() / "games" / "midgard-survivors"
+    def game_executable(self) -> Path:
+        game_dir = os.environ.get("GAME_DIR")
+        return (Path(game_dir) if game_dir else Path.home() / "games" / "midgard-survivors") / self.game_exe_name
+
+    def render_service(self, argv: Sequence[str]) -> str:
+        return render_unit(argv)
+
+    def register_service(self, argv: Sequence[str]) -> None:
+        rendered = self.render_service(argv)
+        unit = self._unit_path()
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        self.write_atomic(unit, rendered.encode("utf-8"))
+        self._systemctl("daemon-reload")
+
+    def unregister_service(self) -> None:
+        self._unit_path().unlink(missing_ok=True)
+        self._systemctl("daemon-reload")
+
+    @staticmethod
+    def _unit_path() -> Path:
+        return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user" / UNIT_NAME
+
+    @staticmethod
+    def _systemctl(*args: str) -> None:
+        subprocess.run(["systemctl", "--user", *args],
+                       check=True, capture_output=True, text=True, errors="replace", timeout=5)
 
     def start_service(self) -> None:
-        subprocess.run(["systemctl", "--user", "start", "midgard-farm.service"],
-                       check=True, capture_output=True, text=True, errors="replace", timeout=5)
+        self._systemctl("start", UNIT_NAME)
 
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
         urgency = "critical" if priority == "high" else priority

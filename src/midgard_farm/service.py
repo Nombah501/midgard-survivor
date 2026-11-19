@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -18,37 +19,24 @@ from .core.preflight import PreflightError
 from .core.profile import AmbiguousProfile, ProfileNotFound, find_profile
 from .core.state import StateKind, StateReporter
 from .core.supervisor import InvalidSavedSession, Policy, Supervisor, log, pending_commands, refuse_command
+from .platform._systemd import render_unit
 
 # sysexits: the same "unfixable" code run.sh's preflight uses.
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
 EXIT_QUARANTINE = 2
 
-UNIT = """\
-[Unit]
-Description=Midgard Farm background service
-StartLimitIntervalSec=1h
-StartLimitBurst=3
 
-[Service]
-Type=simple
-ExecStart={exec_start}
-EnvironmentFile=-%h/.config/midgard-farmer.env
-Restart=on-failure
-RestartSec=30
-RestartPreventExitStatus=2 75
-# Signal only the service first so it can ask the game to finish and flush.
-KillMode=mixed
-TimeoutStopSec=90
-
-[Install]
-WantedBy=default.target
-"""
-
-
-def _systemd_quote(arg: str) -> str:
-    arg = arg.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
-    return '"' + arg.replace("%", "%%").replace("$", "$$") + '"'
+def service_command(*, windowless: bool) -> list[str]:
+    """Resolve the service entry point for the checkout or a frozen bundle."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    executable = Path(sys.executable)
+    if windowless:
+        executable = executable.with_name("pythonw.exe")
+        if not executable.is_file():
+            raise RuntimeError(f"windowless Python interpreter not found at {executable}")
+    return [str(executable), "-m", "midgard_farm.service"]
 
 
 def _startup_quarantine(os_: platform.Platform, data: Path, notifier: Notifier,
@@ -93,6 +81,7 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
             try:
                 profile = find_profile(os_.godot_user_data_root())
             except ProfileNotFound as exc:
+                os_.game_running()  # Windows learns its install path even before the profile exists.
                 reason = str(exc)
                 guidance = reason if isinstance(exc, AmbiguousProfile) else START_GAME_AND_UPDATE
                 if reason != last_missing:
@@ -102,7 +91,7 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
                 for path, command in pending_commands(os_):
                     if isinstance(command, Start):
                         refuse_command(os_, state, path, "start", guidance)
-                    elif command == "check_again":
+                    elif command in ("check_again", "restore_official"):
                         refuse_command(os_, state, path, command, guidance)
                     else:
                         path.unlink()
@@ -142,24 +131,49 @@ def main(*, policy: Policy = Policy()) -> int:
     platform.run_isolation_helper()
     # Redirected output on Windows defaults to the ANSI code page, which
     # cannot encode every profile path.
+    # The scheduled action (pythonw or a windowed frozen binary) has neither stream.
     for stream in (sys.stdout, sys.stderr):
-        stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        if stream is not None:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--print-unit", action="store_true", help="print the systemd user unit without installing it")
+    registration = parser.add_mutually_exclusive_group()
+    registration.add_argument("--register", action="store_true", help="register the background service for this user")
+    registration.add_argument("--unregister", action="store_true", help="remove the service registration")
+    registration.add_argument("--print-unit", action="store_true", help="render the systemd user unit")
+    registration.add_argument("--print-task", action="store_true", help="render the Windows Task Scheduler XML")
+    parser.add_argument("--dry-run", action="store_true", help="render the service definition without registering it")
     subcommands = parser.add_subparsers(dest="command")
     launch = subcommands.add_parser("launch", help="launch one attempt with the installed farmer patch")
     launch.add_argument("preset", nargs="?", type=Path, help="JSON preset; defaults to the profile's farmer.cfg")
     launch.add_argument("--session-id", default=os.environ.get("FARMER_SESSION_ID"),
                         help="run a supervised attempt (defaults to FARMER_SESSION_ID)")
     args = parser.parse_args()
+    if args.command and any((args.register, args.unregister, args.print_unit, args.print_task, args.dry_run)):
+        parser.error("service registration options cannot be combined with launch")
+    if args.dry_run and args.unregister:
+        parser.error("--dry-run cannot be combined with --unregister")
     if args.print_unit:
-        argv = [sys.executable]
-        if not getattr(sys, "frozen", False):
-            argv.extend(("-m", "midgard_farm.service"))
-        print(UNIT.format(exec_start=" ".join(map(_systemd_quote, argv))), end="")
+        print(render_unit(service_command(windowless=False)), end="")
         return 0
+    if args.print_task and sys.platform != "win32":
+        parser.error("--print-task is only available on Windows")
 
     os_ = platform.current()
+    if args.register or args.unregister or args.dry_run or args.print_task:
+        try:
+            if args.unregister:
+                os_.unregister_service()
+            else:
+                argv = service_command(windowless=(sys.platform == "win32"))
+                if args.dry_run or args.print_task:
+                    print(os_.render_service(argv), end="")
+                else:
+                    os_.register_service(argv)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            detail = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else None
+            print(f"midgard-farm-service: {str(detail or exc).strip()}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "launch":
         try:
             profile = find_profile(os_.godot_user_data_root())

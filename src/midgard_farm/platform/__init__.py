@@ -97,12 +97,8 @@ class Platform(abc.ABC):
         """This app's per-user data directory."""
 
     @abc.abstractmethod
-    def default_game_dir(self) -> Path:
-        """Where the game is installed when `GAME_DIR` is not set."""
-
     def game_executable(self) -> Path:
-        game_dir = os.environ.get("GAME_DIR")
-        return (Path(game_dir) if game_dir else self.default_game_dir()) / self.game_exe_name
+        """Resolve the installed game executable, honoring per-user overrides."""
 
     @abc.abstractmethod
     def game_pids(self) -> set[int]:
@@ -122,6 +118,18 @@ class Platform(abc.ABC):
     def allocated_bytes(self, path: Path) -> int:
         """Disk blocks allocated to a file; its logical size on Windows."""
         return path.stat().st_size
+
+    @abc.abstractmethod
+    def render_service(self, argv: Sequence[str]) -> str:
+        """Render this user's service definition without installing it."""
+
+    @abc.abstractmethod
+    def register_service(self, argv: Sequence[str]) -> None:
+        """Install or replace the background service without starting it."""
+
+    @abc.abstractmethod
+    def unregister_service(self) -> None:
+        """Remove the background service registration."""
 
     @abc.abstractmethod
     def start_service(self) -> None:

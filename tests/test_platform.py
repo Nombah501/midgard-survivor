@@ -1,12 +1,16 @@
 """The platform seam, exercised against the real OS of the runner."""
 
+import base64
+import json
 import os
 import shutil
 import subprocess
 import sys
 import textwrap
 import time
+import uuid
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
@@ -16,6 +20,8 @@ from midgard_farm.core.profile import find_profile
 from test_profile import godot_root, make_profile
 
 OS = platform.current()
+WINDOWS_CI = sys.platform == "win32" and os.environ.get("GITHUB_ACTIONS") == "true"
+TASK_NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
 
 
 def python(code: str, *args: str, **kwargs) -> subprocess.Popen:
@@ -144,6 +150,49 @@ def test_tree_kill_reaches_grandchildren(tmp_path):
         assert lock_freed_within(lock_path, 5), "grandchild survived the tree kill"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object kill-on-close")
+def test_job_owner_crash_kills_the_root_and_grandchild(tmp_path):
+    ready = tmp_path / "grandchild-ready"
+    root_lock = tmp_path / "root-lock"
+    grandchild_lock = tmp_path / "grandchild-lock"
+    child = textwrap.dedent("""
+        import subprocess, sys, time
+        from pathlib import Path
+        from midgard_farm import platform
+        mode, path, ready, *rest = sys.argv[1:]
+        lock = platform.current().acquire_lock(path)
+        if mode == "root":
+            subprocess.Popen([sys.executable, "-c", rest[0], "leaf", rest[1], ready])
+        else:
+            Path(ready).touch()
+        time.sleep(60)
+    """)
+    with python("""
+        import sys, time
+        from midgard_farm import platform
+        child, root_lock, grandchild_lock, ready = sys.argv[1:]
+        tree = platform.current().spawn_tree(
+            [sys.executable, "-c", child, "root", root_lock, ready, child, grandchild_lock]
+        )
+        time.sleep(60)
+    """, child, str(root_lock), str(grandchild_lock), str(ready)) as owner:
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                assert time.monotonic() < deadline, "grandchild never started"
+                time.sleep(0.02)
+            for lock in (root_lock, grandchild_lock):
+                with pytest.raises(platform.LockHeld):
+                    OS.acquire_lock(lock)
+        finally:
+            # TerminateProcess: no Python context manager or normal cleanup can run.
+            owner.kill()
+            owner.wait(timeout=5)
+            owner.stdout.close()
+        for lock in (root_lock, grandchild_lock):
+            assert lock_freed_within(lock, 5), f"{lock.name} survived the job owner"
+
+
 def test_a_tree_that_exits_on_its_own_reports_its_code():
     with OS.spawn_tree([sys.executable, "-c", "raise SystemExit(7)"]) as tree:
         assert tree.wait(timeout=30) == 7
@@ -252,7 +301,8 @@ def fake_game(tmp_path: Path) -> list[str]:
     return [str(exe), "-c", "import time; time.sleep(60)"]
 
 
-def test_game_pids_see_the_game_by_executable_name(tmp_path):
+def test_game_pids_see_the_game_by_executable_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     # By pid: the operator's real game may be running on this machine.
     with OS.spawn_tree(fake_game(tmp_path), stdout=subprocess.DEVNULL) as game:
         deadline = time.monotonic() + 10
@@ -268,6 +318,41 @@ def test_game_executable_follows_game_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("GAME_DIR", str(tmp_path / "Midgard Survivors"))
 
     assert OS.game_executable() == tmp_path / "Midgard Survivors" / OS.game_exe_name
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows game discovery")
+def test_windows_preflight_explains_an_unknown_game_location(tmp_path, monkeypatch):
+    from midgard_farm.core.preflight import PreflightError, check_prerequisites
+
+    monkeypatch.delenv("GAME_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    os_ = platform.current()
+    monkeypatch.setattr(os_, "game_pids", set)  # The operator could have a real game running.
+    with pytest.raises(PreflightError, match="start the game once so the app can find it"):
+        check_prerequisites(os_, tmp_path / "unused profile")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows game discovery")
+def test_windows_remembers_the_running_executable_across_service_restarts(tmp_path, monkeypatch):
+    monkeypatch.delenv("GAME_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    argv = fake_game(tmp_path)
+    exe = Path(argv[0])
+    with OS.spawn_tree(argv, stdout=subprocess.DEVNULL) as game:
+        # Query a real fake-game PID, but never learn any other running game's location.
+        monkeypatch.setattr(OS, "game_pids", lambda: {game.popen.pid})
+        assert OS.game_running()
+
+    os_ = platform.current()
+    monkeypatch.setattr(os_, "game_pids", set)
+    assert os_.game_executable() == exe
+    configured = tmp_path / "configured game"
+    config = os_.app_data_dir() / "config.json"
+    config.write_text(json.dumps({"game_dir": str(configured)}), encoding="utf-8")
+    assert os_.game_executable() == configured / OS.game_exe_name
+    env_override = tmp_path / "env game"
+    monkeypatch.setenv("GAME_DIR", str(env_override))
+    assert os_.game_executable() == env_override / OS.game_exe_name
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows v1 policy")
@@ -324,3 +409,148 @@ def test_sandbox_kill_pins_a_child_and_checks_its_home_and_session(tmp_path):
         assert tree.popen.poll() is None
         assert os_.kill_owned_sandbox_game(pid, tmp_path, session)
         assert tree.wait(timeout=5) == -9
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="systemd user registration")
+def test_service_registration_writes_and_removes_the_user_unit(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    calls = []
+
+    def systemctl(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", systemctl)
+    argv = ["/opt/Midgard Farm/python", "-m", "midgard_farm.service"]
+    unit = tmp_path / "systemd" / "user" / "midgard-farm.service"
+    rendered = OS.render_service(argv)
+    assert 'ExecStart="/opt/Midgard Farm/python" "-m" "midgard_farm.service"' in rendered
+    assert "Restart=on-failure\n" in rendered
+    assert not unit.exists() and not calls
+
+    OS.register_service(argv)
+    assert unit.read_text(encoding="utf-8") == rendered
+    OS.unregister_service()
+    assert not unit.exists()
+    assert calls == [["systemctl", "--user", "daemon-reload"]] * 2
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Task Scheduler")
+def test_windows_task_xml_and_registration_commands(tmp_path, monkeypatch):
+    sid = "S-1-5-21-123-456-789-1001"
+    calls = []
+    registered = []
+
+    def run(argv, **kwargs):
+        tool = Path(argv[0]).name.lower()
+        if tool == "whoami.exe":
+            return subprocess.CompletedProcess(argv, 0, stdout=f'"PC\\user","{sid}"\r\n')
+        assert tool == "schtasks.exe"
+        calls.append(argv[1:])
+        assert kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW
+        if argv[1] == "/Create":
+            registered.append(Path(argv[argv.index("/XML") + 1]).read_text(encoding="utf-16"))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    executable = str(tmp_path / "Мидгард & Farm" / "pythonw.exe")
+    argv = [executable, "-m", "midgard_farm.service", "some & arg"]
+    text = OS.render_service(argv)
+    assert not calls
+    task = ElementTree.fromstring(text)
+    expected = {
+        "t:Triggers/t:LogonTrigger/t:UserId": sid,
+        "t:Triggers/t:LogonTrigger/t:ExecutionTimeLimit": "PT0S",
+        "t:Principals/t:Principal/t:UserId": sid,
+        "t:Principals/t:Principal/t:LogonType": "InteractiveToken",
+        "t:Principals/t:Principal/t:RunLevel": "LeastPrivilege",
+        "t:Settings/t:Hidden": "true",
+        "t:Settings/t:RestartOnFailure/t:Count": "3",
+        "t:Settings/t:RestartOnFailure/t:Interval": "PT1M",
+        "t:Settings/t:ExecutionTimeLimit": "PT0S",
+        "t:Settings/t:MultipleInstancesPolicy": "IgnoreNew",
+        "t:Settings/t:DisallowStartIfOnBatteries": "false",
+        "t:Settings/t:StopIfGoingOnBatteries": "false",
+        "t:Actions/t:Exec/t:Command": executable,
+        "t:Actions/t:Exec/t:Arguments": '-m midgard_farm.service "some & arg"',
+    }
+    for selector, value in expected.items():
+        assert task.findtext(selector, namespaces=TASK_NS) == value
+
+    OS.register_service(argv)
+    OS.start_service()
+    OS.unregister_service()
+    assert registered == [text]
+    assert calls[0][:4] == ["/Create", "/TN", "Midgard Farm", "/XML"]
+    assert calls[0][5:] == ["/F"]
+    assert not Path(calls[0][4]).exists()
+    assert calls[1:] == [["/Run", "/TN", "Midgard Farm"], ["/Delete", "/TN", "Midgard Farm", "/F"]]
+
+
+@pytest.mark.skipif(not WINDOWS_CI, reason="real Task Scheduler round trip on Windows CI only")
+def test_windows_scheduler_accepts_and_deletes_the_task(monkeypatch):
+    from midgard_farm.platform import windows
+
+    task_name = f"Midgard Farm CI {uuid.uuid4().hex}"
+    monkeypatch.setattr(windows, "SERVICE_TASK_NAME", task_name)
+    query = ["schtasks.exe", "/Query", "/TN", task_name, "/XML"]
+    argv = [sys.executable, "-c", "pass"]
+    try:
+        OS.register_service(argv)
+        result = subprocess.run(query, check=True, capture_output=True, timeout=20)
+        # `schtasks /Query /XML` emits UTF-16 (unlike regular console queries).
+        xml = result.stdout
+        if xml.startswith(b"\xff\xfe") or b"\0" in xml[:8]:
+            xml = xml.decode("utf-16-le").lstrip("\ufeff").encode("utf-8")
+        root = ElementTree.fromstring(xml.decode("utf-8").strip())
+        assert root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=TASK_NS) == "-c pass"
+        assert root.findtext("t:Settings/t:Hidden", namespaces=TASK_NS) == "true"
+    finally:
+        # A failed registration must not replace its useful error with a missing-task error.
+        if subprocess.run(query, capture_output=True, timeout=20).returncode == 0:
+            OS.unregister_service()
+    assert subprocess.run(query, capture_output=True, timeout=20).returncode != 0
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows desktop notifications")
+def test_windows_toast_arguments_are_windowless_and_escape_xml(monkeypatch):
+    def run(argv, **kwargs):
+        assert Path(argv[0]).name == "powershell.exe"
+        assert argv[1:4] == ["-NoProfile", "-NonInteractive", "-EncodedCommand"]
+        assert kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW
+        assert kwargs["timeout"] == 10
+        env = kwargs["env"]
+        xml = ElementTree.fromstring(env["MIDGARD_FARM_TOAST_XML"])
+        assert [node.text for node in xml.findall(".//text")] == ["Test & title", "<message>"]
+        assert xml.find("audio").get("silent") == "true"
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    OS.notify_desktop("Test & title", "<message>", "low")
+
+
+@pytest.mark.skipif(not WINDOWS_CI, reason="real PowerShell parser on Windows CI only")
+def test_windows_toast_script_parses_without_showing_a_toast(monkeypatch):
+    run = subprocess.run
+
+    def parse_only(argv, **kwargs):
+        wrapper = b64_powershell("""
+            $tokens = $null; $errors = $null
+            $source = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:TOAST_UNDER_TEST))
+            [System.Management.Automation.Language.Parser]::ParseInput(
+                $source, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -ne 0) { $errors | Out-String | Write-Error; exit 1 }
+            exit 0
+        """)
+        result = run([*argv[:-1], wrapper], **(kwargs | {"check": False, "env": kwargs["env"] | {
+            "TOAST_UNDER_TEST": argv[-1],
+        }}))
+        assert result.returncode == 0, result.stderr
+        return result
+
+    monkeypatch.setattr(subprocess, "run", parse_only)
+    OS.notify_desktop("Parser only", "No notification is displayed", "high")
+
+
+def b64_powershell(code: str) -> str:
+    return base64.b64encode(textwrap.dedent(code).encode("utf-16-le")).decode("ascii")

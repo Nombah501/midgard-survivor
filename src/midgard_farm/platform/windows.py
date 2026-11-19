@@ -4,12 +4,15 @@ import ctypes
 import msvcrt
 import os
 import subprocess
+import sys
+import tempfile
 import time
 from collections.abc import Sequence
 from ctypes import wintypes
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from ..core.config import read_config
 from . import InstanceLock, LockHeld, NotificationPriority, Platform, ProcessTree, check_argv
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -20,6 +23,42 @@ _GODOT_USER_DATA = Path("Godot", "app_userdata")
 
 SERVICE_TASK_NAME = "Midgard Farm"
 
+_TASK_XML = """\
+<?xml version="1.0"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+      <UserId>{sid}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Operator">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Operator">
+    <Exec>
+      <Command>{command}</Command>
+{arguments}      <WorkingDirectory>{directory}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
 ERROR_ACCESS_DENIED = 5
 ERROR_SHARING_VIOLATION = 32
 ERROR_LOCK_VIOLATION = 33
@@ -29,16 +68,19 @@ MOVEFILE_REPLACE_EXISTING = 0x1
 CREATE_SUSPENDED = 0x4
 CREATE_NO_WINDOW = 0x08000000
 MOVEFILE_WRITE_THROUGH = 0x8
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 # A reader (the window polling a status file) may briefly hold the target open.
 REPLACE_RETRY_SECONDS = 2.0
 
 _TOAST_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $appId = 'Midgard.Farm'
-# A per-user identity needs no desktop window, shortcut target or administrator.
+# The task uses the signed-in user's token: register the identity in that user's hive.
 $key = "HKCU:\Software\Classes\AppUserModelId\$appId"
-if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-New-ItemProperty -Path $key -Name DisplayName -Value 'Midgard Farm' -Force | Out-Null
+if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+New-ItemProperty -LiteralPath $key -Name DisplayName -PropertyType String -Value 'Midgard Farm' -Force | Out-Null
 
 [Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null
 [Windows.UI.Notifications.ToastNotification,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null
@@ -47,7 +89,8 @@ $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
 $xml.LoadXml($env:MIDGARD_FARM_TOAST_XML)
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 if ($env:MIDGARD_FARM_TOAST_PRIORITY -eq 'high') { $toast.Priority = 1 }
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+$notifier.Show($toast)
 """
 _TOAST_COMMAND = base64.b64encode(_TOAST_SCRIPT.encode("utf-16-le")).decode("ascii")
 
@@ -59,6 +102,31 @@ class _OVERLAPPED(ctypes.Structure):
         ("Offset", wintypes.DWORD),
         ("OffsetHigh", wintypes.DWORD),
         ("hEvent", wintypes.HANDLE),
+    ]
+
+
+class _JOB_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _JOB_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOB_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", ctypes.c_uint64 * 6),  # IO_COUNTERS, reserved by this info class.
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
     ]
 
 
@@ -79,6 +147,9 @@ _MoveFileExW.restype = wintypes.BOOL
 _CreateJobObjectW = _kernel32.CreateJobObjectW
 _CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
 _CreateJobObjectW.restype = wintypes.HANDLE
+_SetInformationJobObject = _kernel32.SetInformationJobObject
+_SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+_SetInformationJobObject.restype = wintypes.BOOL
 _AssignProcessToJobObject = _kernel32.AssignProcessToJobObject
 _AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
 _AssignProcessToJobObject.restype = wintypes.BOOL
@@ -88,6 +159,14 @@ _TerminateJobObject.restype = wintypes.BOOL
 _CloseHandle = _kernel32.CloseHandle
 _CloseHandle.argtypes = [wintypes.HANDLE]
 _CloseHandle.restype = wintypes.BOOL
+_OpenProcess = _kernel32.OpenProcess
+_OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_OpenProcess.restype = wintypes.HANDLE
+_QueryFullProcessImageNameW = _kernel32.QueryFullProcessImageNameW
+_QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+]
+_QueryFullProcessImageNameW.restype = wintypes.BOOL
 _NtResumeProcess = _ntdll.NtResumeProcess
 _NtResumeProcess.argtypes = [wintypes.HANDLE]
 _NtResumeProcess.restype = ctypes.c_long
@@ -103,6 +182,26 @@ def _env_dir(name: str) -> Path:
     if not value:
         raise RuntimeError(f"%{name}% is not set")
     return Path(value)
+
+
+def _system_tool(tool: str, *args: str) -> str:
+    command = _env_dir("SystemRoot") / "System32" / tool
+    return subprocess.run([str(command), *args], creationflags=CREATE_NO_WINDOW,
+                          check=True, capture_output=True, text=True, errors="replace", timeout=15).stdout
+
+
+def _process_image(pid: int) -> Path | None:
+    handle = _OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None  # The process may have exited or belong to another user.
+    try:
+        path = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(path))
+        if _QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
+            return Path(path.value)
+        return None
+    finally:
+        _CloseHandle(handle)
 
 
 class _FileLock(InstanceLock):
@@ -124,9 +223,11 @@ class _JobTree(ProcessTree):
 
     def kill(self) -> None:
         if self._job is not None:
-            _check(_TerminateJobObject(self._job, 1))
-            _CloseHandle(self._job)
-            self._job = None
+            try:
+                _check(_TerminateJobObject(self._job, 1))
+            finally:
+                _CloseHandle(self._job)
+                self._job = None
         self.popen.wait()
 
     def wait(self, timeout: float | None = None) -> int:
@@ -150,9 +251,68 @@ class WindowsPlatform(Platform):
     def app_data_dir(self) -> Path:
         return _env_dir("LOCALAPPDATA") / "MidgardFarm"
 
-    def default_game_dir(self) -> Path:
-        # The game ships as a ZIP unpacked anywhere; no install location to assume.
-        raise RuntimeError("the game folder is unknown on Windows; set GAME_DIR")
+    def game_executable(self) -> Path:
+        if game_dir := os.environ.get("GAME_DIR"):
+            return Path(game_dir) / self.game_exe_name
+        if configured := read_config(self).game_dir:
+            return configured / self.game_exe_name
+        if executable := self._known_game() or self._remember_game(self.game_pids()):
+            return executable
+        raise RuntimeError("start the game once so the app can find it")
+
+    def _game_location_path(self) -> Path:
+        return self.app_data_dir() / "game-executable.txt"
+
+    def _known_game(self) -> Path | None:
+        try:
+            executable = Path(self.read_shared(self._game_location_path()).decode("utf-8"))
+        except (OSError, UnicodeError):
+            return None
+        if self._is_game_executable(executable):
+            return executable
+        return None
+
+    def _is_game_executable(self, executable: Path) -> bool:
+        return (executable.is_absolute() and executable.name.casefold() == self.game_exe_name.casefold()
+                and executable.is_file())
+
+    def _remember_game(self, pids: set[int]) -> Path | None:
+        for pid in sorted(pids):
+            executable = _process_image(pid)
+            # The PID may have been reused since tasklist took its snapshot.
+            if executable is None or not self._is_game_executable(executable):
+                continue
+            location = self._game_location_path()
+            try:
+                location.parent.mkdir(parents=True, exist_ok=True)
+                self.write_atomic(location, str(executable).encode("utf-8"))
+            except OSError as exc:
+                print(f"midgard-farm-service: could not remember game location: {exc}", file=sys.stderr)
+            return executable
+        return None
+
+    def render_service(self, argv: Sequence[str]) -> str:
+        command, *args = check_argv(argv)
+        # Use the actual caller's SID, not a possibly ambiguous environment username.
+        rows = csv.reader(_system_tool("whoami.exe", "/User", "/FO", "CSV", "/NH").splitlines())
+        identity = next(rows, [])
+        if len(identity) != 2 or not identity[1].startswith("S-1-"):
+            raise RuntimeError("could not identify the current Windows user")
+        directory = Path(command).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
+        arguments = f"      <Arguments>{escape(subprocess.list2cmdline(args))}</Arguments>\n" if args else ""
+        return _TASK_XML.format(sid=escape(identity[1]), command=escape(command),
+                                arguments=arguments, directory=escape(str(directory)))
+
+    def register_service(self, argv: Sequence[str]) -> None:
+        xml = self.render_service(argv)
+        with tempfile.TemporaryDirectory(prefix="midgard-farm-task-") as temporary:
+            path = Path(temporary) / "task.xml"
+            # schtasks accepts UTF-16LE with a BOM, including non-ASCII paths.
+            path.write_text(xml, encoding="utf-16")
+            _system_tool("schtasks.exe", "/Create", "/TN", SERVICE_TASK_NAME, "/XML", str(path), "/F")
+
+    def unregister_service(self) -> None:
+        _system_tool("schtasks.exe", "/Delete", "/TN", SERVICE_TASK_NAME, "/F")
 
     def start_service(self) -> None:
         subprocess.run(["schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME], creationflags=CREATE_NO_WINDOW,
@@ -169,16 +329,19 @@ class WindowsPlatform(Platform):
                        creationflags=CREATE_NO_WINDOW, check=True, capture_output=True, timeout=10)
 
     def game_pids(self) -> set[int]:
-        out = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {self.game_exe_name}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, check=True, creationflags=CREATE_NO_WINDOW,
-        ).stdout
+        out = _system_tool("tasklist.exe", "/FI", f"IMAGENAME eq {self.game_exe_name}", "/FO", "CSV", "/NH")
         # One `"name","pid",...` row per match; otherwise an "INFO: No tasks" line.
         return {
             int(row[1])
             for row in csv.reader(out.splitlines())
             if len(row) > 1 and row[0].lower() == self.game_exe_name.lower()
         }
+
+    def game_running(self) -> bool:
+        pids = self.game_pids()
+        if pids and self._known_game() is None:
+            self._remember_game(pids)
+        return bool(pids)
 
     def acquire_lock(self, path) -> InstanceLock:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOINHERIT)
@@ -203,6 +366,11 @@ class WindowsPlatform(Platform):
         _check(job)
         flags = popen_kwargs.pop("creationflags", 0) | CREATE_SUSPENDED
         try:
+            # The service owns the only handle; a crash must terminate the game too.
+            limits = _JOB_EXTENDED_LIMIT_INFORMATION()
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            _check(_SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                                            ctypes.byref(limits), ctypes.sizeof(limits)))
             popen = subprocess.Popen(check_argv(argv), creationflags=flags, **popen_kwargs)
         except BaseException:
             _CloseHandle(job)
