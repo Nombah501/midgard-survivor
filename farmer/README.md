@@ -279,7 +279,7 @@ AFK-цикл: забег идёт до смерти/победы (на SinX D25 
 | `game_speed` | 3 | штатный режим игры 1–3 (frenzy/game_fast) |
 | `run_minutes` | 12 | таймаут забега по игровому времени |
 | `arena_wall_max` | 180 | таймаут арены MVP по реальному времени |
-| `stall_seconds` | 45 | watchdog: часы игры не идут |
+| `stall_seconds` | 45 | watchdog: не идут часы игры (`STALL`) или время забега (`RUN_STALL`); после 3 попыток забег завершается принудительно |
 | `endless` | false | продолжать после MVP |
 | `endless_minutes`/`endless_mvps` | 4/0 | бюджет endless |
 | `max_runs`/`max_minutes`/`stop_after_wins` | 0 | лимиты сессии |

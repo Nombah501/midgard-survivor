@@ -69,6 +69,14 @@ def endless(run: Run, driven: Driven, status: dict) -> None:
     _marker(run, "ENDLESS_DONE")
 
 
+def run_stall(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    _marker(run, "RUN_STALL")
+    _marker(run, "tries=3")
+    need((status.get("last") or {}).get("forced"), "frozen run was not forced")
+
+
 def failed(run: Run, driven: Driven, status: dict, reason: str) -> None:
     _exit(driven, 1)
     need(status.get("phase") == "failed", "phase != failed")

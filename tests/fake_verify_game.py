@@ -93,7 +93,8 @@ def account(row):
 
 def settle(force, *, wait_at_keep=False):
     row = {"session": session, "run_id": run_id, "zeny_gain": 20, "kills": 15, "game_s": 7, "victory": True,
-           "endless": cfg.get("endless"), "endless_mvps": 3, "kept": [], "force_reason": force}
+           "endless": cfg.get("endless"), "endless_mvps": 3, "kept": [], "force_reason": force,
+           "forced": os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1" and fault != "unforced-stall"}
     if fault == "no-victory":
         row["victory"] = False
     if fault == "no-mvp":
@@ -190,6 +191,9 @@ if cfg.get("keep_on_defeat"):
         time.sleep(0.02)
 if cfg.get("run_minutes") == 0.2 and started == 1:
     time.sleep(0.65)  # Leave time for the supervisor driver to see r1.
+if os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1":
+    for tries in (1, 2, 3):
+        log(f"RUN_STALL clock={tries * 5.0:.1f} t=12.0 tries={tries}")
 if os.environ.get("FARMER_TEST_FLUSH_FAIL") == "1":
     log("FAIL flush_failed")
     status("failed", "flush_failed", 1)

@@ -21,7 +21,7 @@ from test_profile import make_profile
 ALL = (
     "one-run", "stop", "endless", "flush-fail", "crash-run", "crash-settled", "crash-journaled",
     "cmd-finish", "cmd-abort", "cmd-abort-settled", "cmd-pause-resume", "cmd-legacy", "checkpoint-corrupt",
-    "supervised-kill-run", "supervised-crash-settled",
+    "supervised-kill-run", "supervised-crash-settled", "run-stall",
 )
 
 
@@ -133,6 +133,7 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
     ("cmd-pause-resume", "pause-starts-run", "paused farmer started another run"),
     ("cmd-abort-settled", "kept-on-abort", "abort kept an item"),
     ("checkpoint-corrupt", "profile-mutated", "profile changed"),
+    ("run-stall", "unforced-stall", "frozen run was not forced"),
 ])
 def test_judges_reject_wrong_evidence(verification, monkeypatch, name, fault, reason):
     monkeypatch.setenv("FAKE_VERIFY_FAULT", fault)

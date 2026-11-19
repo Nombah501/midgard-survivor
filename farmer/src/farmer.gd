@@ -84,6 +84,7 @@ var _finish_after_run := ""
 var _pause_requested := false
 var _hard_finished := false
 var _test_wait_at_keep := false
+var _test_freeze_run_time := false
 
 var _potential_script = null
 var _vanilla_input_seen := false
@@ -111,6 +112,7 @@ func _ready() -> void:
 	if session_id == "":
 		session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
 	_test_wait_at_keep = _test_env("WAIT_AT_KEEP") == "1"
+	_test_freeze_run_time = _test_env("FREEZE_RUN_TIME") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
 	_mark_transition("boot")
@@ -544,6 +546,8 @@ func _check_watchdog(now: int) -> void:
 	_paused_since_ms = 0
 	var clock := float(world.clock)
 	var t := float(world.time)
+	if _test_freeze_run_time and _time_last >= 0.0:
+		t = _time_last
 	if _clock_last < 0.0 or not is_equal_approx(clock, _clock_last):
 		_clock_last = clock
 		_clock_change_ms = now
@@ -558,16 +562,28 @@ func _check_watchdog(now: int) -> void:
 		var st := str(world.raid.state)
 		if st == "portal" or st == "loading" or st == "intro" or st == "fight" or st == "won":
 			frozen_reason = "raid"
-	if frozen_reason == "" and now - _clock_change_ms > int(stall_s * 1000.0):
-		_stall_tries += 1
-		_log("STALL clock=%.1f t=%.1f tries=%d" % [clock, t, _stall_tries])
-		if world.menus != null and is_instance_valid(world.menus):
-			world.menus.close()
-		get_tree().paused = false
-		_clock_change_ms = now
-		if _stall_tries >= 3:
-			run_state["forced"] = true
-			_end_run_safe(false)
+	if frozen_reason != "":
+		return
+	# Engine clock frozen, or the run's own time frozen while the clock ticks
+	# (2026-11-19: a run sat at t=640 with no enemies for 6.5 h; the clock-only
+	# check never fired and the heartbeat stayed healthy).
+	var stalled := ""
+	if now - _clock_change_ms > int(stall_s * 1000.0):
+		stalled = "STALL"
+	elif now - _time_change_ms > int(stall_s * 1000.0):
+		stalled = "RUN_STALL"
+	if stalled == "":
+		return
+	_stall_tries += 1
+	_log("%s clock=%.1f t=%.1f tries=%d" % [stalled, clock, t, _stall_tries])
+	if world.menus != null and is_instance_valid(world.menus):
+		world.menus.close()
+	get_tree().paused = false
+	_clock_change_ms = now
+	_time_change_ms = now
+	if _stall_tries >= 3:
+		run_state["forced"] = true
+		_end_run_safe(false)
 
 
 func _check_command(now: int) -> void:

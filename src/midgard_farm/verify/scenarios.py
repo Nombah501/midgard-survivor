@@ -77,6 +77,11 @@ SCENARIOS = {
     # Supervisor exit and final status; duration, heartbeat, RSS and disk thresholds;
     # at least one settlement, unique IDs and all journal-backed totals match.
     "soak": Scenario(1800, {}, partial(drive.supervised, sample=True), judges.soak, True),
+    # Watchdog sees the run's own time frozen while the engine clock ticks
+    # (2026-11-19 night: t=640 for 6.5 h): three RUN_STALL tries force the run
+    # to end, and the session still finishes at max_runs.
+    "run-stall": Scenario(180, {"run_minutes": 0.0, "stall_seconds": 5.0},
+                          partial(drive.direct, FARMER_TEST_FREEZE_RUN_TIME="1"), judges.run_stall),
 }
 
 
