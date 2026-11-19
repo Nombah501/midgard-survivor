@@ -42,6 +42,7 @@ class _GroupTree(ProcessTree):
 
 
 class LinuxPlatform(Platform):
+    release_os = "linux"
     game_exe_name = "MidgardSurvivors.x86_64"
 
     def godot_user_data_root(self) -> Path:

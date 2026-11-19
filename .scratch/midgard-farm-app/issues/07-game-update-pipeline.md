@@ -14,3 +14,8 @@
 - [ ] A Game reinstall triggers nothing automatic and reports 'start the game and accept the update'.
 - [ ] History lines and notifications are emitted for every outcome as specified.
 - [ ] ADR 0005 holds as written.
+
+## Comments
+
+- 2026-11-19 (review of ticket 03): `farmer_patch.snapshot_official_state` raises while the farmer pack is mounted. Pipeline step 1, refreshing the official state, works after a Game update because the farmer pack is gone by then. On a Farmer hash change the farmer pack is still mounted, so the pipeline must skip the refresh and keep the existing `patches/official-state.json`. Cover this with a test.
+- Install re-checks for a running game after staging, but a narrow window remains before the state write, and no test covers it. The pipeline's "game running → wait" gate is the primary guard.

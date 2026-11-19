@@ -11,3 +11,7 @@
 - [ ] Toast notifications appear from the windowless service.
 - [ ] On gpu-pc: the farmer patch builds byte-identically to Linux, and a supervised session of several runs finishes with a correct terminal outcome despite the missing exit code.
 - [ ] The missing isolation and its risks (updater prompt, CloudSave race) are documented in the README.
+
+## Comments
+
+- 2026-11-19 (review of ticket 03): the injectors (`farmer/tools/inject_hook.py`, `patch_player.py`) write text with the platform's default newline, so on Windows the injected `.gd` files get CRLF. Byte-identical Linux and Windows builds are therefore assumed, not yet tested, on the Python path. Check this first on gpu-pc. If the packs differ, make the injectors write `\n`; that changes the Farmer hash inputs, so rebuild on both machines.

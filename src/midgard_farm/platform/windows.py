@@ -108,6 +108,7 @@ class _JobTree(ProcessTree):
 
 
 class WindowsPlatform(Platform):
+    release_os = "windows"
     game_exe_name = "MidgardSurvivors.exe"
 
     def godot_user_data_root(self) -> Path:

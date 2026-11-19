@@ -54,6 +54,12 @@ class ProcessTree(abc.ABC):
 
 
 class Platform(abc.ABC):
+    release_os: str
+    """OS id for picking per-OS release assets, e.g. GDRE."""
+
+    game_exit_status_reliable: bool
+    """Whether the game exit code can veto an otherwise clean terminal status."""
+
     game_exe_name: str
     """File name of the game executable on this OS."""
 
