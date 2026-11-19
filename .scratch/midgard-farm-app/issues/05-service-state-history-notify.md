@@ -4,12 +4,12 @@
 
 **Blocked by:** 04.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The state file is refreshed periodically; a stale file is distinguishable from an idle service.
-- [ ] Each session terminal outcome appends one history line with totals; the format is backward-compatible by design.
-- [ ] Notification events and priorities match the spec; a failing notifier never blocks recovery.
-- [ ] The ntfy URL comes from a config file; there is no settings UI.
+- [x] The state file is refreshed periodically; a stale file is distinguishable from an idle service.
+- [x] Each session terminal outcome appends one history line with totals; the format is backward-compatible by design.
+- [x] Notification events and priorities match the spec; a failing notifier never blocks recovery.
+- [x] The ntfy URL comes from a config file; there is no settings UI.
 
 ## Comments
 
@@ -18,3 +18,12 @@
   - Notifications go through one `notify(event, message)` hook (ntfy only); add desktop notifications behind it.
   - The state file must expose, from these records, the last outcome, a quarantine (with reason) and refused commands, so the window can show why a Start did nothing.
   - Desktop notifications (`notify-send`) were dropped when the old supervisor was ported; restore them here.
+- 2026-11-20: Done in `3adfade` and `0abd4ad`; CI run 44600114868 passed on Linux and Windows.
+  - Contract:
+    - `state.json` v1: kind, reason, updated_at, refresh_interval, session_id, farmer_phase, last_heartbeat, last_outcome, quarantine {reason, detail, next_action}, command_refusals. `read_state(os_)` reports STALE when the file is older than 3× refresh.
+    - `history.jsonl` v1: a `session` row with totals that mirror `farmer/tools/summary.py`, plus `append_event(os_, "game_update" | "app_update", …)`. Readers skip unknown fields and a torn last line.
+    - `Notifier`: desktop (`notify-send`, or a Windows toast via a hidden PowerShell process with no console) plus ntfy from `config.json` `{"ntfy_url": …}`. Priorities follow the spec; the drain is bounded.
+  - `Platform.read_shared` retries Windows sharing violations while a file is replaced; every reader of replaced files uses it.
+  - Independent review: CHANGES_REQUIRED; the major and all minors are fixed.
+  - The window (08) must read a session quarantine from its log dir; the top-level `quarantine.json` is only the startup quarantine.
+  - Windows toast delivery is still unverified on real Windows (ticket 10).
