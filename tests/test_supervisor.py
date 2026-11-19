@@ -32,7 +32,9 @@ FAKE = Path(__file__).with_name("fake_supervised_game.py")
 POSIX = pytest.mark.skipif(sys.platform != "linux", reason="Linux process signals and permissions")
 
 
-def wait_for(read, predicate=bool, *, seconds=8):
+def wait_for(read, predicate=bool, *, seconds=20):
+    # Generous: a passing test returns as soon as the condition holds; the
+    # budget only bounds a real failure, and windows-latest runs slowly.
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         try:
