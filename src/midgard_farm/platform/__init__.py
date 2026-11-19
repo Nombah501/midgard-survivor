@@ -54,6 +54,9 @@ class ProcessTree(abc.ABC):
 
 
 class Platform(abc.ABC):
+    game_exe_name: str
+    """File name of the game executable on this OS."""
+
     @abc.abstractmethod
     def godot_user_data_root(self) -> Path:
         """Godot's root for `user://` folders of apps without a custom user dir."""
@@ -61,6 +64,21 @@ class Platform(abc.ABC):
     @abc.abstractmethod
     def app_data_dir(self) -> Path:
         """This app's per-user data directory."""
+
+    @abc.abstractmethod
+    def default_game_dir(self) -> Path:
+        """Where the game is installed when `GAME_DIR` is not set."""
+
+    def game_executable(self) -> Path:
+        game_dir = os.environ.get("GAME_DIR")
+        return (Path(game_dir) if game_dir else self.default_game_dir()) / self.game_exe_name
+
+    @abc.abstractmethod
+    def game_pids(self) -> set[int]:
+        """Processes running the game executable, from any folder."""
+
+    def game_running(self) -> bool:
+        return bool(self.game_pids())
 
     @abc.abstractmethod
     def acquire_lock(self, path: str | os.PathLike) -> InstanceLock:

@@ -42,11 +42,29 @@ class _GroupTree(ProcessTree):
 
 
 class LinuxPlatform(Platform):
+    game_exe_name = "MidgardSurvivors.x86_64"
+
     def godot_user_data_root(self) -> Path:
         return _xdg_data_home() / "godot" / "app_userdata"
 
     def app_data_dir(self) -> Path:
         return _xdg_data_home() / "midgard-farm"
+
+    def default_game_dir(self) -> Path:
+        return Path.home() / "games" / "midgard-survivors"
+
+    def game_pids(self) -> set[int]:
+        # The argv[0] name, as `pgrep -f` matched in run.sh: `unshare` execs
+        # the game, so an isolated game shows its own path there.
+        pids = set()
+        for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+            try:
+                argv0 = cmdline.read_bytes().split(b"\0", 1)[0]
+            except OSError:  # exited meanwhile, or not ours to read
+                continue
+            if os.path.basename(os.fsdecode(argv0)) == self.game_exe_name:
+                pids.add(int(cmdline.parent.name))
+        return pids
 
     def acquire_lock(self, path) -> InstanceLock:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)

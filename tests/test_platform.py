@@ -1,5 +1,7 @@
 """The platform seam, exercised against the real OS of the runner."""
 
+import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -143,3 +145,33 @@ def test_readers_see_old_or_new_content_never_a_mix(tmp_path):
     assert seen == {old, new}
     assert target.read_bytes() == old
     assert [p.name for p in tmp_path.iterdir()] == [target.name]
+
+
+def fake_game(tmp_path: Path) -> list[str]:
+    """A long-running command whose executable has the game's file name."""
+    exe = tmp_path / "game dir" / OS.game_exe_name
+    exe.parent.mkdir()
+    if sys.platform == "win32":
+        # A standalone system tool keeps working under another name.
+        shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", exe)
+        return [str(exe), "-n", "60", "127.0.0.1"]
+    exe.symlink_to(os.path.realpath(sys.executable))
+    return [str(exe), "-c", "import time; time.sleep(60)"]
+
+
+def test_game_pids_see_the_game_by_executable_name(tmp_path):
+    # By pid: the operator's real game may be running on this machine.
+    with OS.spawn_tree(fake_game(tmp_path), stdout=subprocess.DEVNULL) as game:
+        deadline = time.monotonic() + 10
+        while game.popen.pid not in OS.game_pids():
+            assert time.monotonic() < deadline, "running game not seen"
+            time.sleep(0.05)
+        assert OS.game_running()
+        game.kill()
+        assert game.popen.pid not in OS.game_pids()
+
+
+def test_game_executable_follows_game_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("GAME_DIR", str(tmp_path / "Midgard Survivors"))
+
+    assert OS.game_executable() == tmp_path / "Midgard Survivors" / OS.game_exe_name

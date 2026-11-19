@@ -1,3 +1,4 @@
+import csv
 import ctypes
 import msvcrt
 import os
@@ -18,8 +19,9 @@ ERROR_LOCK_VIOLATION = 33
 LOCKFILE_FAIL_IMMEDIATELY = 0x1
 LOCKFILE_EXCLUSIVE_LOCK = 0x2
 MOVEFILE_REPLACE_EXISTING = 0x1
-MOVEFILE_WRITE_THROUGH = 0x8
 CREATE_SUSPENDED = 0x4
+CREATE_NO_WINDOW = 0x08000000
+MOVEFILE_WRITE_THROUGH = 0x8
 # A reader (the window polling a status file) may briefly hold the target open.
 REPLACE_RETRY_SECONDS = 2.0
 
@@ -106,11 +108,29 @@ class _JobTree(ProcessTree):
 
 
 class WindowsPlatform(Platform):
+    game_exe_name = "MidgardSurvivors.exe"
+
     def godot_user_data_root(self) -> Path:
         return _env_dir("APPDATA") / "Godot" / "app_userdata"
 
     def app_data_dir(self) -> Path:
         return _env_dir("LOCALAPPDATA") / "MidgardFarm"
+
+    def default_game_dir(self) -> Path:
+        # The game ships as a ZIP unpacked anywhere; no install location to assume.
+        raise RuntimeError("the game folder is unknown on Windows; set GAME_DIR")
+
+    def game_pids(self) -> set[int]:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {self.game_exe_name}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, check=True, creationflags=CREATE_NO_WINDOW,
+        ).stdout
+        # One `"name","pid",...` row per match; otherwise an "INFO: No tasks" line.
+        return {
+            int(row[1])
+            for row in csv.reader(out.splitlines())
+            if len(row) > 1 and row[0].lower() == self.game_exe_name.lower()
+        }
 
     def acquire_lock(self, path) -> InstanceLock:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOINHERIT)
