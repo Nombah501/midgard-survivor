@@ -15,3 +15,4 @@
 ## Comments
 
 - 2026-11-19 (review of ticket 03): the injectors (`farmer/tools/inject_hook.py`, `patch_player.py`) write text with the platform's default newline, so on Windows the injected `.gd` files get CRLF. Byte-identical Linux and Windows builds are therefore assumed, not yet tested, on the Python path. Check this first on gpu-pc. If the packs differ, make the injectors write `\n`; that changes the Farmer hash inputs, so rebuild on both machines.
+- 2026-11-20 (from ticket 08): the window's "Start service" runs the scheduled task named `Midgard Farm` (`platform/windows.py` `SERVICE_TASK_NAME`). Register the task under exactly that name. On Linux the window runs `systemctl --user start midgard-farm.service`.
