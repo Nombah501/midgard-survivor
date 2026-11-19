@@ -80,7 +80,16 @@ class Farm:
             if paths:
                 path = paths[0]
                 return json.loads(self.os_.read_shared(path)), path.parent
-        return wait_for(read)
+        result = wait_for(read)
+        # The service logs its terminal notification just after publishing the
+        # outcome; on Windows the fixture hard-kills it soon after. Give the log a
+        # bounded chance to catch up (runners without notify lines just time out).
+        deadline = time.monotonic() + 2
+        output = self.plan.with_suffix(".output")
+        while output.exists() and time.monotonic() < deadline and not any(
+                event in ("stop", "goal", "quarantine") for event in self.notifications()):
+            time.sleep(0.01)
+        return result
 
     @contextmanager
     def service(self, *, runner=SERVICE, **policy):
