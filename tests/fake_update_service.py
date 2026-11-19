@@ -12,6 +12,8 @@ from unittest.mock import patch
 from midgard_farm import platform, service
 from midgard_farm.core.farmer_patch import gdre
 
+from fake_notification_service import fixture_shutdown_request
+
 
 class FakeGamePlatform(type(platform.current())):
     game_exe_name = "midgard-update-fixture.exe" if sys.platform == "win32" else "midgard-update-fixture"
@@ -44,6 +46,7 @@ def main():
     sources = Path(os.environ["FAKE_FARMER_SOURCES"])
     policy = service.Policy(**json.loads(os.environ["FAKE_SERVICE_POLICY"]))
     with ExitStack() as stack:
+        stack.enter_context(patch.object(service, "shutdown_request", fixture_shutdown_request))
         stack.enter_context(patch.object(platform, "current", return_value=FakeGamePlatform()))
         stack.enter_context(patch.object(gdre, "prepare", return_value=gdre.Gdre(command, "fake-update")))
         stack.enter_context(patch.object(importlib.import_module("midgard_farm.core.farmer_patch.build"),

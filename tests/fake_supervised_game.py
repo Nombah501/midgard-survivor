@@ -8,6 +8,9 @@ import sys
 import time
 from pathlib import Path
 
+from midgard_farm import platform
+
+os_ = platform.current()
 profile = Path(os.environ["FAKE_GAME_PROFILE"])
 plan = Path(os.environ["FAKE_SUPERVISED_PLAN"])
 count = plan.with_suffix(".count")
@@ -21,10 +24,15 @@ command_path = profile / "farmer_command"
 seq = 0
 
 
+def write_status(text):
+    tmp = status_path.with_suffix(".tmp")
+    tmp.write_text(text)
+    os_.replace_atomic(tmp, status_path)
+
+
 def status(phase="run", reason=""):
     global seq
     seq += 1
-    tmp = status_path.with_suffix(".tmp")
     data = {"phase": phase, "terminal": phase in {"done", "failed"},
             "failed": phase == "failed", "finish_reason": reason,
             "heartbeat_seq": seq, "pid": os.getpid(), "session": os.environ["FARMER_SESSION_ID"]}
@@ -36,8 +44,7 @@ def status(phase="run", reason=""):
         del data["terminal"]
     if phase == "done" and kind == "foreign-session":
         data["session"] = "a different AFK session"
-    tmp.write_text(json.dumps(data))
-    tmp.replace(status_path)
+    write_status(json.dumps(data))
 
 
 def forever():
@@ -74,7 +81,7 @@ if kind == "fail":
 if kind == "crash":
     os._exit(1)
 if kind == "garbage":
-    status_path.write_text('{"phase":"done", "terminal')
+    write_status('{"phase":"done", "terminal')
     os._exit(0)
 if kind == "hang":
     python = str(Path(sys.base_prefix) / "python.exe") if sys.platform == "win32" else sys.executable
@@ -87,7 +94,7 @@ if kind == "commands":
         command = ""
         try:
             claimed = profile / "farmer_command.claimed"
-            command_path.replace(claimed)
+            os_.replace_atomic(command_path, claimed)
             command = claimed.read_text().strip()
             claimed.unlink()
         except FileNotFoundError:

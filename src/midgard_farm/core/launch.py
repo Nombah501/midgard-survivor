@@ -192,6 +192,22 @@ def run_attempt(
                                 forced_reason = watch(status)
                             elif timeout == 0:
                                 forced_reason = "operator_timeout"
+                            if watch is not None and forced_reason in ("heartbeat_stale", "no_heartbeat"):
+                                # A status replacement or process exit can race the timed wait and read.
+                                status = _read_status(os_, profile, expected_session,
+                                                      retry_missing=forced_reason == "heartbeat_stale")
+                                if status is not None:
+                                    last_status = status
+                                    forced_reason = watch(status)
+                                if forced_reason is None:
+                                    continue
+                                try:
+                                    code = tree.wait(timeout=0)
+                                except subprocess.TimeoutExpired:
+                                    pass
+                                else:
+                                    forced_reason = None
+                                    break
                             if forced_reason:
                                 tree.kill()
                                 code = tree.wait()
@@ -203,6 +219,8 @@ def run_attempt(
                 tee()
 
         status = _read_status(os_, profile, expected_session, retry_missing=True)
+        if status is None and last_status is not None and last_status.get("terminal") is True:
+            status = last_status
         result = AttemptExit(code, status, status if status is not None else last_status, forced_reason)
         reason = (status or {}).get("finish_reason")
         if session_id and result.clean(os_) and isinstance(reason, str) and reason in _SETTLED_REASONS:

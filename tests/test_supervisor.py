@@ -14,11 +14,12 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from midgard_farm import platform
-from midgard_farm.core import commands, patch_info
+from midgard_farm.core import commands, launch, patch_info, supervisor
 from midgard_farm.core.history import append_event, history_path, read_history
 from midgard_farm.core.state import StateKind, read_state
 from midgard_farm.core.backup import known_good_snapshot, publish_known_good
@@ -83,44 +84,38 @@ class Farm:
             if paths:
                 path = paths[0]
                 return json.loads(self.os_.read_shared(path)), path.parent
-        result = wait_for(read)
-        # The service logs its terminal notification just after publishing the
-        # outcome; on Windows the fixture hard-kills it soon after. Give the log a
-        # bounded chance to catch up (runners without notify lines just time out).
-        deadline = time.monotonic() + 2
-        output = self.plan.with_suffix(".output")
-        while output.exists() and time.monotonic() < deadline and not any(
-                event in ("stop", "goal", "quarantine") for event in self.notifications()):
-            time.sleep(0.01)
-        return result
+        return wait_for(read)
 
     @contextmanager
     def service(self, *, runner=SERVICE, **policy):
-        # Stale after heartbeat_interval x 3: keep that above Windows' up-to-1 s
-        # read_shared retry on a status file being replaced (0.15 s flaked there).
+        # The fake publishes every 0.05 s; keep its accelerated watchdog
+        # independent from individual heartbeat writes.
         timing = dict(heartbeat_interval=0.5, startup_grace=3.0, backoff_base=0.05,
                       backoff_max=0.2, max_failures=3, failure_window=60.0,
                       kill_grace=0.5, stop_grace=0.85) | policy
         command = [*self.prefix, *runner]
-        env = {**os.environ, "FAKE_SERVICE_POLICY": json.dumps(timing)}
+        stop = self.plan.with_suffix(".service-stop")
+        stop.unlink(missing_ok=True)
+        env = {**os.environ, "FAKE_SERVICE_POLICY": json.dumps(timing), "FAKE_SERVICE_STOP": str(stop)}
         output = self.plan.with_suffix(".output")
         with output.open("wb") as log:
             proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
             try:
                 yield proc
+            except BaseException as exc:
+                logs = sorted(self.data.glob("logs/supervisor-*/attempt-*.log"))
+                for path in [output, *logs]:
+                    exc.add_note(f"{path.name}:\n{path.read_text(encoding='utf-8', errors='replace')}")
+                raise
             finally:
                 if proc.poll() is None:
-                    if sys.platform == "linux":
-                        self.stop(proc)
-                    else:
-                        self.send("finish")
-                        time.sleep(0.15)
-                        proc.terminate()
+                    stop.touch()
                     try:
-                        proc.wait(timeout=5)
+                        assert proc.wait(timeout=5) == 0, output.read_text(encoding="utf-8", errors="replace")
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait(timeout=5)
+                        raise
 
     def stop(self, proc):
         if self.prefix:
@@ -191,11 +186,17 @@ def farm(tmp_path, monkeypatch):
             shutil.copyfile(dll, game_dir / dll.name)
         monkeypatch.setenv("PYTHONHOME", sys.base_prefix)
         monkeypatch.setenv("PATH", str(Path(sys.base_prefix)) + os.pathsep + os.environ["PATH"])
-        monkeypatch.setenv("PYTHONPATH", str(game_dir) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        package_root = str(Path(platform.__file__).resolve().parents[2])
+        pythonpath = (str(game_dir), package_root, os.environ.get("PYTHONPATH", ""))
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, pythonpath)))
         (game_dir / "sitecustomize.py").write_text(
-            "import os, sys\nfrom pathlib import Path\n"
+            "import os, sys, traceback\nfrom pathlib import Path\n"
             f"if Path(sys.executable).name.lower() == {game.name.lower()!r}:\n"
-            f"    exec(compile(Path({str(FAKE)!r}).read_bytes(), {str(FAKE)!r}, 'exec'))\n"
+            "    try:\n"
+            f"        exec(compile(Path({str(FAKE)!r}).read_bytes(), {str(FAKE)!r}, 'exec'))\n"
+            "    except Exception:\n"
+            "        traceback.print_exc()\n"
+            "        os._exit(1)\n"
         )
     else:
         game.write_bytes(f"#!{sys.executable}\n".encode() + FAKE.read_bytes())
@@ -308,6 +309,109 @@ def test_supervisor_stop_requests_finish_before_signalling_child(farm, step):
         assert known_good_snapshot(farm.data / "backups") is not None
     assert len(outcome["attempts"]) == 1
     assert farm.notifications() == ["stop"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sharing violation")
+def test_fake_game_retries_status_replacement(tmp_path, monkeypatch):
+    import ctypes
+    import runpy
+
+    from midgard_farm.platform import windows
+
+    plan = tmp_path / "plan"
+    plan.write_text("fail:settle_timeout")
+    status_path = tmp_path / "farmer_status.json"
+    monkeypatch.setenv("FAKE_GAME_PROFILE", str(tmp_path))
+    monkeypatch.setenv("FAKE_SUPERVISED_PLAN", str(plan))
+    monkeypatch.setenv("FARMER_SESSION_ID", "afk-test")
+    monkeypatch.setattr(os, "_exit", sys.exit)
+    original = windows._MoveFileExW
+    injected = False
+
+    def move(src, dst, flags):
+        nonlocal injected
+        if Path(dst) == status_path and json.loads(Path(src).read_bytes())["terminal"] and not injected:
+            injected = True
+            ctypes.set_last_error(windows.ERROR_SHARING_VIOLATION)
+            return 0
+        return original(src, dst, flags)
+
+    monkeypatch.setattr(windows, "_MoveFileExW", move)
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(FAKE))
+    assert injected and exc.value.code == 1
+    terminal = json.loads(status_path.read_bytes())
+    assert terminal["terminal"] is True
+    assert terminal["finish_reason"] == "settle_timeout"
+
+
+@pytest.mark.parametrize(("fault", "next_phase", "reason"), [
+    (PermissionError, "paused", None),
+    (FileNotFoundError, "paused", None),
+    (FileNotFoundError, "done", None),
+    (PermissionError, "failed", None),
+    (FileNotFoundError, "run", "heartbeat_stale"),
+])
+def test_stale_verdict_is_checked_against_current_status_and_exit(tmp_path, monkeypatch,
+                                                               fault, next_phase, reason):
+    session = "afk-" + uuid.uuid4().hex
+    status_path = tmp_path / "farmer_status.json"
+    os_ = platform.current()
+    monkeypatch.setattr(os_, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(os_, "game_running", lambda: False)
+    monkeypatch.setattr(os_, "check_network_isolation", lambda: "")
+    monkeypatch.setenv("FARMER_BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.setattr(launch, "check_prerequisites", lambda *_: (tmp_path / "game", None))
+    monkeypatch.setattr(launch, "preflight", lambda *_: SimpleNamespace(argv=[tmp_path / "game"], config=None))
+    reads = polls = 0
+    killed = False
+    monkeypatch.setattr(supervisor, "time", SimpleNamespace(monotonic=lambda: float(polls * 2)))
+
+    class Tree(platform.ProcessTree):
+        def wait(self, timeout=None):
+            nonlocal polls
+            if killed:
+                return 9
+            # Failed exited during the timed-out poll's status read; paused/done
+            # are still alive until the next ordinary poll.
+            if (next_phase == "failed" and reads >= 2) or (next_phase != "run" and polls >= 3):
+                return int(next_phase == "failed")
+            if timeout:
+                polls += 1
+                if polls == 3 and next_phase in ("paused", "done"):
+                    return 0
+            raise subprocess.TimeoutExpired("fake game", timeout)
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+
+    def read(path, *, retry_missing=False):
+        nonlocal reads
+        if path != status_path:
+            return path.read_bytes()
+        reads += 1
+        rename_gap = fault is FileNotFoundError and not retry_missing
+        if reads == 2 or (reads == 3 and (next_phase in ("failed", "run") or rename_gap)):
+            raise fault(path)
+        if reads == 4 and next_phase == "done":
+            raise PermissionError(path)  # The explicit terminal status was already observed in poll 2.
+        phase = "run" if reads == 1 else "done" if polls >= 3 else next_phase
+        return json.dumps({"session": session, "phase": phase, "heartbeat_seq": 1 if phase == "run" else reads,
+                           "terminal": phase in ("done", "failed"), "failed": phase == "failed",
+                           "finish_reason": "settle_timeout" if phase == "failed" else ""}).encode()
+
+    monkeypatch.setattr(os_, "spawn_tree", lambda *_, **__: Tree())
+    monkeypatch.setattr(os_, "read_shared", read)
+    watcher = supervisor.Supervisor(os_, tmp_path, supervisor.Policy(heartbeat_interval=0.5),
+                                    lambda: None, lambda *_: None, state=SimpleNamespace(observe_farmer=lambda _: None))
+    result = launch.run_attempt(os_, tmp_path, None, session, watch=watcher._watcher())
+    assert result.forced_reason == reason
+    if next_phase == "failed":
+        assert result.code == 1
+        assert result.status["finish_reason"] == "settle_timeout"
+    elif reason is None:
+        assert result.clean(os_)
 
 
 def test_crash_restarts_with_exponential_backoff_and_same_session_id(farm):
