@@ -1,0 +1,3 @@
+# The compiled QML bundle (gui/_resources.py) embeds Main.qml byte for byte;
+# a test compares them, so the source must not be converted to CRLF on Windows.
+/src/midgard_farm/gui/*.qml text eol=lf

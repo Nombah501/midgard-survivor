@@ -193,6 +193,7 @@ class UpdatesView:
     action_blocker: str = "Reading service state…"
     feedback: str = ""
     app_version: str = _DASH
+    check_again_feedback: str = ""
 
 
 @dataclass(frozen=True)
@@ -473,18 +474,26 @@ class SessionModel:
         elif state.kind in (StateKind.REBUILDING, StateKind.UPDATING):
             blocker = "Wait for the current update to finish."
         feedback = ""
+        check_again_feedback = ""
+        restore_requested_here = False
         restore = state.last_restore or {}
         if self._patch_request:
             command, request = self._patch_request
+            restore_requested_here = command == "restore_official" and restore.get("request") == request.name
             for row in state.command_refusals:
                 if row.get("request") == request.name and row.get("command") == command:
                     action = "Restore" if command == "restore_official" else "Check again"
                     feedback = f"{action} refused: {_text(row.get('reason'))}"
+                    if command == "check_again":
+                        check_again_feedback = feedback
                     break
-        if not feedback and restore.get("outcome") != "official_patch_missing":
-            feedback = _text(restore.get("reason"))
+        if not feedback and not busy and state.kind is not StateKind.STALE:
+            outcome = restore.get("outcome")
+            if ((outcome == "restored" and state.keep_official)
+                    or (outcome == "restore_failed" and restore_requested_here)):
+                feedback = _text(restore.get("reason"))
         return UpdatesView(title, detail, activity, activity_detail, *self._last_update, blocker, feedback,
-                           self._app_version)
+                           self._app_version, check_again_feedback)
 
     def _start_refusal(self, state: ServiceState) -> str:
         if self._last_start is not None:
@@ -551,6 +560,7 @@ class SessionModel:
         request = self._submit(commands.Start(self._preset.fixed or self._character, self._preset.path))
         if request is not None:
             self._last_start = request
+            self._patch_request = None
             self._pending_start = True
         return request
 

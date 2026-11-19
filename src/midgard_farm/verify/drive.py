@@ -18,7 +18,7 @@ from ..core.commands import Start
 from ..core.launch import AttemptExit, GameBusy, run_attempt
 from ..core.preflight import PreflightError
 from ..core.state import StateReporter
-from ..core.supervisor import Policy, Supervisor
+from ..core.supervisor import Policy, Supervisor, session_log_dir
 
 
 @dataclass(frozen=True)
@@ -240,7 +240,7 @@ def _sample_during(run: Run) -> Iterator[None]:
 
 def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: str = "", sample: bool = False) -> Driven:
     app_data = run.os.app_data_dir()
-    log_dir = app_data / "logs" / f"supervisor-{run.session}"
+    log_dir = session_log_dir(run.os, run.session)
     outcome_path = log_dir / "outcome.json"
     session_path = app_data / "session.json"
     main_log = run.artifact("run.log")

@@ -484,6 +484,7 @@ ApplicationWindow {
                             wrapMode: Text.Wrap
                         }
                         BodyText {
+                            objectName: "patchFeedback"
                             visible: text.length > 0
                             text: shell.updates.feedback
                         }
@@ -547,8 +548,9 @@ ApplicationWindow {
                                 wrapMode: Text.Wrap
                             }
                             BodyText {
+                                objectName: "quarantineCheckFeedback"
                                 visible: text.length > 0
-                                text: shell.updates.feedback
+                                text: shell.updates.check_again_feedback
                             }
                             BodyText {
                                 visible: text.length > 0

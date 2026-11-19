@@ -49,7 +49,7 @@ class ServiceState:
 
 class _PatchChanges(TypedDict, total=False):
     game_update_classification: str
-    last_restore: dict[str, Any]
+    last_restore: dict[str, Any] | None
     keep_official: bool
 
 

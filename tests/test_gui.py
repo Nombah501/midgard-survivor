@@ -362,6 +362,37 @@ def test_update_controls_gate_active_sessions_and_show_correlated_restore_refusa
     assert model.poll().updates.feedback == "Restore refused: Close the game before restoring the official patch."
 
 
+@pytest.mark.parametrize(("outcome", "message"), [
+    ("restored", "Official patch restored."),
+    ("restore_failed", "Could not restore the official patch: access denied"),
+])
+def test_updates_drops_restore_feedback_after_check_again(farm, outcome, message):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state()
+    model = SessionModel(farm.platform)
+    restore = model.patch_command("restore_official")
+    assert restore
+    result = {"request": restore.name, "outcome": outcome, "reason": message}
+    farm.state(last_restore=result, keep_official=outcome == "restored")
+    assert model.poll().updates.feedback == message
+    assert model.patch_command("check_again")
+    # Older service publications may still retain the outcome after the check.
+    farm.state(last_restore=result, keep_official=False)
+    assert model.poll().updates.feedback == ""
+
+
+def test_bundled_main_qml_matches_source():
+    from PySide6.QtCore import QFile, QIODevice
+
+    from midgard_farm.gui import _resources  # noqa: F401  # Import registers the resource in Qt.
+
+    source = Path(__file__).resolve().parents[1] / "src/midgard_farm/gui/Main.qml"
+    resource = QFile(":/midgard-farm/Main.qml")
+    assert resource.open(QIODevice.OpenModeFlag.ReadOnly), resource.errorString()
+    assert bytes(resource.readAll()) == source.read_bytes(), "Regenerate _resources.py with pyside6-rcc"
+
+
 @pytest.mark.parametrize("reason", ["build_failed", "anchors_broken", "smoke_failed"])
 def test_rebuild_quarantine_offers_check_again(farm, reason):
     from midgard_farm.gui.model import SessionModel
@@ -698,13 +729,20 @@ def test_updates_buttons_submit_without_confirmation_and_restore_disables_during
     click(window, "restoreOfficialButton")
     wait_until(lambda: requested_commands(farm) == ["check_again", "restore_official"])
     assert not qml_item(window, "abortDialog").property("visible")
-    farm.state(game_update_classification="farmer_removed_or_stale", keep_official=True,
-               last_restore={"outcome": "restored", "reason": "Official patch restored."})
+    restore = sorted(commands.directory(farm.platform).glob("*.json"))[-1]
+    result = {"request": restore.name, "outcome": "restored", "reason": "Official patch restored."}
+    farm.state(game_update_classification="farmer_removed_or_stale", keep_official=True, last_restore=result,
+               quarantine={"reason": "heartbeat_stale", "detail": "Previous session lost its heartbeat."})
     wait_until(lambda: qml_item(window, "gameUpdateState").property("text") == "Farmer patch removed or stale")
+    assert qml_item(window, "patchFeedback").property("text") == result["reason"]
     capture(window, tmp_path, "updates-official-restored")
-    farm.state("active", session_id="afk-fixture", game_update_classification="current")
+    click(window, "quarantineTab")
+    assert not qml_item(window, "quarantineCheckFeedback").property("visible")
+    click(window, "updatesTab")
+    farm.state("active", session_id="afk-fixture", game_update_classification="current", last_restore=result)
     wait_until(lambda: not qml_item(window, "restoreOfficialButton").property("enabled"))
     assert qml_item(window, "patchActionBlocker").property("text") == "An AFK session is already active."
+    assert not qml_item(window, "patchFeedback").property("visible")
     capture(window, tmp_path, "updates-session-active")
 
 

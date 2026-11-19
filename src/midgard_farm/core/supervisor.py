@@ -185,9 +185,9 @@ class Supervisor:
                 if command == "restore_official":
                     self._restore_official(path)
                     continue
-                if self._keep_official and (isinstance(command, Start) or command == "check_again"):
+                if isinstance(command, Start) or command == "check_again":
                     self._keep_official = False
-                    self.state.patch_status(keep_official=False)
+                    self.state.patch_status(keep_official=False, last_restore=None)
                 gate = self._idle_update(check_again=command == "check_again")
                 if isinstance(gate, game_update.Stopped) or self.stop_requested_at() is not None:
                     return
