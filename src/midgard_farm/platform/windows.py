@@ -196,6 +196,10 @@ _QueryFullProcessImageNameW.argtypes = [
     wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
 ]
 _QueryFullProcessImageNameW.restype = wintypes.BOOL
+_GetExitCodeProcess = _kernel32.GetExitCodeProcess
+_GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+_GetExitCodeProcess.restype = wintypes.BOOL
+STILL_ACTIVE = 259
 _NtResumeProcess = _ntdll.NtResumeProcess
 _NtResumeProcess.argtypes = [wintypes.HANDLE]
 _NtResumeProcess.restype = ctypes.c_long
@@ -229,6 +233,19 @@ def _process_image(pid: int) -> Path | None:
         if _QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
             return Path(path.value)
         return None
+    finally:
+        _CloseHandle(handle)
+
+
+def _process_exited(pid: int) -> bool:
+    """True for a process that has terminated but is still listed because a
+    handle to it is open (e.g. our own Popen right after a kill)."""
+    handle = _OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False  # Cannot tell (another user's process): count it as running.
+    try:
+        code = wintypes.DWORD()
+        return bool(_GetExitCodeProcess(handle, ctypes.byref(code))) and code.value != STILL_ACTIVE
     finally:
         _CloseHandle(handle)
 
@@ -380,7 +397,8 @@ class WindowsPlatform(Platform):
             error = ctypes.get_last_error()
             if error != ERROR_NO_MORE_FILES:
                 raise ctypes.WinError(error)
-            return pids
+            # Process32NextW's error is read above, before other API calls.
+            return {pid for pid in pids if not _process_exited(pid)}
         finally:
             _CloseHandle(snapshot)
 
