@@ -32,7 +32,7 @@ _ONE_RUN = {
 _STALE = {
     "farmer.cfg", "farmer_command", "farmer_command.claimed", "farmer_stop", "farmer_status.json",
     "farmer.log", "farmer.log.prev", "farmer.run.lock", "farmer_runs.jsonl", "farmer_session.json",
-    "farmer_supervisor_session", "farmer_test_crashed",
+    "farmer_supervisor.lock", "farmer_supervisor_session", "farmer_test_crashed",
 }
 
 

@@ -22,6 +22,7 @@ from midgard_farm.core import commands, patch_info
 from midgard_farm.core.history import append_event, read_history
 from midgard_farm.core.state import StateKind, read_state
 from midgard_farm.core.backup import known_good_snapshot, publish_known_good
+from midgard_farm.core.farmer_patch import farmer_hash
 
 from test_profile import godot_root, make_profile
 
@@ -82,11 +83,11 @@ class Farm:
         return wait_for(read)
 
     @contextmanager
-    def service(self, **policy):
+    def service(self, *, runner=SERVICE, **policy):
         timing = dict(heartbeat_interval=0.15, startup_grace=3.0, backoff_base=0.05,
                       backoff_max=0.2, max_failures=3, failure_window=60.0,
                       kill_grace=0.5, stop_grace=0.85) | policy
-        command = [*self.prefix, *SERVICE]
+        command = [*self.prefix, *runner]
         env = {**os.environ, "FAKE_SERVICE_POLICY": json.dumps(timing)}
         output = self.plan.with_suffix(".output")
         with output.open("wb") as log:
@@ -153,13 +154,17 @@ def farm(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_GAME_PROFILE", str(profile))
     plan = tmp_path / "plan.txt"
     monkeypatch.setenv("FAKE_SUPERVISED_PLAN", str(plan))
-    (profile / "patches/state.json").write_text('{"file":"patch_farmer.pck"}')
+    official_state = {"file": "patch_official.pck", "version": "1", "bridge": {"file": "bridge.pck"}}
+    (profile / "patches/official-state.json").write_bytes(json.dumps(official_state).encode())
+    (profile / "patches/state.json").write_bytes(
+        json.dumps(official_state | {"file": "patch_farmer.pck", "farmer": 1}).encode(),
+    )
     (profile / "patches/patch_official.pck").write_bytes(b"official")
     (profile / "patches/patch_farmer.pck").write_bytes(b"farmer")
     patch_info.save(os_, patch_info.info_path(os_), patch_info.PatchInfo(
         patch_file="patch_official.pck", patch_version="1", patch_sha256=hashlib.sha256(b"official").hexdigest(),
         bridge_file="bridge.pck", bridge_sha256="", bytecode="ebc36a7", farmer_api=1,
-        farmer_hash="fixture", result_sha256=hashlib.sha256(b"farmer").hexdigest(), built_at="fixture",
+        farmer_hash=farmer_hash(), result_sha256=hashlib.sha256(b"farmer").hexdigest(), built_at="fixture",
     ))
     preset = tmp_path / "farmer preset.json"
     game = os_.game_executable()
@@ -451,6 +456,9 @@ def test_preflight_quarantine_names_the_actual_launcher_cause(farm):
         farm.start()
         outcome, directory = farm.outcome()
         state = wait_for(lambda: read_state(farm.os_), lambda state: state.kind is StateKind.IDLE and state.quarantine)
+        check = commands.submit(farm.os_, "check_again")
+        wait_for(lambda: not check.exists())
+        assert read_state(farm.os_).quarantine == state.quarantine
         history = read_history(farm.os_)
         assert proc.poll() is None  # Still available to the window after quarantine.
     cause = "run: official patch changed (game updated); rebuild the farmer patch"
@@ -607,7 +615,7 @@ def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm, tm
     assert "Restart=on-failure\n" in unit
     command = shlex.split(next(line.removeprefix("ExecStart=") for line in unit.splitlines()
                                if line.startswith("ExecStart=")))
-    (farm.profile / "patches/patch_farmer.pck").unlink()
+    (farm.profile / "patches/patch_official.pck").unlink()
     fake_bin = tmp_path / "notification-bin"
     fake_bin.mkdir()
     fake_notify = fake_bin / "notify-send"
@@ -625,7 +633,7 @@ def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm, tm
 
 
 def test_crash_recovery_reuses_session_without_replaying_the_start(farm):
-    (farm.profile / "patches/patch_farmer.pck").unlink()
+    (farm.profile / "patches/patch_official.pck").unlink()
     start = {"character": {"class": "archer", "job_path": 1}, "preset": str(farm.preset)}
     request = farm.send("start", **start)
     session_id = "afk-" + uuid.uuid4().hex

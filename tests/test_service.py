@@ -60,17 +60,14 @@ def test_service_waits_for_a_missing_profile_and_discovers_it(tmp_path, monkeypa
             wait_for("profile not found")
             unavailable = read_state(os_)
             assert unavailable.kind is StateKind.FARMER_UNAVAILABLE
-            assert "launch the game once" in unavailable.reason
+            assert unavailable.reason == "start the game and accept the update"
             request = submit(os_, Start(Character("archer", 1), tmp_path / "preset.json"))
             wait_for("refused start")
-            assert read_state(os_).command_refusals[0]["request"] == request.name
+            refusal, = read_state(os_).command_refusals
+            assert refusal["request"] == request.name and refusal["reason"] == unavailable.reason
             assert service.poll() is None
             profile = make_profile(godot_root(tmp_path), "Late Midgard Survivors")
             wait_for(str(profile))
-            deadline = time.monotonic() + 5
-            while read_state(os_).kind is not StateKind.IDLE:
-                assert time.monotonic() < deadline
-                time.sleep(0.01)
             assert service.poll() is None
         finally:
             if service.poll() is None:

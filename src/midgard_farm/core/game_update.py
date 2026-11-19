@@ -41,8 +41,8 @@ class _MountedPatch:
         return GameUpdateState.FARMER_REMOVED_OR_STALE
 
 
-def _read_shared(_os: Platform, path: Path) -> bytes:
-    return path.read_bytes()
+def _read_shared(os_: Platform, path: Path) -> bytes:
+    return os_.read_shared(path)
 
 
 def _inspect(os_: Platform, profile: Path) -> _MountedPatch | None:
@@ -118,6 +118,8 @@ class Wait:
 @dataclass(frozen=True)
 class Blocked:
     reason: str
+    detail: str = ""
+    log_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,7 @@ class _Transaction:
     reason: FailureReason | None = None
     detail: str = ""
     log_path: str | None = None
+    unattended: bool = True
 
     @property
     def key(self) -> tuple[str, str]:
@@ -160,12 +163,14 @@ class _Transaction:
         stage = _Stage(data["stage"])
         reason = FailureReason(data["reason"]) if data["reason"] is not None else None
         log_path = data["log_path"]
+        unattended = data.get("unattended", True)
         if (not all(isinstance(data[name], str) for name in ("official_patch_sha256", "farmer_hash", "detail"))
+                or type(unattended) is not bool
                 or (log_path is not None and not isinstance(log_path, str))
                 or (stage in {_Stage.RESTORE, _Stage.BLOCKED}) != (reason is not None)):
             raise ValueError("invalid update transaction")
         return cls(data["official_patch_sha256"], data["farmer_hash"], GameUpdateState(data["classification"]),
-                   stage, reason, data["detail"], log_path)
+                   stage, reason, data["detail"], log_path, unattended)
 
 
 class GameUpdatePipeline:
@@ -192,7 +197,7 @@ class GameUpdatePipeline:
         """Prepare once; call again on Wait. Invalid prerequisites raise PreflightError."""
         pending = self._load()
         if check_again and pending is not None and pending.reason is not None:
-            pending = replace(pending, stage=_Stage.BUILD, reason=None, detail="", log_path=None)
+            pending = replace(pending, stage=_Stage.BUILD, reason=None, detail="", log_path=None, unattended=False)
             self._save(pending)
         if self.os.game_running():
             return self._busy()
@@ -227,7 +232,7 @@ class GameUpdatePipeline:
         if pending is not None and pending.reason is not None:
             if pending.stage is _Stage.BLOCKED:
                 self.events.state("farmer_unavailable", pending.reason)
-                return Blocked(pending.reason)
+                return Blocked(pending.reason, pending.detail, Path(pending.log_path) if pending.log_path else None)
             return self._restore_and_quarantine(pending, mounted.mounted)
 
         try:
@@ -256,7 +261,7 @@ class GameUpdatePipeline:
                     pass
                 except OSError as exc:
                     raise PreflightError(f"cannot read built farmer patch {candidate}: {exc}") from exc
-            pending = _Transaction(*key, classification, stage)
+            pending = _Transaction(*key, classification, stage, unattended=unattended)
             self._save(pending)
         elif not has_candidate and pending.stage is not _Stage.BUILD:
             pending = replace(pending, stage=_Stage.BUILD)
@@ -300,7 +305,7 @@ class GameUpdatePipeline:
 
         self._journal.unlink()
         self._history(pending, "ready")
-        if pending.classification is GameUpdateState.GAME_UPDATE and unattended:
+        if pending.classification is GameUpdateState.GAME_UPDATE and pending.unattended and unattended:
             self.events.notify("game_update_handled", "Game update handled; the farmer patch is ready")
         return self._ready()
 

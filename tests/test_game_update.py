@@ -121,7 +121,7 @@ def official_state(profile, *, version="2"):
 
 
 def write_state(profile, state, name="state.json"):
-    (profile / "patches" / name).write_text(json.dumps(state) + "\n", encoding="utf-8")
+    (profile / "patches" / name).write_bytes((json.dumps(state) + "\n").encode())
 
 
 def save_info(os_, *, version="2", fingerprint=None):
@@ -247,7 +247,9 @@ def test_retry_block_persists_and_only_lifts_for_new_inputs_or_check_again(farm,
     failed_trace = farm.observations()
     old_log = result.log_path.read_bytes()
 
-    assert farm.pipeline(sources=sources).run() == game_update.Blocked("smoke_failed")
+    blocked = farm.pipeline(sources=sources).run()
+    assert isinstance(blocked, game_update.Blocked) and blocked.reason == "smoke_failed"
+    assert (blocked.detail, blocked.log_path) == (result.detail, result.log_path)
     assert farm.observations() == failed_trace
     assert result.log_path.read_bytes() == old_log
     assert len(farm.events.records) == len(farm.events.notifications) == 1
@@ -276,6 +278,8 @@ def test_check_again_while_busy_rearms_the_persisted_block(farm, monkeypatch):
 @pytest.mark.parametrize("fail", [False, True])
 def test_mounted_farmer_hash_change_keeps_official_snapshot(farm, tmp_path, monkeypatch, fail):
     assert isinstance(farm.pipeline().run(), game_update.Ready)
+    official = farm.patches / "official-state.json"
+    official.write_bytes(official.read_bytes().replace(b"\n", b"\r\n"))
     before = snapshot(farm.profile)
     sources = tmp_path / "farmer sources"
     farmer_script = farmer_sources(sources)
@@ -303,6 +307,8 @@ def test_mounted_farmer_hash_change_keeps_official_snapshot(farm, tmp_path, monk
 
 def test_failed_mounted_rebuild_restores_official_only_after_game_closes(farm, tmp_path, monkeypatch):
     assert isinstance(farm.pipeline().run(), game_update.Ready)
+    official = farm.patches / "official-state.json"
+    official.write_bytes(official.read_bytes().replace(b"\n", b"\r\n"))
     before = snapshot(farm.profile)
     sources = tmp_path / "changed sources"
     script = farmer_sources(sources)

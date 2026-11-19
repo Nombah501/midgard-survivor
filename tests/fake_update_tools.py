@@ -11,11 +11,11 @@ import fake_smoke_game
 
 def record(stage):
     patches = Path(os.environ["FAKE_SMOKE_PROFILE"]) / "patches"
-    state = (patches / "state.json").read_text(encoding="utf-8")
+    state = (patches / "state.json").read_bytes().decode()
     snapshot = patches / "official-state.json"
     with open(os.environ["FAKE_UPDATE_TRACE"], "a", encoding="utf-8") as log:
         print(json.dumps({"stage": stage, "state": state,
-                          "snapshot": snapshot.read_text(encoding="utf-8") if snapshot.exists() else None}), file=log)
+                          "snapshot": snapshot.read_bytes().decode() if snapshot.exists() else None}), file=log)
 
 
 def reopen_after(stage):

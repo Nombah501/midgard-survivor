@@ -11,12 +11,13 @@ from pathlib import Path
 from . import platform
 from .core.commands import Start
 from .core.config import read_config
+from .core.game_update import START_GAME_AND_UPDATE
 from .core.launch import GameBusy, run_attempt, shutdown_request
 from .core.notify import Notifier
 from .core.preflight import PreflightError
 from .core.profile import ProfileNotFound, find_profile
 from .core.state import StateKind, StateReporter
-from .core.supervisor import InvalidSavedSession, Policy, Supervisor, log, pending_commands, refuse_start
+from .core.supervisor import InvalidSavedSession, Policy, Supervisor, log, pending_commands, refuse_command
 
 # sysexits: the same "unfixable" code run.sh's preflight uses.
 EX_TEMPFAIL = 75
@@ -95,11 +96,13 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
                 reason = str(exc)
                 if reason != last_missing:
                     last_missing = reason
-                    state.set(StateKind.FARMER_UNAVAILABLE, reason)
+                    state.set(StateKind.FARMER_UNAVAILABLE, START_GAME_AND_UPDATE)
                     log(f"profile not found: {reason}")
                 for path, command in pending_commands(os_):
                     if isinstance(command, Start):
-                        refuse_start(os_, state, path, reason)
+                        refuse_command(os_, state, path, "start", START_GAME_AND_UPDATE)
+                    elif command == "check_again":
+                        refuse_command(os_, state, path, command, START_GAME_AND_UPDATE)
                     else:
                         path.unlink()
                 time.sleep(1)
@@ -120,8 +123,6 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
             return _startup_quarantine(os_, data, notifier, "profile_unusable", "profile directory unusable", exc,
                                        state=state)
         with profile_lock:
-            if last_missing:
-                state.set(StateKind.IDLE)
             log(f"profile: {profile}")
             supervisor = Supervisor(os_, profile, policy, requested_at, notifier.notify, state=state)
             try:
