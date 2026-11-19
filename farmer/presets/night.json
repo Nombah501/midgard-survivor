@@ -17,7 +17,7 @@
   "max_runs": 0,
   "max_minutes": 480,
   "restart_seconds": 2,
-  "auto_keep": true,
+  "auto_keep": false,
   "auto_stats": true,
   "auto_achievements": true,
   "auto_upgrades": true,

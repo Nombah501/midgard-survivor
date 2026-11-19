@@ -15,7 +15,7 @@
   "job_paths": {
     "thief": 0
   },
-  "stage": "prontera",
+  "stage": "ra_san",
   "danger": 25,
   "auto_danger": false,
   "danger_ceiling": 30,
@@ -30,7 +30,7 @@
   "restart_seconds": 3,
   "arena_wall_max": 240,
   "stall_seconds": 45,
-  "auto_keep": true,
+  "auto_keep": false,
   "auto_stats": true,
   "auto_achievements": true,
   "auto_upgrades": false,

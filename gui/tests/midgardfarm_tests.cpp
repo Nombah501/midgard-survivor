@@ -25,7 +25,8 @@ private slots:
             },
             "stages": {
                 "payon":    "Payon Forest",
-                "prontera": "Prontera Field"
+                "prontera": "Prontera Field",
+                "ra_san":   "Rachel Sanctuary"
             }
         })";
         const bool wrote = write(farmer + "/targets.json", targets);
@@ -34,7 +35,7 @@ private slots:
         Backend backend(farmer, dir.path() + "/data");
         QCOMPARE(backend.characters().size(), 3);
         QCOMPARE(backend.characters().first().toMap().value("id").toString(), QString("sinx"));
-        QCOMPARE(backend.stages().first().toMap().value("id").toString(), QString("prontera"));
+        QCOMPARE(backend.stages().first().toMap().value("id").toString(), QString("ra_san"));
 
         const QStringList expected{"--char", "sniper", "--stage", "payon", "--danger", "25"};
         QCOMPARE(backend.farmArguments("sniper", "payon", 25), expected);

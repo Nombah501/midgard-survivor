@@ -3,8 +3,8 @@
 
 Examples:
   ./tools/farm.py --list
-  ./tools/farm.py --char sinx --stage prontera --danger 25
-  ./tools/farm.py --char sniper --stage payon --danger 20
+  ./tools/farm.py --char sinx --stage ra_san --danger 25
+  ./tools/farm.py --char sniper --stage ra_san --danger 25
   ./tools/farm.py --class archer --job-path 0 --stage orc --danger 15
 
 The config is generated from presets/synx-hell.json; the preset is not edited.
@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--char", help="named character from targets.json")
     parser.add_argument("--class", dest="class_", help="base class id, e.g. thief")
     parser.add_argument("--job-path", type=int, help="job path index (default 0)")
-    parser.add_argument("--stage", default="prontera", help="stage id from --list")
+    parser.add_argument("--stage", default="ra_san", help="stage id from --list")
     parser.add_argument("--danger", type=int, default=25, help="fixed danger (default 25)")
     parser.add_argument("--speed", type=float, help="override Engine.time_scale")
     parser.add_argument("--run-minutes", type=float, help="override run timeout in game minutes")

@@ -256,6 +256,7 @@ func _prepare_run() -> void:
 	run_state["kills"] = 0
 	run_state["run_zeny"] = 0
 	run_state["run_mvps"] = 0
+	run_state["route_entered"] = false
 	_time_last = -1.0
 	_time_change_ms = _now()
 	_clock_last = -1.0
@@ -351,6 +352,25 @@ func _handle_victory(now: int) -> void:
 		return
 	world._pull_prizes()
 	if now - int(run_state.get("won_at", now)) < VICTORY_PULL_MS:
+		return
+	# After the MVP the arena opens a karma portal: Valhalla -> Valkyrie
+	# Reginleif, Niflheim -> Randgris. Entering it before endless grants the
+	# route boon (+1 revive and +15% XP for Valhalla), which makes the endless
+	# run last longer. Without a chosen karma side there is no portal.
+	if world.karma != null and is_instance_valid(world.karma) \
+			and world.karma.has_method("can_route") and bool(world.karma.can_route()) \
+			and not bool(run_state.get("route_entered", false)):
+		run_state["route_entered"] = true
+		var side := str(world.karma.route_side())
+		var route_mvp := str(GameData.KARMA_ROUTES.get(side, {}).get("mvp", ""))
+		_log("KARMA_ROUTE side=%s mvp=%s" % [side, route_mvp])
+		if world.menus != null and is_instance_valid(world.menus) and str(world.menus._mode) == "victory":
+			world.menus.close()
+		get_tree().paused = false
+		world.karma.enter_route()
+		run_state["won_at"] = 0
+		run_state["boss_won"] = false
+		_apply_autopilot()
 		return
 	if _want_endless():
 		if _endless_exhausted():
@@ -933,7 +953,7 @@ func _do_keep() -> void:
 	var free := victory or int(world.run_ymir) > 0
 	var slots := int(GameData.KEEP_WIN) if free else (1 if bool(cfg.get("keep_on_defeat", false)) else 0)
 	var kept: Array = []
-	if bool(cfg.get("auto_keep", true)) and slots > 0 and not offer.is_empty():
+	if bool(cfg.get("auto_keep", false)) and slots > 0 and not offer.is_empty():
 		var sorted: Array = []
 		for it in offer:
 			if it is Dictionary and not bool(it.get("_kept", false)):
@@ -2273,7 +2293,7 @@ func _load_cfg() -> bool:
 		"endless": false, "endless_minutes": 4.0, "endless_mvps": 0,
 		"max_runs": 0, "max_minutes": 0.0, "stop_after_wins": 0,
 		"display": false, "offline": true, "hard_exit": true,
-		"auto_keep": true, "keep_on_defeat": false, "keep_reserve_slots": 2,
+		"auto_keep": false, "keep_on_defeat": false, "keep_reserve_slots": 2,
 		"keep_max_pct": 0.05, "swap_margin": 1.25,
 		"auto_stats": true, "auto_rebirth": false, "auto_rebirth_lv": false,
 		"auto_achievements": true,
@@ -2358,6 +2378,7 @@ func _write_status() -> void:
 		"session": session_id,
 		"pid": OS.get_process_id(),
 		"phase": phase,
+		"terminal": phase == "done" or phase == "failed",
 		"failed": failed,
 		"finish_reason": finish_reason,
 		"last_error": last_error,
@@ -2467,7 +2488,7 @@ func _mark_transition(label: String) -> void:
 	last_transition = "%s@%d" % [label, int(Time.get_unix_time_from_system())]
 
 
-func _profile_stamp() -> String:
+func _profile_fingerprint() -> String:
 	if not FileAccess.file_exists(Save.PATH):
 		return ""
 	var bytes := FileAccess.get_file_as_bytes(Save.PATH)
@@ -2480,10 +2501,12 @@ func _flush_profile_verified() -> bool:
 	# Test-only seam used by verify.sh; never set in a real session.
 	if OS.get_environment("FARMER_TEST_FLUSH_FAIL") == "1":
 		return false
-	var before := _profile_stamp()
+	var before := _profile_fingerprint()
+	# Force a content change so a successful write must alter the fingerprint.
+	Save.set_setting("farmer_flush_marker", "%s-%d" % [session_id, _now()])
 	Save.mark_dirty()
 	Save.flush()
-	var after := _profile_stamp()
+	var after := _profile_fingerprint()
 	return after != "" and after != before
 
 

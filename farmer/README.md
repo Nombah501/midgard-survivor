@@ -79,8 +79,8 @@ cd ../gui
 | `presets/steady.json` | авто-класс, авто-стадия/danger, апгрейды, карты, loadout, питомец |
 | `presets/zeny.json` | цель — зеньги; авто-подбор danger по измеренной доходности |
 | `presets/crumbs.json` | цель — Star Crumb: danger 25+, endless до 6 минут / 8 MVP |
-| `presets/synx-hell.json` | соло SinX, Prontera danger 25 (hell 10), speed 4, AFK-цикл |
-| `presets/sniper-hell.json` | соло Sniper (archer/0), те же настройки; включится после прокачки archer |
+| `presets/synx-hell.json` | соло SinX, Rachel Sanctuary danger 25 (hell 10), speed 4, AFK-цикл |
+| `presets/sniper-hell.json` | соло Sniper (archer/0), Rachel Sanctuary, те же настройки; включится после прокачки archer |
 | `presets/progress.json` | продавливание максимального danger, rebirth |
 | `presets/night.json` | ночной сбалансированный фарм, 8 часов, короткий endless |
 
@@ -200,8 +200,12 @@ AFK-цикл: забег идёт до смерти/победы (на SinX D25 
 
 - Endless Tower, Hel Tower и Emperium Festival **не автоматизируются** в v1:
   это отдельные режимы со своим UI и сохранёнными билдами.
-- Karma-маршруты через портал не запускаются (autopilot подавляет Morroc;
-  маршрут требует выхода из арены).
+- Karma-маршрут после MVP запускается автоматически: Valhalla → Valkyrie
+  Reginleif (+1 жизнь, +15% XP), Niflheim → Randgris. Если сторона karma не
+  выбрана (нет алтаря Baldur/Hel), портала нет и фермер идёт в endless.
+- **Кафра:** `auto_keep: false` по умолчанию — дроп забегов не сохраняется в
+  кафру (продаётся/остаётся в награде). Включать только вручную и следить за
+  местом.
 - Гача, town-refine с риском слома, grades/sockets и ролл traits не трогаются.
 - На danger 26–30 кумулятивные механики Hell могут убивать: автоподбор отступит
   по метрикам, но гарантий выживания нет.

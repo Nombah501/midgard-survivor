@@ -149,10 +149,13 @@ void Backend::loadTargets()
 
     const QJsonObject stages = root.value("stages").toObject();
     QStringList stageOrder;
-    if (stages.contains(QStringLiteral("prontera")))
-        stageOrder.append(QStringLiteral("prontera"));
+    // The measured best run for the main SinX profile is Rachel Sanctuary
+    // (ra_san|25 in the farmer's arms); keep it first so Start uses it.
+    const QString preferred = QStringLiteral("ra_san");
+    if (stages.contains(preferred))
+        stageOrder.append(preferred);
     for (auto it = stages.begin(); it != stages.end(); ++it)
-        if (it.key() != QStringLiteral("prontera"))
+        if (it.key() != preferred)
             stageOrder.append(it.key());
     for (const QString &id : std::as_const(stageOrder)) {
         QVariantMap item;

@@ -14,7 +14,7 @@
   "endless_mvps": 8,
   "max_runs": 0,
   "restart_seconds": 2,
-  "auto_keep": true,
+  "auto_keep": false,
   "auto_stats": true,
   "auto_upgrades": true,
   "upgrade_reserve": 200000,
