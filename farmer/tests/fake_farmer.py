@@ -11,7 +11,9 @@ repeats). The attempt counter lives next to the plan file. Behaviours:
   fail:<reason>    heartbeat, write phase=failed, exit 1
   crash            heartbeat, exit 1 without a terminal status
   hang             heartbeat once, spawn a grandchild, then stop beating
+  garbage          heartbeat, overwrite the status with non-JSON, exit 0
   exit:<code>      exit with <code> before any status
+  preflight:<msg>  print "run: <msg>" (underscores as spaces) to stderr, exit 78
 """
 import json
 import os
@@ -56,6 +58,10 @@ def beat(times=3):
 
 if kind == "exit":
     sys.exit(int(arg))
+if kind == "preflight":
+    print("launcher banner")
+    print(f"run: {arg.replace('_', ' ')}", file=sys.stderr)
+    sys.exit(78)
 stop_path = status_path.with_name("farmer_stop")
 if kind == "commands" and arg == "preboot":
     plan_path.with_suffix(".preboot").touch()
@@ -69,6 +75,9 @@ if kind == "clean":
 if kind == "fail":
     write("failed", failed=True, reason=arg)
     sys.exit(1)
+if kind == "garbage":
+    status_path.write_text('{"phase": "done", "termin')
+    sys.exit(0)
 if kind == "crash":
     sys.exit(1)
 if kind == "hang":

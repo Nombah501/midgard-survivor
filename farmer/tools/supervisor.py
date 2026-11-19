@@ -23,9 +23,11 @@ set, to ntfy. They run in background threads; a failed notification never
 delays recovery.
 
 Exit codes: 0 finished or stopped by the operator, 2 quarantine, 1 supervisor
-error. systemd restarts only the last one (RestartPreventExitStatus=2).
+error or another supervisor already running. systemd restarts only the last
+one (RestartPreventExitStatus=2).
 """
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -50,6 +52,9 @@ FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt"}
 # Present only while a session has no terminal outcome: a supervisor that
 # systemd restarts after its own crash continues the same AFK session.
 SESSION_FILE = DATA_DIR / "farmer_supervisor_session"
+# Held for the supervisor's lifetime: a second supervisor would read the
+# first one's status, request its finish on SIGTERM and end its session.
+LOCK_FILE = DATA_DIR / "farmer_supervisor.lock"
 EXIT_QUARANTINE = 2
 
 
@@ -73,6 +78,7 @@ class Attempt:
     outcome: str  # finished | failed | fatal | stopped
     reason: str
     exit_code: int | None
+    detail: str = ""  # run.sh's own words for a preflight failure
 
 
 @dataclass
@@ -171,13 +177,14 @@ class Supervisor:
                 {
                     "reason": reason,
                     "last_failure": last.reason,
+                    "detail": last.detail,
                     "attempts": [a.__dict__ for a in outcome.attempts],
                 },
                 indent=2,
             )
         )
         log(f"QUARANTINE {reason}; diagnostics in {self.log_dir}")
-        self.notify("quarantine", f"farmer quarantined: {reason} (last: {last.reason})")
+        self.notify("quarantine", f"farmer quarantined: {reason} (last: {last.detail or last.reason})")
         return outcome
 
     def _attempt(self, number, delay):
@@ -197,8 +204,12 @@ class Supervisor:
             outcome = "failed"
         if outcome != "finished" and status is not None:
             Path(f"{stem}.status.json").write_text(json.dumps(status, indent=2))
-        log(f"attempt {number}: {outcome} ({reason}, exit {code})")
-        return Attempt(number, delay, outcome, reason, code)
+        detail = ""
+        if reason == "preflight_failed":
+            lines = Path(f"{stem}.log").read_text(errors="replace").splitlines()
+            detail = next((line for line in reversed(lines) if line.startswith("run: ")), "")
+        log(f"attempt {number}: {outcome} ({reason}, exit {code}){' ' + detail if detail else ''}")
+        return Attempt(number, delay, outcome, reason, code, detail)
 
     def _watch(self, proc, since_ns):
         """Wait for the child; return (exit_code, last_status, forced_reason).
@@ -379,19 +390,29 @@ def main():
         ), end="")
         return 0
 
+    notify = make_notifier(args.ntfy_url)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     try:
-        session = SESSION_FILE.read_text().strip()
-    except OSError:
-        session = ""
-    if session:
-        log(f"continuing unfinished session {session}")
-    else:
-        session = f"afk-{stamp}"
-        SESSION_FILE.write_text(session)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        lock = open(LOCK_FILE, "w")  # noqa: SIM115 - released only by process exit
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        session = SESSION_FILE.read_text().strip() if SESSION_FILE.exists() else ""
+        if session:
+            log(f"continuing unfinished session {session}")
+        else:
+            session = f"afk-{stamp}"
+            SESSION_FILE.write_text(session)
+    except BlockingIOError:
+        log(f"another supervisor holds {LOCK_FILE}; leaving its session alone")
+        return 1
+    except OSError as exc:
+        # A read-only or full profile disk: no restart can fix it (like run.sh exit 78).
+        log(f"QUARANTINE profile directory unusable: {exc}")
+        notify("quarantine", f"profile directory unusable: {exc}")
+        notify.drain(25)
+        return EXIT_QUARANTINE
     # One AFK session id for every restart: the farmer continues its checkpoint.
     os.environ["FARMER_SESSION_ID"] = session
-    notify = make_notifier(args.ntfy_url)
     sup = Supervisor(
         command=[str(FARMER_DIR / "run.sh")] + ([preset] if preset else []),
         status_path=DATA_DIR / "farmer_status.json",

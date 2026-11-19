@@ -37,8 +37,11 @@ tail -f "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer.log"
 Игра должна быть закрыта перед `install.sh`/`run.sh`. `run.sh` сам проверяет
 SHA официального патча и установленного фермерского патча; при обновлении игры
 нужно пересобрать (`./build.sh && ./install.sh`). Exit `run.sh`: 0 — чистый
-финиш, 78 — ошибка, которую рестарт не исправит (нет игры/патча, устаревшая
-сборка, плохой пресет), прочее — сбой.
+финиш, 78 — ошибка, которую рестарт не исправит (нет игры/патча, обновился
+официальный патч, устаревшая сборка, плохой пресет, `farmer.cfg` не JSON-объект,
+каталог профиля недоступен на запись или на его диске меньше
+`FARMER_MIN_FREE_MB`, по умолчанию 200 MiB), 1 — второй `run.sh` или уже
+запущенная игра, прочее — сбой.
 
 ## AFK-сессия (supervisor)
 
@@ -57,7 +60,7 @@ Supervisor запускает `run.sh` в отдельной группе про
 | --- | --- |
 | exit 0 и `phase=done` | конец сессии, уведомление `stop`/`goal` |
 | crash, выход без терминального статуса, heartbeat не менялся 3×5 с | kill всей группы, уведомление `fail`, рестарт через 15 с × 2ⁿ (до 10 мин) |
-| 4 сбоя за час, exit 78, `cfg_invalid` | quarantine: без рестарта, уведомление, exit 2 |
+| 4 сбоя за час, exit 78, `cfg_invalid`, `checkpoint_corrupt` | quarantine: без рестарта, уведомление с причиной из `run.sh`, exit 2 |
 | SIGTERM/SIGINT | запрос `finish` даже при загрузке; до 45 с на весь выход и до 20 с после терминального статуса, затем SIGKILL всей группе, без рестарта |
 
 Все рестарты одного supervisor'а — одна AFK-сессия: он передаёт фермеру
@@ -73,7 +76,10 @@ totals, счётчики, `run_id`, цель, pre-run snapshot. Checkpoint пи�
 
 До первого heartbeat даётся 180 с на загрузку игры. Логи и диагностика —
 `farmer/logs/supervisor-<stamp>/`: `attempt-NN.log` (вывод `run.sh`),
-`attempt-NN.status.json` (статус упавшей попытки), `quarantine.json`.
+`attempt-NN.status.json` (статус упавшей попытки), `quarantine.json`
+(`detail` — строка `run: …`, которой `run.sh` объяснил exit 78).
+Второй supervisor на том же профиле сразу выходит с кодом 1 и не трогает
+сессию первого (`farmer_supervisor.lock`).
 Уведомления: `notify-send` и, если задан `FARMER_NTFY_URL` (в
 `~/.config/midgard-farmer.env` для unit'а или `--ntfy-url`), ntfy; они идут в
 фоне и не задерживают рестарт.
@@ -152,6 +158,7 @@ backup может отсутствовать.
 ./tools/verify.sh                # все сценарии, у каждого свой timeout
 ./tools/verify.sh --crash-settled  # падение после settlement + рестарт сессии
 ./tools/verify.sh --cmd-abort-settled --cmd-pause-resume
+./tools/verify.sh --soak=8       # ночной soak под supervisor'ом (не входит в --all)
 ```
 
 `verify.sh` читает реальный `user://`, но запускает игру на копии профиля в
@@ -161,9 +168,21 @@ backup может отсутствовать.
 таймаут — FAIL. `--crash-run|--crash-settled|--crash-journaled` убивают фермера
 на границе checkpoint (`FARMER_TEST_CRASH_AT`), перезапускают ту же сессию и
 проверяют, что totals совпадают с журналом и каждый `run_id` в нём один раз.
-Сценарии `--cmd-*` отправляют запросы в sandbox: проверяют терминальную
-причину, журнал при `abort` до и после settlement, heartbeat во время pause
-и `resume` с тем же PID.
+`--supervised-kill-run` и `--supervised-crash-settled` делают то же под
+настоящим supervisor'ом: SIGKILL игры снаружи во время run или одноразовым
+хуком после settlement, рестарт — уже решение supervisor'а.
+`--checkpoint-corrupt` проверяет терминальный `checkpoint_corrupt` без
+изменения профиля. Сценарии `--cmd-*` отправляют запросы в sandbox: проверяют
+терминальную причину, журнал при `abort` до и после settlement, heartbeat во
+время pause и `resume` с тем же PID.
+
+`--soak=HOURS [--soak-preset=PRESET]` запускает пресет (по умолчанию
+`presets/night.json`, `max_minutes=HOURS×60`) под supervisor'ом и каждые 5 с
+пишет heartbeat, RSS игры и занятый диск в `soak.samples.jsonl`. Вердикт —
+`tools/soak_check.py`: FAIL при heartbeat gap > 15 с, росте RSS > 50% после
+первого часа, росте диска > 200 MiB, дубле `run_id`, расхождении totals с
+журналом, quarantine или нечистом финише; в `soak.verdict.log` — rewards/hour.
+Soak занимает машину (одна игра) на HOURS + до 30 мин.
 
 ## GUI
 
@@ -299,10 +318,11 @@ AFK-цикл: забег идёт до смерти/победы (на SinX D25 
 - `install.sh`/`run.sh` сохраняют снимки профиля и сопутствующих файлов.
   `run.sh` хранит 10 последних обычных снимков в `farmer/backups/`; ротация
   не затрагивает `official-state.json` и `known-good/`.
-- `run.sh` держит `flock`, проверяет отсутствие второго процесса игры, сверяет
+- `run.sh` держит `flock` (снимается ядром при смерти процесса, stale lock
+  не бывает), проверяет отсутствие второго процесса игры, сверяет
   SHA официального патча и собранного фермера.
-- Фермер держит `user://farmer.lock`, пишет статус атомарно, а при
-  `hard_exit` убивает процесс только после `Save.flush()`.
+- Фермер пишет статус атомарно, а при `hard_exit` убивает процесс только
+  после `Save.flush()`.
 - `uninstall.sh` возвращает официальный патч и удаляет только фермерский pck;
   профиль/конфиг/логи остаются.
 
@@ -346,9 +366,11 @@ src/save_hook.gd     bootstrap, добавляется в Save
 tools/inject_hook.py идемпотентная вставка хука
 tools/patch_player.py next_job: путь профессии из Save meta
 tools/check.sh       статические проверки
-tools/verify.sh      bounded one-run/stop/endless/crash-* в sandbox
+tools/verify.sh      bounded сценарии и soak в sandbox
 tools/supervisor.py  AFK supervisor: heartbeat, рестарт, quarantine, уведомления
-tests/               pytest supervisor'а на фейковом farmer
+tools/drive_supervisor.py  supervisor в sandbox: SIGKILL или сэмплы для verify.sh
+tools/soak_check.py  вердикт soak по сэмплам, журналу и статусу
+tests/               pytest supervisor'а, run.sh и soak_check без игры
 tools/install_hooks.sh  git core.hooksPath=.githooks
 presets/*.json       конфиги
 patch_farmer.pck     собранный патч

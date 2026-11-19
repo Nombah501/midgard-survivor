@@ -19,8 +19,8 @@ const CHECKPOINT_PATH := "user://farmer_session.json"
 const LOG_PATH := "user://farmer.log"
 const COMMAND_PATH := "user://farmer_command"
 const STOP_PATH := "user://farmer_stop"
-const LOCK_PATH := "user://farmer.lock"
 const BUILD_PATH := "user://farmer_build.json"
+const TEST_CRASHED_PATH := "user://farmer_test_crashed"
 
 const RESULT_BOSS_WON := "boss_won"
 
@@ -83,7 +83,6 @@ var _settle_ms := 0
 var _finish_after_run := ""
 var _pause_requested := false
 var _hard_finished := false
-var _lock_pid := 0
 var _test_wait_at_keep := false
 
 var _potential_script = null
@@ -118,10 +117,6 @@ func _ready() -> void:
 	if not _load_cfg():
 		_fail_session("cfg_invalid")
 		return
-	if not _acquire_lock():
-		_log("LOCKED by pid %d: another farmer session is alive" % _lock_pid)
-		_fail_session("locked")
-		return
 	_log("BOOT api=%d session=%s zeny=%d cfg=%s" % [API_VERSION, session_id, int(Save.zeny()), JSON.stringify(cfg)])
 	if not _restore_checkpoint():
 		return
@@ -130,7 +125,6 @@ func _ready() -> void:
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_EXIT_TREE or what == NOTIFICATION_PREDELETE:
-		_release_lock()
 		if not failed and not _hard_finished and Save != null:
 			Save.flush()
 
@@ -2336,10 +2330,16 @@ func _test_env(name: String) -> String:
 	return OS.get_environment("FARMER_TEST_" + name)
 
 
+# One-shot per sandbox: the relaunch (or supervisor restart) passes the same point.
 func _test_crash(point: String) -> void:
-	if _test_env("CRASH_AT") == point:
-		_log("TEST_CRASH " + point)
-		OS.kill(OS.get_process_id())
+	if _test_env("CRASH_AT") != point or FileAccess.file_exists(TEST_CRASHED_PATH):
+		return
+	var f := FileAccess.open(TEST_CRASHED_PATH, FileAccess.WRITE)
+	if f != null:
+		f.store_string(point)
+		f.close()
+	_log("TEST_CRASH " + point)
+	OS.kill(OS.get_process_id())
 
 
 func _build_result() -> Dictionary:
@@ -2726,37 +2726,6 @@ func _save_arms() -> void:
 	_atomic_write(ARMS_PATH, JSON.stringify(arms))
 
 
-func _pid_alive(pid: int) -> bool:
-	if pid <= 0:
-		return false
-	if OS.get_name() == "Linux":
-		return FileAccess.file_exists("/proc/%d" % pid)
-	return OS.is_process_running(pid)
-
-
-func _acquire_lock() -> bool:
-	if FileAccess.file_exists(LOCK_PATH):
-		var txt := FileAccess.get_file_as_string(LOCK_PATH)
-		var pid := txt.to_int()
-		if pid > 0 and pid != OS.get_process_id() and _pid_alive(pid):
-			_lock_pid = pid
-			return false
-	var f := FileAccess.open(LOCK_PATH, FileAccess.WRITE)
-	if f == null:
-		return false
-	f.store_string(str(OS.get_process_id()))
-	f.close()
-	_lock_pid = OS.get_process_id()
-	return true
-
-
-func _release_lock() -> void:
-	if _lock_pid != OS.get_process_id():
-		return
-	if FileAccess.file_exists(LOCK_PATH):
-		DirAccess.remove_absolute(ProjectSettings.globalize_path(LOCK_PATH))
-
-
 func _fail_session(reason: String, allow_hard_exit := true) -> void:
 	if failed:
 		return
@@ -2768,7 +2737,6 @@ func _fail_session(reason: String, allow_hard_exit := true) -> void:
 	_mark_transition("fail:" + reason)
 	_log("FAIL " + reason)
 	_write_status()
-	_release_lock()
 	if allow_hard_exit and bool(cfg.get("hard_exit", true)) and DisplayServer.get_name() == "headless":
 		OS.kill(OS.get_process_id())
 		return
@@ -2798,7 +2766,6 @@ func _finish(reason: String) -> void:
 	_log("FINISH %s runs=%d wins=%d losses=%d zeny=%d" % [reason, runs_done, wins, losses, total_zeny])
 	phase = "done"
 	_write_status()
-	_release_lock()
 	_hard_finished = true
 	if bool(cfg.get("hard_exit", true)) and DisplayServer.get_name() == "headless":
 		print("FARMER HARD_EXIT")

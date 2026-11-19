@@ -1,4 +1,5 @@
 """Exercise run.sh with a fake game, an isolated XDG home, and real Linux netns."""
+import fcntl
 import hashlib
 import json
 import os
@@ -137,6 +138,65 @@ def test_isolation_failure_is_fatal_before_game_exec(launcher, monkeypatch, deny
     proc = launch(run, 78)
     assert "network isolation" in proc.stderr
     assert "namespace permission denied" in proc.stdout + proc.stderr
+    assert not (data / "fake-game.json").exists()
+
+
+def test_read_only_profile_directory_is_unfixable_before_launch(launcher):
+    run, data, _ = launcher
+    data.chmod(0o555)
+    try:
+        proc = launch(run, 78)
+    finally:
+        data.chmod(0o755)
+    assert "not writable" in proc.stderr
+    assert not (data / "fake-game.json").exists()
+
+
+def test_nearly_full_profile_disk_is_unfixable_before_launch(launcher):
+    run, data, bin_dir = launcher
+    shim(bin_dir, "df", 'echo "Filesystem 1024-blocks Used Available Capacity Mounted on"\n'
+                        'echo "/dev/fake 1000000 900000 102400 90% /"')  # 100 MiB free
+    proc = launch(run, 78)
+    assert "100 MiB free" in proc.stderr
+    assert not (data / "fake-game.json").exists()
+
+
+@pytest.mark.parametrize("cfg", ['{"speed": 10', "[]"])
+def test_broken_farmer_config_is_unfixable_before_launch(launcher, cfg):
+    run, data, _ = launcher
+    (data / "farmer.cfg").write_text(cfg)
+    proc = launch(run, 78)
+    assert "farmer.cfg is not a JSON object" in proc.stderr
+    assert not (data / "fake-game.json").exists()
+
+
+def test_official_patch_update_is_unfixable_before_launch(launcher):
+    run, data, _ = launcher
+    (data / "patches/patch_official.pck").write_bytes(b"official, next game version")
+    proc = launch(run, 78)
+    assert "official patch changed" in proc.stderr
+    assert not (data / "fake-game.json").exists()
+
+
+def test_unreadable_final_status_is_not_a_clean_finish(launcher):
+    run, _, _ = launcher
+    proc = launch(run, 1, mode="garbage")
+    assert "did not finish cleanly" in proc.stderr
+
+
+def test_lock_file_left_by_a_dead_launcher_does_not_block(launcher):
+    run, data, _ = launcher
+    (data / "farmer.run.lock").write_text("12345")  # its flock died with the launcher
+    launch(run)
+    assert (data / "fake-game.json").exists()
+
+
+def test_second_launcher_is_transient_busy_without_touching_the_game(launcher):
+    run, data, _ = launcher
+    with open(data / "farmer.run.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the first launcher
+        proc = launch(run, 1)
+    assert "another farmer launcher" in proc.stderr
     assert not (data / "fake-game.json").exists()
 
 

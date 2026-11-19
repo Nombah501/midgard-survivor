@@ -31,6 +31,17 @@ busy() { echo "run: $*" >&2; exit 1; }
 [[ -f "$STATE" ]] || die "no state.json at $STATE (launch the game once)"
 [[ -f "$INFO" ]] || die "patch_farmer.info missing; run ./build.sh && ./install.sh"
 
+# A read-only or full profile disk survives every restart; stop before the lock.
+if ! probe="$(mktemp -p "$DATA" .farmer-write-probe.XXXXXXXX 2>/dev/null)"; then
+	die "profile directory is not writable: $DATA"
+fi
+rm -f -- "$probe"
+MIN_FREE_MB="${FARMER_MIN_FREE_MB:-200}"
+free_mb="$(df -Pk -- "$DATA" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }' || true)"
+if [[ "$free_mb" =~ ^[0-9]+$ ]] && (( free_mb < MIN_FREE_MB )); then
+	die "profile disk has $free_mb MiB free, below $MIN_FREE_MB MiB (FARMER_MIN_FREE_MB): $DATA"
+fi
+
 # One launcher at a time. The game also checks its own process below.
 exec 9>"$DATA/farmer.run.lock"
 if ! flock -n 9; then
@@ -66,6 +77,8 @@ if [[ $# -ge 1 ]]; then
 	cp "$1" "$DATA/farmer.cfg"
 fi
 [[ -f "$DATA/farmer.cfg" ]] || die "no farmer.cfg; pass a preset or create one"
+python3 -c 'import json,sys; sys.exit(not isinstance(json.load(open(sys.argv[1])), dict))' \
+	"$DATA/farmer.cfg" 2>/dev/null || die "farmer.cfg is not a JSON object: $DATA/farmer.cfg"
 
 DISPLAY_MODE="$(python3 -c 'import json,sys; print("1" if json.load(open(sys.argv[1])).get("display",False) else "0")' "$DATA/farmer.cfg" 2>/dev/null || echo 0)"
 if [[ "${FARMER_DISPLAY:-}" == "1" || "${FARMER_DISPLAY:-}" == "true" ]]; then

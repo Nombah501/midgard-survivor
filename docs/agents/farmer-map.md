@@ -21,12 +21,12 @@ Cross-cutting:
 
 ## Around the game
 
-- `farmer/tools/supervisor.py`: restart, backoff, quarantine, notifications, the systemd unit (`--print-unit`). Its tests are in `farmer/tests/test_supervisor.py`.
-- `farmer/run.sh`: preflight (exit 78 = unfixable), network isolation for supervised sessions, backups and known-good. Its tests are in `farmer/tests/test_run_sh.py`.
+- `farmer/tools/supervisor.py`: restart, backoff, quarantine (with run.sh's preflight `detail`), notifications, the single-supervisor lock, the systemd unit (`--print-unit`). Its tests are in `farmer/tests/test_supervisor.py`.
+- `farmer/run.sh`: preflight (exit 78 = unfixable: game/patch/build, cfg not a JSON object, profile dir not writable or below `FARMER_MIN_FREE_MB`), the launcher `flock` (the only single-instance guard), network isolation for supervised sessions, backups and known-good. Its tests are in `farmer/tests/test_run_sh.py`.
 - Contracts and operator docs: `farmer/README.md` (AFK session, commands, isolation/backup, status). Decisions: `docs/adr/`.
 
 ## Verification
 
 - `farmer/tools/check.sh`: static checks plus pytest when tools, tests or scripts are staged. Needs no game.
-- `farmer/tools/verify.sh [--scenario…]`: real-game scenarios on a sandbox copy of the profile. Run `./build.sh` first after any `farmer.gd` change. One game per machine: runs queue on `.sandbox/verify.lock`.
+- `farmer/tools/verify.sh [--scenario…]`: real-game scenarios on a sandbox copy of the profile. Run `./build.sh` first after any `farmer.gd` change. One game per machine: runs queue on `.sandbox/verify.lock`. `--supervised-*` and `--soak=HOURS` run the real supervisor through `tools/drive_supervisor.py`; `tools/soak_check.py` judges a soak (tests: `farmer/tests/test_soak_check.py`).
 - The real profile and the real install (`./install.sh`) are the operator's. Leave them to the operator.

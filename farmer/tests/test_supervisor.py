@@ -1,8 +1,11 @@
 """Supervisor decisions, driven through a fake farmer child (no game)."""
 import dataclasses
+import fcntl
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -15,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from supervisor import Policy, Supervisor, make_notifier  # noqa: E402
 
 FAKE = Path(__file__).resolve().parent / "fake_farmer.py"
+SUPERVISOR = FAKE.parent.parent / "tools/supervisor.py"
 
 FAST = Policy(
     heartbeat_interval=0.1,
@@ -210,6 +214,90 @@ def test_stale_heartbeat_kills_the_whole_group_and_restarts(farm):
     grandchild = int(plan.with_suffix(".grandchild").read_text())
     assert not _alive(grandchild)
     assert sent == ["fail", "stop"]
+
+
+def test_sigstopped_farmer_is_a_stale_heartbeat_and_restarts(farm):
+    sup, sent, _ = farm("commands", "clean:stop")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(sup.run)
+        try:
+            running = wait_status(sup.status_path, lambda d: d["phase"] == "run")
+            os.killpg(running["pid"], signal.SIGSTOP)
+            result = future.result(timeout=3)
+        finally:
+            sup.request_stop()
+    assert result.attempts[0].reason == "heartbeat_stale"
+    assert not _alive(running["pid"])
+    assert (result.kind, len(result.attempts)) == ("finished", 2)
+    assert sent == ["fail", "stop"]
+
+
+def test_unreadable_status_is_never_a_clean_finish(farm):
+    sup, sent, _ = farm("garbage", "clean:stop")
+
+    result = sup.run()
+
+    assert result.attempts[0].outcome == "failed"
+    assert result.attempts[0].reason == "exit_0_phase_run"
+    assert sent == ["fail", "stop"]
+
+
+def test_second_supervisor_leaves_the_running_session_alone(tmp_path):
+    data = tmp_path / "godot/app_userdata/Midgard Survivors"
+    data.mkdir(parents=True)
+    session = data / "farmer_supervisor_session"
+    session.write_text("afk-first")
+    with open(data / "farmer_supervisor.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the first supervisor
+        second = subprocess.Popen(
+            [sys.executable, str(SUPERVISOR)],
+            env={**os.environ, "XDG_DATA_HOME": str(tmp_path), "GAME_DIR": str(tmp_path)},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            out, _ = second.communicate(timeout=5)
+        finally:
+            second.kill()
+    assert second.returncode == 1, out
+    assert "another supervisor" in out
+    assert session.read_text() == "afk-first"
+    assert not (data / "farmer_stop").exists()
+    assert "attempt" not in out
+
+
+def test_unwritable_profile_quarantines_the_supervisor_itself(tmp_path):
+    data = tmp_path / "godot/app_userdata/Midgard Survivors"
+    data.mkdir(parents=True)
+    data.chmod(0o555)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(SUPERVISOR)], capture_output=True, text=True, timeout=10,
+            env={**os.environ, "XDG_DATA_HOME": str(tmp_path), "GAME_DIR": str(tmp_path), "PATH": ""},
+        )
+    finally:
+        data.chmod(0o755)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "notify quarantine: profile directory unusable" in proc.stdout
+    assert "attempt" not in proc.stdout
+
+
+def test_preflight_quarantine_names_the_launcher_cause(tmp_path):
+    plan = tmp_path / "plan.txt"
+    plan.write_text("preflight:official_patch_changed_(game_updated);_rebuild")
+    status = tmp_path / "farmer_status.json"
+    sent = []
+    sup = Supervisor(
+        command=[sys.executable, str(FAKE), str(status), str(plan)],
+        status_path=status, log_dir=tmp_path / "logs", policy=FAST,
+        notify=lambda event, message: sent.append((event, message)),
+    )
+
+    result = sup.run()
+
+    cause = "run: official patch changed (game updated); rebuild"
+    assert (result.kind, result.reason, len(result.attempts)) == ("quarantined", "preflight_failed", 1)
+    assert json.loads((result.log_dir / "quarantine.json").read_text())["detail"] == cause
+    assert sent == [("quarantine", f"farmer quarantined: preflight_failed (last: {cause})")]
 
 
 def test_repeated_failures_in_window_quarantine(farm):

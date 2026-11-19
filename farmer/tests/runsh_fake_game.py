@@ -39,6 +39,8 @@ if mode in {"done", "done-137", "done-9"}:
             "exit_code": 0,
         })
     )
+if mode == "garbage":
+    (data / "farmer_status.json").write_text('{"phase": "done", "fail')
 if mode in {"kill", "done-137"}:
     os.kill(os.getpid(), signal.SIGKILL)
-raise SystemExit({"done": 0, "done-9": 9, "fail": 1}.get(mode, 9))
+raise SystemExit({"done": 0, "done-9": 9, "fail": 1, "garbage": 0}.get(mode, 9))

@@ -8,14 +8,26 @@
 # Usage: ./tools/verify.sh [--one-run] [--stop] [--endless] [--flush-fail]
 #                          [--crash-run] [--crash-settled] [--crash-journaled]
 #                          [--cmd-finish] [--cmd-abort] [--cmd-abort-settled]
-#                          [--cmd-pause-resume] [--cmd-legacy] [--all] [--keep]
-# Default: --all.
+#                          [--cmd-pause-resume] [--cmd-legacy] [--checkpoint-corrupt]
+#                          [--supervised-kill-run] [--supervised-crash-settled]
+#                          [--all] [--keep]
+#        ./tools/verify.sh --soak=HOURS [--soak-preset=PRESET] [--keep]
+# Default: --all (every scenario except the soak).
 #
 # --crash-* kill the farmer at one checkpoint boundary (run start, after
 # settlement, after the journal write), relaunch the same session and assert
 # that totals and the journal hold every settled run exactly once.
 #
 # --cmd-* publish commands inside the sandbox and check heartbeat and accounting.
+#
+# --supervised-* run the real supervisor: SIGKILL the game before settlement
+# (from outside) or after it (one-shot in-farmer hook); the supervisor restarts
+# the farmer, which must continue the session without a second settlement.
+#
+# --soak=HOURS runs PRESET (default presets/night.json, max_minutes=HOURS*60)
+# under the supervisor, samples heartbeat, game RSS and disk every 5 s and
+# judges the result with tools/soak_check.py (heartbeat gap, RSS after the
+# first hour, disk growth, duplicate run_id, totals == journal).
 #
 # Artifacts: farmer/logs/verify-<stamp>/{summary.json,*.log,*.status.json}
 set -euo pipefail
@@ -38,11 +50,14 @@ SNAP="$SB/snapshot"
 KEEP=0
 FAILED=0
 SCENARIOS=()
+SOAK_HOURS=""
+SOAK_PRESET="$FARMER_DIR/presets/night.json"
 ALL_SCENARIOS=(one-run stop endless flush-fail crash-run crash-settled crash-journaled
-	cmd-finish cmd-abort cmd-abort-settled cmd-pause-resume cmd-legacy)
+	cmd-finish cmd-abort cmd-abort-settled cmd-pause-resume cmd-legacy checkpoint-corrupt
+	supervised-kill-run supervised-crash-settled)
 
 usage() {
-	sed -n '2,18p' "$0"
+	awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
 die() {
@@ -60,8 +75,11 @@ for arg in "$@"; do
 		--crash-run) SCENARIOS+=(crash-run) ;;
 		--crash-settled) SCENARIOS+=(crash-settled) ;;
 		--crash-journaled) SCENARIOS+=(crash-journaled) ;;
-		--cmd-finish|--cmd-abort|--cmd-abort-settled|--cmd-pause-resume|--cmd-legacy)
+		--cmd-finish|--cmd-abort|--cmd-abort-settled|--cmd-pause-resume|--cmd-legacy|--checkpoint-corrupt|\
+		--supervised-kill-run|--supervised-crash-settled)
 			SCENARIOS+=("${arg#--}") ;;
+		--soak=*) SOAK_HOURS="${arg#--soak=}"; SCENARIOS+=(soak) ;;
+		--soak-preset=*) SOAK_PRESET="$(realpath -- "${arg#--soak-preset=}")" ;;
 		--all) SCENARIOS=("${ALL_SCENARIOS[@]}") ;;
 		--keep) KEEP=1 ;;
 		-h|--help) usage; exit 0 ;;
@@ -70,6 +88,10 @@ for arg in "$@"; do
 done
 if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
 	SCENARIOS=("${ALL_SCENARIOS[@]}")
+fi
+if [[ -n "$SOAK_HOURS" ]]; then
+	[[ "$SOAK_HOURS" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--soak needs a number of hours, got: $SOAK_HOURS"
+	[[ -f "$SOAK_PRESET" ]] || die "soak preset not found: $SOAK_PRESET"
 fi
 
 # One game process per machine: concurrent verifications queue here instead
@@ -138,8 +160,8 @@ INSTALLED_SHA="$(sha256sum "$SB_DATA/patches/patch_farmer.pck" | cut -d' ' -f1)"
 [[ "$INSTALLED_SHA" == "$PCK_SHA" ]] || die "sandbox install hash mismatch"
 
 write_cfg() {
-	local name="$1" override="$2"
-	python3 - "$FARMER_DIR/presets/one-run.json" "$OUT_DIR/$name.json" "$override" <<'PY'
+	local name="$1" override="$2" base="${3:-$FARMER_DIR/presets/one-run.json}"
+	python3 - "$base" "$OUT_DIR/$name.json" "$override" <<'PY'
 import json
 import sys
 
@@ -170,7 +192,9 @@ reset_profile() {
 		"$SB_DATA/farmer.log.prev" \
 		"$SB_DATA/farmer.run.lock" \
 		"$SB_DATA/farmer_runs.jsonl" \
-		"$SB_DATA/farmer_session.json"
+		"$SB_DATA/farmer_session.json" \
+		"$SB_DATA/farmer_supervisor_session" \
+		"$SB_DATA/farmer_test_crashed"
 }
 
 assert_status() {
@@ -222,8 +246,8 @@ PY
 }
 
 assert_failed_status() {
-	local status="$1"
-	python3 - "$status" <<'PY'
+	local status="$1" expected="$2"
+	python3 - "$status" "$expected" <<'PY'
 import json
 import sys
 
@@ -240,7 +264,7 @@ def need(cond, msg):
 need(d.get("phase") == "failed", "phase != failed")
 need(bool(d.get("terminal")), "terminal false")
 need(bool(d.get("failed")), "failed false")
-need(str(d.get("finish_reason") or "") == "flush_failed", "finish_reason != flush_failed")
+need(str(d.get("finish_reason") or "") == sys.argv[2], "finish_reason != " + sys.argv[2])
 need(int(d.get("exit_code") or 0) != 0, "exit_code == 0")
 need(str(d.get("last_transition") or "") != "", "last_transition empty")
 
@@ -399,7 +423,8 @@ PY
 }
 
 run_scenario() {
-	local name="$1" cfg="$2" timeout_s="$3" marker="$4" expect_fail="${5:-0}" extra_env="${6:-}"
+	# expect_fail: the expected terminal finish_reason of a failing launch; empty = clean finish.
+	local name="$1" cfg="$2" timeout_s="$3" marker="$4" expect_fail="${5:-}" extra_env="${6:-}"
 	local run_log="$OUT_DIR/$name.run.log"
 	local status="$OUT_DIR/$name.status.json"
 	local farmer_log="$OUT_DIR/$name.farmer.log"
@@ -407,9 +432,12 @@ run_scenario() {
 
 	reset_profile
 	echo "=== $name (timeout ${timeout_s}s) ==="
+	if [[ "$name" == checkpoint-corrupt ]]; then
+		printf '{"session": "verify-%s-%s", "phase": "sett' "$name" "$STAMP" >"$SB_DATA/farmer_session.json"
+	fi
 	set +e
 	local env_args=("XDG_DATA_HOME=$SB" "GAME_DIR=$GAME_DIR")
-	if [[ "$name" == cmd-* || "$name" == flush-fail ]]; then
+	if [[ "$name" == cmd-* || "$name" == flush-fail || "$name" == checkpoint-corrupt ]]; then
 		env_args+=("FARMER_SESSION_ID=verify-$name-$STAMP")
 	fi
 	if [[ -n "$extra_env" ]]; then
@@ -431,7 +459,7 @@ run_scenario() {
 		cp "$SB_DATA/farmer.log" "$farmer_log"
 	fi
 
-	if [[ "$expect_fail" == "1" ]]; then
+	if [[ -n "$expect_fail" ]]; then
 		if [[ "$rc" -ne 1 ]]; then
 			reason="run.sh exit $rc (expected 1)"
 		fi
@@ -443,12 +471,16 @@ run_scenario() {
 	fi
 	if [[ -z "$reason" ]]; then
 		local err
-		if [[ "$expect_fail" == "1" ]]; then
-			if ! err="$(assert_failed_status "$status")"; then
+		if [[ -n "$expect_fail" ]]; then
+			if ! err="$(assert_failed_status "$status" "$expect_fail")"; then
 				reason="status: $err"
 			fi
 		elif ! err="$(assert_status "$status" "$name")"; then
 			reason="status: $err"
+		fi
+		if [[ -z "$reason" && "$name" == checkpoint-corrupt ]] &&
+			! cmp -s "$SB_DATA/profile.json" "$SNAP/profile.json"; then
+			reason="profile changed although the session could not start"
 		fi
 	fi
 	if [[ -z "$reason" ]]; then
@@ -538,6 +570,24 @@ sys.exit(1 if err else 0)
 PY
 }
 
+# Prints and records the verdict; fails (return 1) when the game outlived the scenario.
+conclude_scenario() {
+	local name="$1" status="$2" rc="$3" reason="$4" verdict=PASS
+	if [[ -z "$reason" ]]; then
+		echo "  PASS"
+	else
+		verdict=FAIL
+		FAILED=1
+		echo "  FAIL: $reason" >&2
+	fi
+	write_result "$status" "$name" "$verdict" "$rc" "$reason" || FAILED=1
+	if pgrep -f 'MidgardSurvivors\.x86_64' >/dev/null 2>&1; then
+		echo "verify: game process still running after $name; close it and re-run" >&2
+		FAILED=1
+		return 1
+	fi
+}
+
 # Launch 1 is killed at a checkpoint boundary; launch 2 continues the same
 # session (as the supervisor would) and must finish cleanly.
 run_crash_scenario() {
@@ -547,7 +597,7 @@ run_crash_scenario() {
 	local run_log="$OUT_DIR/$name.run.log"
 	local status="$OUT_DIR/$name.status.json"
 	local farmer_log="$OUT_DIR/$name.farmer.log"
-	local reason="" rc=0 crash_rc=0 verdict=FAIL err
+	local reason="" rc=0 crash_rc=0 err
 
 	reset_profile
 	echo "=== $name (crash at $point, timeout ${timeout_s}s per launch) ==="
@@ -579,21 +629,95 @@ run_crash_scenario() {
 		reason="script error in game log"
 	fi
 
-	if [[ -z "$reason" ]]; then
-		verdict=PASS
-		echo "  PASS"
-	else
-		FAILED=1
-		echo "  FAIL: $reason" >&2
-	fi
-	write_result "$status" "$name" "$verdict" "$rc" "$reason" || FAILED=1
+	conclude_scenario "$name" "$status" "$rc" "$reason"
+}
 
-	if pgrep -f 'MidgardSurvivors\.x86_64' >/dev/null 2>&1; then
-		echo "verify: game process still running after $name; close it and re-run" >&2
-		FAILED=1
-		return 1
+# The real supervisor owns the session (its id is pre-seeded so FARMER_TEST_*
+# hooks answer). Attempt 1 is SIGKILLed at point; attempt 2 must continue the
+# same session and account every settled run exactly once.
+run_supervised_scenario() {
+	local name="$1" cfg="$2" point="$3" marker="$4" timeout_s="$5"
+	local session="verify-$name-$STAMP"
+	local run_log="$OUT_DIR/$name.run.log"
+	local status="$OUT_DIR/$name.status.json"
+	local farmer_log="$OUT_DIR/$name.farmer.log"
+	local boot_log="$OUT_DIR/$name.crash.farmer.log"
+	local reason="" rc=0 err mode=wait
+	local env_args=("XDG_DATA_HOME=$SB" "GAME_DIR=$GAME_DIR")
+
+	reset_profile
+	echo "=== $name (SIGKILL at $point under the supervisor, timeout ${timeout_s}s) ==="
+	printf '%s\n' "$session" >"$SB_DATA/farmer_supervisor_session"
+	if [[ "$point" == run ]]; then
+		mode=kill-run
+	else
+		env_args+=("FARMER_TEST_CRASH_AT=$point")
 	fi
-	return 0
+	set +e
+	env "${env_args[@]}" timeout --foreground -k 30 "$timeout_s" \
+		python3 "$FARMER_DIR/tools/drive_supervisor.py" "$SB_DATA" "$mode" "$OUT_DIR/$name" -- \
+		python3 "$FARMER_DIR/tools/supervisor.py" "$cfg" >"$run_log" 2>&1
+	rc=$?
+	set -e
+	cp "$SB_DATA/farmer_status.json" "$status" 2>/dev/null || true
+	cp "$SB_DATA/farmer.log" "$farmer_log" 2>/dev/null || true
+	cp "$SB_DATA/farmer.log.prev" "$boot_log" 2>/dev/null || true
+
+	if [[ "$rc" -ne 0 ]]; then
+		reason="supervised launch exit $rc"
+	elif [[ "$mode" == kill-run ]] && ! grep -q '^drive: SIGKILL game pid .* in run .*-r1$' "$run_log"; then
+		reason="the game was not killed in run r1"
+	elif [[ "$mode" == wait ]] && ! grep -Fq -- "TEST_CRASH $point" "$boot_log" 2>/dev/null; then
+		reason="attempt 1 did not crash at $point"
+	elif ! grep -q 'attempt 1: failed' "$run_log" || ! grep -q 'attempt 2: finished' "$run_log"; then
+		reason="supervisor did not fail attempt 1 and finish attempt 2"
+	elif [[ ! -f "$status" || ! -f "$boot_log" ]]; then
+		reason="no farmer_status.json or attempt-1 farmer.log"
+	elif ! err="$(assert_recovered "$status" "$point" "$session" "$boot_log")"; then
+		reason="status: $err"
+	elif ! grep -Fq -- "$marker" "$farmer_log"; then
+		reason="missing log marker: $marker"
+	elif grep -Eq 'SCRIPT ERROR|Parse Error|Invalid call|Cannot call method' "$run_log"; then
+		reason="script error in game log"
+	fi
+
+	conclude_scenario "$name" "$status" "$rc" "$reason"
+}
+
+run_soak() {
+	local hours="$1"
+	local session="verify-soak-$STAMP"
+	local run_log="$OUT_DIR/soak.run.log"
+	local status="$OUT_DIR/soak.status.json"
+	local reason="" rc=0
+	local minutes deadline
+	minutes="$(python3 -c 'import sys; print(float(sys.argv[1]) * 60)' "$hours")"
+	deadline="$(python3 -c 'import sys; print(int(float(sys.argv[1]) * 3600) + 1800)' "$hours")"
+	write_cfg soak "{\"max_minutes\":$minutes,\"max_runs\":0,\"hard_exit\":true,\"display\":false}" "$SOAK_PRESET"
+
+	reset_profile
+	echo "=== soak (${hours} h of $(basename "$SOAK_PRESET"), deadline ${deadline}s) ==="
+	printf '%s\n' "$session" >"$SB_DATA/farmer_supervisor_session"
+	set +e
+	env XDG_DATA_HOME="$SB" GAME_DIR="$GAME_DIR" timeout --foreground -k 120 "$deadline" \
+		python3 "$FARMER_DIR/tools/drive_supervisor.py" "$SB_DATA" sample "$OUT_DIR/soak" -- \
+		python3 "$FARMER_DIR/tools/supervisor.py" "$OUT_DIR/soak.json" >"$run_log" 2>&1
+	rc=$?
+	set -e
+	cp "$SB_DATA/farmer_status.json" "$status" 2>/dev/null || true
+	cp "$SB_DATA/farmer_runs.jsonl" "$OUT_DIR/soak.journal.jsonl" 2>/dev/null || true
+	cp "$SB_DATA/farmer.log" "$OUT_DIR/soak.farmer.log" 2>/dev/null || true
+
+	if [[ "$rc" -eq 124 ]]; then
+		reason="soak overran max_minutes by more than 30 min"
+	elif ! python3 "$FARMER_DIR/tools/soak_check.py" "$OUT_DIR/soak.samples.jsonl" \
+		"$OUT_DIR/soak.journal.jsonl" "$status" --session "$session" --supervisor-exit "$rc" \
+		--min-hours "$hours" >"$OUT_DIR/soak.verdict.log" 2>&1; then
+		reason="soak_check (see soak.verdict.log)"
+	fi
+	cat "$OUT_DIR/soak.verdict.log" 2>/dev/null || true
+
+	conclude_scenario soak "$status" "$rc" "$reason"
 }
 
 write_cfg one-run '{"speed":10.0,"max_runs":1,"hard_exit":true,"endless":false,"display":false}'
@@ -610,12 +734,16 @@ for scenario in "${SCENARIOS[@]}"; do
 		one-run) run_scenario one-run "$OUT_DIR/one-run.json" 300 FINISH || break ;;
 		stop) run_scenario stop "$OUT_DIR/stop.json" 180 'STOP max_minutes' || break ;;
 		endless) run_scenario endless "$OUT_DIR/endless.json" 360 ENDLESS_DONE || break ;;
-		flush-fail) run_scenario flush-fail "$OUT_DIR/flush-fail.json" 180 'FAIL flush_failed' 1 "FARMER_TEST_FLUSH_FAIL=1" || break ;;
+		flush-fail) run_scenario flush-fail "$OUT_DIR/flush-fail.json" 180 'FAIL flush_failed' flush_failed "FARMER_TEST_FLUSH_FAIL=1" || break ;;
+		checkpoint-corrupt) run_scenario checkpoint-corrupt "$OUT_DIR/crash-run.json" 120 'FAIL checkpoint_corrupt' checkpoint_corrupt || break ;;
 		crash-run) run_crash_scenario crash-run "$OUT_DIR/crash-run.json" run 'RUN_LOST' 180 || break ;;
 		crash-settled) run_crash_scenario crash-settled "$OUT_DIR/crash-settled.json" settled 'journal=appended' 180 || break ;;
 		crash-journaled) run_crash_scenario crash-journaled "$OUT_DIR/crash-settled.json" journaled 'journal=present' 180 || break ;;
-		cmd-abort-settled) run_scenario "$scenario" "$OUT_DIR/commands.json" 75 FINISH 0 FARMER_TEST_WAIT_AT_KEEP=1 || break ;;
+		cmd-abort-settled) run_scenario "$scenario" "$OUT_DIR/commands.json" 75 FINISH "" FARMER_TEST_WAIT_AT_KEEP=1 || break ;;
 		cmd-*) run_scenario "$scenario" "$OUT_DIR/commands.json" 75 FINISH || break ;;
+		supervised-kill-run) run_supervised_scenario "$scenario" "$OUT_DIR/crash-run.json" run 'RUN_LOST' 300 || break ;;
+		supervised-crash-settled) run_supervised_scenario "$scenario" "$OUT_DIR/crash-settled.json" settled 'journal=appended' 300 || break ;;
+		soak) run_soak "$SOAK_HOURS" || break ;;
 	esac
 done
 
