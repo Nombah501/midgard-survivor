@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,12 @@ def make_profile(root: Path, name: str) -> Path:
     (profile / "profile.json").write_text("{}")
     (profile / "patches" / "state.json").write_text("{}")
     return profile
+
+
+def godot_root(home: Path) -> Path:
+    """Godot's user:// root: $XDG_DATA_HOME/godot/app_userdata on Linux,
+    %APPDATA%\\Godot\\app_userdata on Windows."""
+    return home / ("Godot" if sys.platform == "win32" else "godot") / "app_userdata"
 
 
 def test_finds_profile_by_markers_in_folder_with_space(tmp_path):

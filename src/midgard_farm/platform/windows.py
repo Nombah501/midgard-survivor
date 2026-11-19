@@ -101,6 +101,9 @@ class _JobTree(ProcessTree):
             self._job = None
         self.popen.wait()
 
+    def wait(self, timeout: float | None = None) -> int:
+        return self.popen.wait(timeout)
+
 
 class WindowsPlatform(Platform):
     def godot_user_data_root(self) -> Path:

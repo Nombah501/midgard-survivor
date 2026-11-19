@@ -25,13 +25,20 @@ class _FlockLock(InstanceLock):
 class _GroupTree(ProcessTree):
     def __init__(self, popen: subprocess.Popen):
         self.popen = popen
+        self._killed = False
 
     def kill(self) -> None:
-        try:
-            os.killpg(self.popen.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if not self._killed:
+            # The group outlives its leader while any descendant is alive.
+            try:
+                os.killpg(self.popen.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self._killed = True
         self.popen.wait()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.popen.wait(timeout)
 
 
 class LinuxPlatform(Platform):

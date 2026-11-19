@@ -11,6 +11,10 @@ EX_CONFIG = 78
 
 
 def main() -> int:
+    # Redirected output on Windows defaults to the ANSI code page, which
+    # cannot encode every profile path.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     os_ = platform.current()
     data = os_.app_data_dir()
     data.mkdir(parents=True, exist_ok=True)

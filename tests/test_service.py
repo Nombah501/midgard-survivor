@@ -6,23 +6,19 @@ import sys
 
 from midgard_farm import platform
 
-from test_profile import make_profile
+from test_profile import godot_root, make_profile
 
 
-def run_service(home, *args):
+def run_service(home):
     env = dict(os.environ, XDG_DATA_HOME=str(home), APPDATA=str(home), LOCALAPPDATA=str(home))
     return subprocess.run(
-        [sys.executable, "-m", "midgard_farm.service", *args],
-        env=env, capture_output=True, text=True, timeout=30,
+        [sys.executable, "-m", "midgard_farm.service"],
+        env=env, capture_output=True, encoding="utf-8", timeout=30,
     )
 
 
-def godot_root(home):
-    return home / ("Godot" if sys.platform == "win32" else "godot") / "app_userdata"
-
-
 def test_service_reports_the_profile_it_found(tmp_path):
-    profile = make_profile(godot_root(tmp_path), "Midgard Survivors")
+    profile = make_profile(godot_root(tmp_path), "Мидгард Survivors")
 
     result = run_service(tmp_path)
 

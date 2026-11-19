@@ -7,6 +7,7 @@ import abc
 import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -29,13 +30,27 @@ class InstanceLock(abc.ABC):
 
 
 class ProcessTree(abc.ABC):
-    """A started process and every descendant it spawns."""
+    """A started process and every descendant it spawns.
+
+    Descendants can outlive the root, so end every tree with `kill()`, also
+    after `wait()`: it ends stragglers and frees the tree's OS resources.
+    """
 
     popen: subprocess.Popen
 
     @abc.abstractmethod
     def kill(self) -> None:
-        """Kill the whole tree, grandchildren included, and reap the root."""
+        """Kill the whole tree, grandchildren included, and reap the root. Idempotent."""
+
+    @abc.abstractmethod
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for the root to exit on its own and return its exit code."""
+
+    def __enter__(self) -> "ProcessTree":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.kill()
 
 
 class Platform(abc.ABC):
@@ -62,15 +77,16 @@ class Platform(abc.ABC):
     def write_atomic(self, path: str | os.PathLike, data: bytes) -> None:
         """Write `data` to `path` so readers see the old or the new content, never a mix."""
         path = Path(path)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        # A unique name per call: concurrent writers never share a temp file.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
         try:
-            with open(tmp, "wb") as fh:
+            with open(fd, "wb") as fh:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
             self.replace_atomic(tmp, path)
         except BaseException:
-            tmp.unlink(missing_ok=True)
+            Path(tmp).unlink(missing_ok=True)
             raise
 
 
