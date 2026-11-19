@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,9 @@ from ..core import farmer_patch, patch_info
 from ..core.launch import shutdown_request
 from ..core.profile import ProfileNotFound, find_profile
 from .scenarios import BOUNDED_SCENARIOS, check_supported, run_scenario
+
+
+_WORKER_AUTH = "MIDGARD_VERIFY_WORKER_AUTH"
 
 
 def wait_for_lock(os_: platform.Platform, path: Path, deadline: float,
@@ -47,7 +51,11 @@ def _hours(value: str) -> float:
 
 
 def _worker(argv: list[str]) -> int:
-    source, candidate, work, name, hours, preset = argv
+    auth = os.environ.pop(_WORKER_AUTH, "")
+    if len(argv) != 7 or not auth or auth != argv[0]:
+        print("verify: internal worker must be launched by the verification CLI", file=sys.stderr)
+        return 2
+    _, source, candidate, work, name, hours, preset = argv
     work_path = Path(work)
     out = work_path.parents[1]
     interrupted_at = None
@@ -80,8 +88,11 @@ def _launch_worker(os_: platform.Platform, out: Path, source: Path, candidate: P
     work.mkdir(parents=True)
     env = os_.app_sandbox_environment(work)
     env["GAME_DIR"] = str(game.parent)
-    argv = [sys.executable, "-B", "-m", "midgard_farm.verify", "_worker", str(source), str(candidate), str(work),
-            name, str(hours), str(preset) if preset else ""]
+    token = secrets.token_hex(16)
+    # Only the parent, which holds both verification locks, launches this worker.
+    env[_WORKER_AUTH] = token
+    argv = [sys.executable, "-B", "-m", "midgard_farm.verify", "_worker", token, str(source), str(candidate),
+            str(work), name, str(hours), str(preset) if preset else ""]
     with (out / f"{name}.worker.log").open("wb") as log, subprocess.Popen(
             argv, env=env, stdout=log, stderr=subprocess.STDOUT) as worker:
         while True:
@@ -98,7 +109,8 @@ def _print_summary(rows: list[dict]) -> None:
     print("|---|---|---|---|---|---|---|")
     for row in rows:
         kills = (row.get("last") or {}).get("kills")
-        print(f"| {row['scenario']} | {row['verdict']} | {row['exit']} | {row.get('phase') or '-'} | "
+        code = row["exit"] if row["exit"] is not None else "-"
+        print(f"| {row['scenario']} | {row['verdict']} | {code} | {row.get('phase') or '-'} | "
               f"{row.get('runs')}/{row.get('wins')} | {kills} | {row.get('zeny')} |")
 
 
@@ -118,6 +130,12 @@ def _suite(os_: platform.Platform, out: Path, source: Path, candidate: Path, gam
         if stop() is not None:
             exit_code = 130
             break
+        try:
+            check_supported(os_, name)
+        except ValueError as exc:
+            print(f"  SKIP: {exc}", flush=True)
+            rows.append({"scenario": name, "verdict": "SKIP", "exit": None, "reason": str(exc)})
+            continue
         if os_.game_running():
             print("verify: the game is running; close it first", file=sys.stderr)
             exit_code = 2
@@ -162,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--scenario", action="append", choices=BOUNDED_SCENARIOS, help="one bounded scenario (repeatable)")
-    mode.add_argument("--all", action="store_true", help="all bounded scenarios (not the soak)")
+    mode.add_argument("--all", action="store_true", help="all supported bounded scenarios (not the soak)")
     mode.add_argument("--soak", type=_hours, metavar="HOURS", help="run a Linux soak")
     parser.add_argument("--soak-preset", type=Path, metavar="JSON", help="override the built-in night preset")
     parser.add_argument("--candidate-dir", type=Path, metavar="DIR", help="read a built patch and its app metadata from DIR")
@@ -174,8 +192,9 @@ def main(argv: list[str] | None = None) -> int:
     out = None
     try:
         os_ = platform.current()
-        for name in names:
-            check_supported(os_, name)
+        if not args.all:
+            for name in names:
+                check_supported(os_, name)
         source = find_profile(os_.godot_user_data_root()).absolute()
         real_app = os_.app_data_dir().resolve()
         candidate = (args.candidate_dir or patch_info.farmer_dir(os_)).resolve()

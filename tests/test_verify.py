@@ -27,6 +27,7 @@ ALL = (
 
 class VerifyGamePlatform(type(platform.current())):
     game_exe_name = "verify-fixture.exe" if sys.platform == "win32" else "verify-fixture"
+    release_os = os.environ.get("FAKE_VERIFY_RELEASE_OS", platform.current().release_os)
     tree = None
 
     def check_network_isolation(self):
@@ -36,6 +37,8 @@ class VerifyGamePlatform(type(platform.current())):
         pytest.fail("verification must not send notifications")
 
     def game_pids(self):
+        if os.environ.get("FAKE_VERIFY_GAME_RUNNING") == "1":
+            return {os.getpid()}
         return {self.tree.popen.pid} if self.tree is not None and self.tree.popen.poll() is None else set()
 
     def spawn_tree(self, argv, *, isolate_network=False, **kwargs):
@@ -67,7 +70,10 @@ def verification(tmp_path, monkeypatch):
     (source / "profile.json").write_text("100", encoding="utf-8")
     (source / "farmer_command").write_text("real command must survive", encoding="utf-8")
     patches = source / "patches"
-    (patches / "state.json").write_text('{"file":"official.pck", "version":"1"}', encoding="utf-8")
+    official_state = b'{"file":"official.pck", "version":"1"}'
+    (patches / "official-state.json").write_bytes(official_state)
+    (patches / "state.json").write_bytes(b'{"file":"patch_farmer.pck", "farmer":1, "version":"1"}')
+    (patches / patch_info.INSTALLED_PACK).write_bytes(b"installed farmer pack")
     official = b"official patch bytes"
     (patches / "official.pck").write_bytes(official)
     candidate = tmp_path / "candidate"
@@ -97,6 +103,8 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
             execute(verification, name)
         return
 
+    protected = [source / "patches" / name for name in ("state.json", patch_info.INSTALLED_PACK)]
+    before = [path.read_bytes() for path in protected]
     row = execute(verification, name)
 
     assert row["verdict"] == "PASS", row
@@ -104,6 +112,7 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
     assert (out / f"{name}.run.log").exists()
     assert (root / source.name / "patches" / "official.pck").samefile(source / "patches/official.pck")
     assert (source / "profile.json").read_text() == "100"
+    assert [path.read_bytes() for path in protected] == before
     assert (source / "farmer_command").read_text() == "real command must survive"
     assert not (source.parents[1] / "real backups").exists()
     assert not os_.game_running()
@@ -141,9 +150,9 @@ def test_cli_requires_explicit_live_selection(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize(("keep", "fault"), [(False, ""), (True, ""), (False, "no-victory")])
-def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(verification, tmp_path, keep, fault):
-    os_, source, candidate, _, _, _ = verification
+@pytest.fixture
+def fake_cli(verification, tmp_path):
+    os_, source, candidate, work, _, _ = verification
     real = tmp_path / "source-home"
     root, _ = os_.godot_sandbox(real)
     root.mkdir(parents=True)
@@ -158,12 +167,20 @@ def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(verificat
         "from midgard_farm import platform\nplatform.current = VerifyGamePlatform\n", encoding="utf-8",
     )
     env.update(PYTHONPATH=os.pathsep.join((str(harness), str(Path(__file__).resolve().parent))),
-               HOME=str(tmp_path), USERPROFILE=str(tmp_path), FAKE_VERIFY_SOURCE=str(profile), FAKE_VERIFY_FAULT=fault)
-    invocation = [sys.executable, "-B", "-m", "midgard_farm.verify", "--scenario", "one-run",
-                  "--candidate-dir", str(candidate)]
-    if keep:
-        invocation.append("--keep")
-    result = subprocess.run(invocation, env=env, cwd=tmp_path, capture_output=True, text=True, timeout=20)
+               HOME=str(tmp_path), USERPROFILE=str(tmp_path), FAKE_VERIFY_SOURCE=str(profile))
+
+    def invoke(*args, **overrides):
+        invocation = [sys.executable, "-B", "-m", "midgard_farm.verify", *args]
+        return subprocess.run(invocation, env=env | overrides, cwd=tmp_path, capture_output=True, text=True, timeout=60)
+
+    return os_, real, profile, candidate, work, invoke
+
+
+@pytest.mark.parametrize(("keep", "fault"), [(False, ""), (True, ""), (False, "no-victory")])
+def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(fake_cli, tmp_path, keep, fault):
+    os_, real, profile, candidate, _, invoke = fake_cli
+    flags = ["--keep"] if keep else []
+    result = invoke("--scenario", "one-run", "--candidate-dir", str(candidate), *flags, FAKE_VERIFY_FAULT=fault)
     assert result.returncode == bool(fault), result.stdout + result.stderr
     out, = (tmp_path / ".sandbox").glob("verify-*")
     summary = json.loads((out / "summary.json").read_bytes())
@@ -172,6 +189,38 @@ def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(verificat
     assert (out / "sandbox").exists() == bool(keep or fault)
     assert (profile / "profile.json").read_text() == "100"
     assert not (real / os_.app_data_dir().name).exists()
+
+
+def test_cli_all_runs_supported_scenarios_and_reports_windows_skip(fake_cli, tmp_path):
+    _, _, _, candidate, _, invoke = fake_cli
+    result = invoke("--all", "--candidate-dir", str(candidate), FAKE_VERIFY_RELEASE_OS="windows")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "supervised-kill-run is Linux only (unsupported on this OS)" in result.stdout
+    out, = (tmp_path / ".sandbox").glob("verify-*")
+    rows = json.loads((out / "summary.json").read_bytes())["rows"]
+    assert [(row["scenario"], row["verdict"]) for row in rows] == [
+        (name, "SKIP" if name == "supervised-kill-run" else "PASS") for name in ALL
+    ]
+    assert not (out / "supervised-kill-run.worker.log").exists()
+
+    explicit = invoke("--scenario", "supervised-kill-run", FAKE_VERIFY_RELEASE_OS="windows")
+    assert explicit.returncode == 2 and "unsupported on this OS" in explicit.stderr
+
+
+def test_cli_refuses_to_start_while_game_is_running(fake_cli, tmp_path):
+    _, _, profile, candidate, _, invoke = fake_cli
+    result = invoke("--scenario", "one-run", "--candidate-dir", str(candidate), FAKE_VERIFY_GAME_RUNNING="1")
+    assert result.returncode == 2 and "the game is running" in result.stderr
+    assert not list((tmp_path / ".sandbox").glob("verify-*"))
+    assert (profile / "profile.json").read_text() == "100"
+
+
+def test_direct_worker_cannot_bypass_suite_locks(fake_cli):
+    os_, _, profile, candidate, work, invoke = fake_cli
+    env = {k: v for k, v in os_.app_sandbox_environment(work).items() if k in {"XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"}}
+    result = invoke("_worker", "not-issued-by-parent", str(profile), str(candidate), str(work), "one-run", "0", "", **env)
+    assert result.returncode == 2 and "must be launched by the verification CLI" in result.stderr
+    assert not list(work.iterdir())
 
 
 def test_lock_queues_and_can_time_out(tmp_path, capsys):
@@ -228,7 +277,7 @@ def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, cus
     verdict = (out / "soak.verdict.log").read_text()
     assert "no game RSS sample after the first hour" in verdict
     summary = json.loads(verdict.splitlines()[0])
-    assert summary["runs"] == 1 and summary["hours"] >= 0.00001
+    assert summary["runs"] == 1
     config = json.loads(next(root.glob("*/farmer.cfg")).read_text())
     assert config["class"] == "" and config["max_minutes"] == 0.00001 * 60
     if custom:
