@@ -15,6 +15,7 @@ const CFG_PATH := "user://farmer.cfg"
 const STATUS_PATH := "user://farmer_status.json"
 const ARMS_PATH := "user://farmer_arms.json"
 const RUNS_PATH := "user://farmer_runs.jsonl"
+const CHECKPOINT_PATH := "user://farmer_session.json"
 const LOG_PATH := "user://farmer.log"
 const STOP_PATH := "user://farmer_stop"
 const LOCK_PATH := "user://farmer.lock"
@@ -44,6 +45,7 @@ var exit_code := 0
 var heartbeat_seq := 0
 var session_id := ""
 var boot_ms := 0
+var session_started_unix := 0
 var next_action_ms := 0
 var next_status_ms := 0
 var last_tick_ms := 0
@@ -52,6 +54,7 @@ var runs_started := 0
 var runs_done := 0
 var wins := 0
 var losses := 0
+var runs_lost := 0
 var total_zeny := 0
 var total_kills := 0
 var total_xp := 0
@@ -100,7 +103,12 @@ class FarmerInput extends HeroInput:
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	boot_ms = _now()
-	session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
+	session_started_unix = int(Time.get_unix_time_from_system())
+	# The supervisor keeps one id for the whole AFK session so a restarted
+	# farmer continues its checkpoint; a one-off launch starts a new session.
+	session_id = OS.get_environment("FARMER_SESSION_ID")
+	if session_id == "":
+		session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
 	_mark_transition("boot")
@@ -111,7 +119,9 @@ func _ready() -> void:
 		_log("LOCKED by pid %d: another farmer session is alive" % _lock_pid)
 		_fail_session("locked")
 		return
-	_log("BOOT api=%d session=%s cfg=%s" % [API_VERSION, session_id, JSON.stringify(cfg)])
+	_log("BOOT api=%d session=%s zeny=%d cfg=%s" % [API_VERSION, session_id, int(Save.zeny()), JSON.stringify(cfg)])
+	if not _restore_checkpoint():
+		return
 	_write_status()
 
 
@@ -283,6 +293,9 @@ func _prepare_run() -> void:
 	_mark_transition("run_start")
 	_log("START #%d class=%s stage=%s danger=%d speed=%.1f" % [
 		runs_started, active_class, active_stage, active_danger, float(cfg.get("speed", 4.0))])
+	if not _write_checkpoint("run"):
+		return
+	_test_crash("run")
 	_write_status()
 
 
@@ -1004,6 +1017,13 @@ func _do_keep() -> void:
 	run_state["kept"] = kept
 	run_state["settled"] = _reward_snapshot()
 	_log("KEEP_DONE kept=%d offer=%d victory=%s" % [kept.size(), offer.size(), str(victory)])
+	# The profile is flushed: the run is settled. A crash from here on must
+	# account this result once, never lose or repeat it. A crash between the
+	# flush and this write loses the run's accounting (ADR 0001), never
+	# doubles it.
+	if not _write_checkpoint("settled", _build_result()):
+		return
+	_test_crash("settled")
 
 
 func _reward_snapshot() -> Dictionary:
@@ -2111,22 +2131,15 @@ func _total_card_copies() -> int:
 func _complete_run(now: int) -> void:
 	_mark_transition("run_complete")
 	var r := _build_result()
-	last_run = r
-	runs_done += 1
-	if bool(r.get("victory", false)):
-		wins += 1
-	else:
-		losses += 1
-	total_zeny += int(r.get("zeny_gain", 0))
-	total_kills += int(r.get("kills", 0))
-	total_xp += int(r.get("xp_gain", 0))
-	var mats: Dictionary = r.get("materials", {})
-	for k in mats:
-		total_materials[str(k)] = int(total_materials.get(str(k), 0)) + int(mats[k])
-	total_coins += int(r.get("coins_gain", 0))
-	total_ymir += int(r.get("ymir_gain", 0))
-	_update_arm(r)
-	_append_run_log(r)
+	# Refresh after maintenance: totals now hold maintenance effects (claimed
+	# achievement coins) and the result is exactly what the journal gets.
+	if not _write_checkpoint("settled", r):
+		return
+	if not _account_run(r, true):
+		return
+	_test_crash("journaled")
+	if not _write_checkpoint("idle"):
+		return
 	_write_status()
 	_log("END " + JSON.stringify(r))
 	if int(cfg.get("max_runs", 0)) > 0 and runs_done >= int(cfg.get("max_runs", 0)):
@@ -2143,6 +2156,137 @@ func _complete_run(now: int) -> void:
 		return
 	next_action_ms = now + int(float(cfg.get("restart_seconds", 1.0)) * 1000.0)
 	phase = "idle"
+
+
+# Adds one settled run to the session totals. append_log=false is the
+# recovery path for a run that is already in the journal (and in arms).
+func _account_run(r: Dictionary, append_log: bool) -> bool:
+	if append_log and not _append_run_log(r):
+		_fail_session("journal_failed")
+		return false
+	last_run = r
+	runs_done += 1
+	if bool(r.get("victory", false)):
+		wins += 1
+	else:
+		losses += 1
+	total_zeny += int(r.get("zeny_gain", 0))
+	total_kills += int(r.get("kills", 0))
+	total_xp += int(r.get("xp_gain", 0))
+	var mats: Dictionary = r.get("materials", {})
+	for k in mats:
+		total_materials[str(k)] = int(total_materials.get(str(k), 0)) + int(mats[k])
+	total_coins += int(r.get("coins_gain", 0))
+	total_ymir += int(r.get("ymir_gain", 0))
+	if append_log:
+		_update_arm(r)
+	return true
+
+
+func _totals() -> Dictionary:
+	return {
+		"started": runs_started, "runs": runs_done, "wins": wins, "losses": losses,
+		"lost": runs_lost,
+		"zeny": total_zeny, "kills": total_kills, "xp": total_xp,
+		"coins": total_coins, "ymir": total_ymir, "materials": total_materials.duplicate(true),
+	}
+
+
+# Checkpoint phases: "run" (started, nothing banked by the farmer yet),
+# "settled" (profile flushed, result not yet in the journal), "idle"
+# (result accounted). Written atomically at each boundary.
+func _write_checkpoint(stage: String, pending: Dictionary = {}) -> bool:
+	var ok := _atomic_write(CHECKPOINT_PATH, JSON.stringify({
+		"session": session_id,
+		"started_unix": session_started_unix,
+		"phase": stage,
+		"run_id": str(run_state.get("run_id", "")),
+		"target": {"stage": active_stage, "danger": active_danger, "class": active_class},
+		"totals": _totals(),
+		"pre_run": run_state,
+		"result": pending,
+		"written_unix": int(Time.get_unix_time_from_system()),
+	}))
+	if not ok:
+		_fail_session("checkpoint_failed")
+	return ok
+
+
+# Returns false (after failing the session) when a supervised session's
+# checkpoint is unreadable: silently starting over would reuse run ids.
+func _restore_checkpoint() -> bool:
+	if not FileAccess.file_exists(CHECKPOINT_PATH):
+		return true
+	var cp = JSON.parse_string(FileAccess.get_file_as_string(CHECKPOINT_PATH))
+	var supervised := OS.get_environment("FARMER_SESSION_ID") != ""
+	if not (cp is Dictionary):
+		if supervised:
+			_fail_session("checkpoint_corrupt")
+			return false
+		return true
+	if str(cp.get("session", "")) != session_id:
+		return true  # another session's checkpoint; the first boundary replaces it
+	if not (cp.get("totals") is Dictionary and cp.get("target") is Dictionary and cp.get("result") is Dictionary):
+		_fail_session("checkpoint_corrupt")
+		return false
+	session_started_unix = int(cp.get("started_unix", session_started_unix))
+	boot_ms = _now() - maxi(0, int(Time.get_unix_time_from_system()) - session_started_unix) * 1000
+	var t: Dictionary = cp["totals"]
+	runs_started = int(t.get("started", 0))
+	runs_done = int(t.get("runs", 0))
+	wins = int(t.get("wins", 0))
+	losses = int(t.get("losses", 0))
+	runs_lost = int(t.get("lost", 0))
+	total_zeny = int(t.get("zeny", 0))
+	total_kills = int(t.get("kills", 0))
+	total_xp = int(t.get("xp", 0))
+	total_coins = int(t.get("coins", 0))
+	total_ymir = int(t.get("ymir", 0))
+	total_materials = {}
+	var mats = t.get("materials", {})
+	if mats is Dictionary:
+		for k in mats:
+			total_materials[str(k)] = int(mats[k])
+	var target: Dictionary = cp["target"]
+	active_stage = str(target.get("stage", ""))
+	active_danger = int(target.get("danger", 1))
+	active_class = str(target.get("class", ""))
+	var run_id := str(cp.get("run_id", ""))
+	match str(cp.get("phase", "")):
+		"run":
+			# ADR 0001: a run that crashed before settlement is lost, not resumed.
+			runs_lost += 1
+			_log("RUN_LOST %s crashed before settlement" % run_id)
+		"settled":
+			var journaled := _journal_has(run_id)
+			if not _account_run(cp["result"], not journaled):
+				return false
+			_log("RECOVER %s settled journal=%s" % [run_id, "present" if journaled else "appended"])
+	_log("SESSION_RESUMED %s runs=%d lost=%d" % [session_id, runs_done, runs_lost])
+	return _write_checkpoint("idle")
+
+
+func _journal_has(run_id: String) -> bool:
+	if run_id == "" or not FileAccess.file_exists(RUNS_PATH):
+		return false
+	var f := FileAccess.open(RUNS_PATH, FileAccess.READ)
+	if f == null:
+		return false
+	var needle := "\"run_id\":\"%s\"" % run_id
+	while not f.eof_reached():
+		var line := f.get_line()
+		if needle in line:
+			var d = JSON.parse_string(line)
+			if d is Dictionary and str(d.get("run_id", "")) == run_id:
+				return true
+	return false
+
+
+# Test-only seam used by verify.sh; never set in a real session.
+func _test_crash(point: String) -> void:
+	if OS.get_environment("FARMER_TEST_CRASH_AT") == point:
+		_log("TEST_CRASH " + point)
+		OS.kill(OS.get_process_id())
 
 
 func _build_result() -> Dictionary:
@@ -2254,15 +2398,18 @@ func _update_arm(r: Dictionary) -> void:
 	_save_arms()
 
 
-func _append_run_log(r: Dictionary) -> void:
+func _append_run_log(r: Dictionary) -> bool:
 	var f := FileAccess.open(RUNS_PATH, FileAccess.READ_WRITE)
 	if f == null:
 		f = FileAccess.open(RUNS_PATH, FileAccess.WRITE)
 	if f == null:
-		return
+		return false
 	f.seek_end()
 	f.store_line(JSON.stringify(r))
+	f.flush()
+	var ok := f.get_error() == OK
 	f.close()
+	return ok
 
 
 # ---------------------------------------------------------------------------
@@ -2392,11 +2539,7 @@ func _write_status() -> void:
 		"build": _build_info(),
 		"objective": str(cfg.get("objective", "")),
 		"target": {"stage": active_stage, "danger": active_danger, "class": active_class},
-		"totals": {
-			"started": runs_started, "runs": runs_done, "wins": wins, "losses": losses,
-			"zeny": total_zeny, "kills": total_kills, "xp": total_xp,
-			"coins": total_coins, "ymir": total_ymir, "materials": total_materials.duplicate(true),
-		},
+		"totals": _totals(),
 		"rates": _rates(),
 		"arms": arms,
 		"last": last_run,
@@ -2461,14 +2604,18 @@ func _build_info() -> Dictionary:
 	return parsed if parsed is Dictionary else {}
 
 
-func _atomic_write(path: String, text: String) -> void:
+func _atomic_write(path: String, text: String) -> bool:
 	var tmp := path + ".tmp"
 	var f := FileAccess.open(tmp, FileAccess.WRITE)
 	if f == null:
-		return
+		return false
 	f.store_string(text)
+	f.flush()
+	var ok := f.get_error() == OK
 	f.close()
-	DirAccess.rename_absolute(ProjectSettings.globalize_path(tmp), ProjectSettings.globalize_path(path))
+	if not ok:
+		return false
+	return DirAccess.rename_absolute(ProjectSettings.globalize_path(tmp), ProjectSettings.globalize_path(path)) == OK
 
 
 func _log(text: String) -> void:

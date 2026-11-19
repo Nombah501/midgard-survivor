@@ -63,6 +63,16 @@ Supervisor запускает `run.sh` в отдельной группе про
 | 4 сбоя за час, exit 78, `cfg_invalid` | quarantine: без рестарта, уведомление, exit 2 |
 | SIGTERM/SIGINT | SIGTERM группе, через 20 с SIGKILL, уведомление `stop`, exit 0 |
 
+Все рестарты одного supervisor'а — одна AFK-сессия: он передаёт фермеру
+`FARMER_SESSION_ID`, и фермер продолжает `farmer_session.json` (checkpoint):
+totals, счётчики, `run_id`, цель, pre-run snapshot. Checkpoint пишется
+атомарно на границах `run` (забег начат), `settled` (профиль записан после
+keep, результат готов) и `idle` (результат в журнале). При старте:
+`run` → забег потерян (`totals.lost`, ADR 0001), `settled` → результат
+засчитывается один раз; в `farmer_runs.jsonl` он дописывается, только если
+его `run_id` там ещё нет. Разовый запуск без `FARMER_SESSION_ID` (GUI,
+`run.sh`) начинает новую сессию.
+
 До первого heartbeat даётся 180 с на загрузку игры. Логи и диагностика —
 `farmer/logs/supervisor-<stamp>/`: `attempt-NN.log` (вывод `run.sh`),
 `attempt-NN.status.json` (статус упавшей попытки), `quarantine.json`.
@@ -80,14 +90,17 @@ systemd держит только сам supervisor: `Restart=on-failure`,
 ```bash
 ./tools/check.sh                 # статический чек; один раз: ./tools/install_hooks.sh
 ./tools/verify.sh --one-run      # быстрый smoke в sandbox
-./tools/verify.sh                # one-run + stop + endless, у каждого свой timeout
+./tools/verify.sh                # все сценарии, у каждого свой timeout
+./tools/verify.sh --crash-settled  # падение после settlement + рестарт сессии
 ```
 
 `verify.sh` читает реальный `user://`, но запускает игру на копии профиля в
 `.sandbox/verify-*`; реальный профиль не изменяется. Артефакты —
 `farmer/logs/verify-*`: `summary.json`, `*.log`, `*.status.json`. Сценарий
 считается пройденным только при exit 0, `phase=done` и выполненных assert'ах;
-таймаут — FAIL.
+таймаут — FAIL. `--crash-run|--crash-settled|--crash-journaled` убивают фермера
+на границе checkpoint (`FARMER_TEST_CRASH_AT`), перезапускают ту же сессию и
+проверяют, что totals совпадают с журналом и каждый `run_id` в нём один раз.
 
 ## GUI
 
@@ -270,7 +283,7 @@ src/save_hook.gd     bootstrap, добавляется в Save
 tools/inject_hook.py идемпотентная вставка хука
 tools/patch_player.py next_job: путь профессии из Save meta
 tools/check.sh       статические проверки
-tools/verify.sh      bounded one-run/stop/endless в sandbox
+tools/verify.sh      bounded one-run/stop/endless/crash-* в sandbox
 tools/supervisor.py  AFK supervisor: heartbeat, рестарт, quarantine, уведомления
 tests/               pytest supervisor'а на фейковом farmer
 tools/install_hooks.sh  git core.hooksPath=.githooks

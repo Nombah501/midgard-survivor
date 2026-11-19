@@ -5,8 +5,13 @@
 # profile. The real profile is only read. Each scenario has its own timeout;
 # a timeout, a non-zero exit, a missing status, or a failed assertion is FAIL.
 #
-# Usage: ./tools/verify.sh [--one-run] [--stop] [--endless] [--flush-fail] [--all] [--keep]
+# Usage: ./tools/verify.sh [--one-run] [--stop] [--endless] [--flush-fail]
+#                          [--crash-run] [--crash-settled] [--crash-journaled] [--all] [--keep]
 # Default: --all.
+#
+# --crash-* kill the farmer at one checkpoint boundary (run start, after
+# settlement, after the journal write), relaunch the same session and assert
+# that totals and the journal hold every settled run exactly once.
 #
 # Artifacts: farmer/logs/verify-<stamp>/{summary.json,*.log,*.status.json}
 set -euo pipefail
@@ -42,14 +47,17 @@ for arg in "$@"; do
 		--stop) SCENARIOS+=(stop) ;;
 		--endless) SCENARIOS+=(endless) ;;
 		--flush-fail) SCENARIOS+=(flush-fail) ;;
-		--all) SCENARIOS=(one-run stop endless flush-fail) ;;
+		--crash-run) SCENARIOS+=(crash-run) ;;
+		--crash-settled) SCENARIOS+=(crash-settled) ;;
+		--crash-journaled) SCENARIOS+=(crash-journaled) ;;
+		--all) SCENARIOS=(one-run stop endless flush-fail crash-run crash-settled crash-journaled) ;;
 		--keep) KEEP=1 ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown argument: $arg" ;;
 	esac
 done
 if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
-	SCENARIOS=(one-run stop endless flush-fail)
+	SCENARIOS=(one-run stop endless flush-fail crash-run crash-settled crash-journaled)
 fi
 
 [[ -x "$GAME_DIR/MidgardSurvivors.x86_64" ]] || die "game not found at $GAME_DIR"
@@ -137,7 +145,8 @@ reset_profile() {
 		"$SB_DATA/farmer.cfg" \
 		"$SB_DATA/farmer.log" \
 		"$SB_DATA/farmer.log.prev" \
-		"$SB_DATA/farmer.run.lock"
+		"$SB_DATA/farmer.run.lock" \
+		"$SB_DATA/farmer_session.json"
 }
 
 assert_status() {
@@ -332,10 +341,127 @@ run_scenario() {
 	return 0
 }
 
+assert_recovered() {
+	local status="$1" point="$2" session="$3" boot_log="$4"
+	python3 - "$status" "$point" "$session" "$SB_DATA/farmer_runs.jsonl" "$boot_log" <<'PY'
+import json
+import re
+import sys
+from collections import Counter
+
+path, point, session, journal, boot_log = sys.argv[1:6]
+with open(path, encoding="utf-8") as fh:
+    d = json.load(fh)
+tot = d.get("totals") or {}
+rows = []
+with open(journal, encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            row = json.loads(line)
+            if row.get("session") == session:
+                rows.append(row)
+ids = Counter(r.get("run_id") for r in rows)
+err = []
+
+
+def need(cond, msg):
+    if not cond:
+        err.append(msg)
+
+
+need(d.get("phase") == "done" and not d.get("failed"), "phase != done")
+need(d.get("session") == session, "session id not continued")
+need(all(n == 1 for n in ids.values()), "duplicate journal run_id: %s" % dict(ids))
+need(int(tot.get("runs") or 0) == len(rows), "totals.runs %s != journal %d" % (tot.get("runs"), len(rows)))
+need(int(tot.get("zeny") or 0) == sum(int(r.get("zeny_gain") or 0) for r in rows),
+     "totals.zeny != journal zeny_gain sum")
+need(int(tot.get("started") or 0) == 2, "totals.started %s != 2" % tot.get("started"))
+# Independent of the journal: the profile's zeny moved exactly by the
+# accounted gains (the one-run preset spends nothing in maintenance).
+with open(boot_log, encoding="utf-8") as fh:
+    boot = re.search(r" BOOT .* zeny=(\d+)", fh.read())
+need(boot is not None, "no BOOT zeny in the crash launch log")
+if boot:
+    moved = int((d.get("profile") or {}).get("zeny") or 0) - int(boot.group(1))
+    need(moved == int(tot.get("zeny") or 0), "profile zeny moved %d != totals.zeny %s" % (moved, tot.get("zeny")))
+if point == "run":
+    need(int(tot.get("lost") or 0) == 1, "totals.lost %s != 1" % tot.get("lost"))
+    need(set(ids) == {session + "-r2"}, "journal ids %s" % sorted(ids))
+else:
+    need(int(tot.get("lost") or 0) == 0, "totals.lost %s != 0" % tot.get("lost"))
+    need(set(ids) == {session + "-r1", session + "-r2"}, "journal ids %s" % sorted(ids))
+
+print("; ".join(err))
+sys.exit(1 if err else 0)
+PY
+}
+
+# Launch 1 is killed at a checkpoint boundary; launch 2 continues the same
+# session (as the supervisor would) and must finish cleanly.
+run_crash_scenario() {
+	local name="$1" cfg="$2" point="$3" marker="$4" timeout_s="$5"
+	local session="verify-$name-$STAMP"
+	local crash_log="$OUT_DIR/$name.crash.log"
+	local run_log="$OUT_DIR/$name.run.log"
+	local status="$OUT_DIR/$name.status.json"
+	local farmer_log="$OUT_DIR/$name.farmer.log"
+	local reason="" rc=0 crash_rc=0 verdict=FAIL err
+
+	reset_profile
+	echo "=== $name (crash at $point, timeout ${timeout_s}s per launch) ==="
+	set +e
+	env XDG_DATA_HOME="$SB" GAME_DIR="$GAME_DIR" FARMER_SESSION_ID="$session" FARMER_TEST_CRASH_AT="$point" \
+		timeout --foreground -k 15 "$timeout_s" "$FARMER_DIR/run.sh" "$cfg" >"$crash_log" 2>&1
+	crash_rc=$?
+	cp "$SB_DATA/farmer.log" "$OUT_DIR/$name.crash.farmer.log" 2>/dev/null
+	env XDG_DATA_HOME="$SB" GAME_DIR="$GAME_DIR" FARMER_SESSION_ID="$session" \
+		timeout --foreground -k 15 "$timeout_s" "$FARMER_DIR/run.sh" "$cfg" >"$run_log" 2>&1
+	rc=$?
+	set -e
+	cp "$SB_DATA/farmer_status.json" "$status" 2>/dev/null || true
+	cp "$SB_DATA/farmer.log" "$farmer_log" 2>/dev/null || true
+
+	if [[ "$crash_rc" -eq 0 || "$crash_rc" -eq 124 ]]; then
+		reason="crash launch exit $crash_rc (expected a killed farmer)"
+	elif ! grep -Fq -- "TEST_CRASH $point" "$OUT_DIR/$name.crash.farmer.log" 2>/dev/null; then
+		reason="crash launch did not reach $point"
+	elif [[ "$rc" -ne 0 ]]; then
+		reason="recovery run.sh exit $rc"
+	elif [[ ! -f "$status" ]]; then
+		reason="no farmer_status.json"
+	elif ! err="$(assert_recovered "$status" "$point" "$session" "$OUT_DIR/$name.crash.farmer.log")"; then
+		reason="status: $err"
+	elif ! grep -Fq -- "$marker" "$farmer_log"; then
+		reason="missing log marker: $marker"
+	elif grep -Eq 'SCRIPT ERROR|Parse Error|Invalid call|Cannot call method' "$crash_log" "$run_log"; then
+		reason="script error in game log"
+	fi
+
+	if [[ -z "$reason" ]]; then
+		verdict=PASS
+		echo "  PASS"
+	else
+		FAILED=1
+		echo "  FAIL: $reason" >&2
+	fi
+	write_result "$status" "$name" "$verdict" "$rc" "$reason" || FAILED=1
+
+	if pgrep -f 'MidgardSurvivors\.x86_64' >/dev/null 2>&1; then
+		echo "verify: game process still running after $name; close it and re-run" >&2
+		FAILED=1
+		return 1
+	fi
+	return 0
+}
+
 write_cfg one-run '{"speed":10.0,"max_runs":1,"hard_exit":true,"endless":false,"display":false}'
 write_cfg stop '{"class":"thief","max_minutes":1.0,"stall_seconds":10.0,"max_runs":0,"speed":10.0,"hard_exit":true,"endless":false,"display":false}'
 write_cfg endless '{"speed":10.0,"max_runs":1,"endless":true,"endless_minutes":1.0,"endless_mvps":2,"hard_exit":true,"display":false}'
 write_cfg flush-fail '{"speed":10.0,"max_runs":1,"run_minutes":0.2,"max_minutes":0.5,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
+# Short forced runs: settlement and keep still happen, a run takes seconds.
+write_cfg crash-run '{"speed":10.0,"max_runs":1,"run_minutes":0.2,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
+write_cfg crash-settled '{"speed":10.0,"max_runs":2,"run_minutes":0.2,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
 
 for scenario in "${SCENARIOS[@]}"; do
 	case "$scenario" in
@@ -343,6 +469,9 @@ for scenario in "${SCENARIOS[@]}"; do
 		stop) run_scenario stop "$OUT_DIR/stop.json" 180 'STOP max_minutes' || break ;;
 		endless) run_scenario endless "$OUT_DIR/endless.json" 360 ENDLESS_DONE || break ;;
 		flush-fail) run_scenario flush-fail "$OUT_DIR/flush-fail.json" 180 'FAIL flush_failed' 1 "FARMER_TEST_FLUSH_FAIL=1" || break ;;
+		crash-run) run_crash_scenario crash-run "$OUT_DIR/crash-run.json" run 'RUN_LOST' 180 || break ;;
+		crash-settled) run_crash_scenario crash-settled "$OUT_DIR/crash-settled.json" settled 'journal=appended' 180 || break ;;
+		crash-journaled) run_crash_scenario crash-journaled "$OUT_DIR/crash-settled.json" journaled 'journal=present' 180 || break ;;
 	esac
 done
 

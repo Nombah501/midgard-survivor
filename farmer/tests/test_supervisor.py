@@ -149,7 +149,11 @@ def test_failures_outside_window_do_not_quarantine(farm):
     assert len(result.attempts) == 5
 
 
-@pytest.mark.parametrize("step,reason", [("exit:78", "preflight_failed"), ("fail:cfg_invalid", "cfg_invalid")])
+@pytest.mark.parametrize("step,reason", [
+    ("exit:78", "preflight_failed"),
+    ("fail:cfg_invalid", "cfg_invalid"),
+    ("fail:checkpoint_corrupt", "checkpoint_corrupt"),
+])
 def test_fatal_preflight_or_config_quarantines_without_retry(farm, step, reason):
     sup, sent, _ = farm(step, "clean:stop")
 

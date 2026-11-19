@@ -44,7 +44,11 @@ DATA_DIR = (
     / "godot/app_userdata/Midgard Survivors"
 )
 EXIT_PREFLIGHT = 78  # run.sh EX_CONFIG: missing game/patch, stale build, bad preset
-FATAL_REASONS = {"cfg_invalid"}  # farmer terminal reasons a restart cannot fix
+# Farmer terminal reasons a restart cannot fix.
+FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt"}
+# Present only while a session has no terminal outcome: a supervisor that
+# systemd restarts after its own crash continues the same AFK session.
+SESSION_FILE = DATA_DIR / "farmer_supervisor_session"
 EXIT_QUARANTINE = 2
 
 
@@ -361,6 +365,17 @@ def main():
         return 0
 
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    try:
+        session = SESSION_FILE.read_text().strip()
+    except OSError:
+        session = ""
+    if session:
+        log(f"continuing unfinished session {session}")
+    else:
+        session = f"afk-{stamp}"
+        SESSION_FILE.write_text(session)
+    # One AFK session id for every restart: the farmer continues its checkpoint.
+    os.environ["FARMER_SESSION_ID"] = session
     notify = make_notifier(args.ntfy_url)
     sup = Supervisor(
         command=[str(FARMER_DIR / "run.sh")] + ([preset] if preset else []),
@@ -371,6 +386,7 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: sup.request_stop())
     outcome = sup.run()
+    SESSION_FILE.unlink(missing_ok=True)  # terminal outcome: the next start is a new session
     log(f"session {outcome.kind}: {outcome.reason} after {len(outcome.attempts)} attempt(s)")
     notify.drain(25)  # below TimeoutStopSec minus kill_grace
     if outcome.kind == "quarantined":
