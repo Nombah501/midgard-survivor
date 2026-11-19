@@ -18,6 +18,8 @@ _ntdll = ctypes.WinDLL("ntdll")
 _GODOT_DATA_HOME = "APPDATA"
 _GODOT_USER_DATA = Path("Godot", "app_userdata")
 
+SERVICE_TASK_NAME = "Midgard Farm"
+
 ERROR_ACCESS_DENIED = 5
 ERROR_SHARING_VIOLATION = 32
 ERROR_LOCK_VIOLATION = 33
@@ -148,6 +150,10 @@ class WindowsPlatform(Platform):
     def default_game_dir(self) -> Path:
         # The game ships as a ZIP unpacked anywhere; no install location to assume.
         raise RuntimeError("the game folder is unknown on Windows; set GAME_DIR")
+
+    def start_service(self) -> None:
+        subprocess.run(["schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME], creationflags=CREATE_NO_WINDOW,
+                       check=True, capture_output=True, text=True, errors="replace", timeout=5)
 
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
         audio = '<audio silent="true"/>' if priority == "low" else ""

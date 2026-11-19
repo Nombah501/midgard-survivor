@@ -15,6 +15,9 @@ test = ["pytest>=8"]
 [project.scripts]
 midgard-farm-service = "midgard_farm.service:main"
 
+[project.gui-scripts]
+midgard-farm = "midgard_farm.gui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

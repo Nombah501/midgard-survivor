@@ -108,6 +108,10 @@ class Platform(abc.ABC):
         return bool(self.game_pids())
 
     @abc.abstractmethod
+    def start_service(self) -> None:
+        """Ask the OS to start the registered Midgard Farm background service."""
+
+    @abc.abstractmethod
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
         """Deliver a desktop notification for the signed-in operator."""
 

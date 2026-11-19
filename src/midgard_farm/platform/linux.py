@@ -73,6 +73,10 @@ class LinuxPlatform(Platform):
     def default_game_dir(self) -> Path:
         return Path.home() / "games" / "midgard-survivors"
 
+    def start_service(self) -> None:
+        subprocess.run(["systemctl", "--user", "start", "midgard-farm.service"],
+                       check=True, capture_output=True, text=True, errors="replace", timeout=5)
+
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
         urgency = "critical" if priority == "high" else priority
         subprocess.run(["notify-send", "--app-name=Midgard Farm", f"--urgency={urgency}", "--", title, message],
