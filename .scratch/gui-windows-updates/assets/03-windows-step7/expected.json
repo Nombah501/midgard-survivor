@@ -1,0 +1,19 @@
+{
+  "PatchFile": "patch_0.2.3.pck",
+  "PatchSha256": "680b5dfd9cdc7290552c7e2b62057002ec0902a4573afb45ff74633e7af31b66",
+  "BridgeFile": "bridge_old_to_0.2.0.pck",
+  "BridgeSha256": "c16dca87fcc181198a4a238ff93a5e4ab1d44e4082fecee473740dcca7ff3777",
+  "Bytecode": "ebc36a7",
+  "GdreUrl": "https://github.com/GDRETools/gdsdecomp/releases/download/v2.7.4/GDRE_tools-v2.7.4-windows.zip",
+  "GdreZipSha256": "af24c563eee501effb194d83595de64696c32547b2246034dbfb891a24bfa0ad",
+  "Decompiled": {
+    "save": "cfd7ec6fc458ffc081021593ca8e3bbd7ac672e8d66ed45debcf5b0dd95ee112",
+    "player": "5ce493c3cc8ddce694ebc73dc08b691f151cfd40298578ef4e47f60382f8cdc3"
+  },
+  "Compiled": {
+    "save_hooked": "4a3fbc7ac14afae1acbf686e21573ba2f1efef032add98310c0f5d0a41da323c",
+    "player_patched": "049184c1badd757b3c7208489035f119f38b6e8b9b8aa0a4feca4eee700d8c9d",
+    "farmer": "8e13ee7716d125e96786f905cfaaba1026ffe532a3ff8adbff836f64e0f2c688"
+  },
+  "PckSha256": "1e6678e9ede9d53d2ac526ce3e06303979024e039f981962de661c078ecfff6c"
+}

@@ -63,3 +63,31 @@ _Avoid_: crash loop, backoff
 **Known-good backup**:
 A profile snapshot verified as restorable, not merely the newest file.
 _Avoid_: backup, copy
+
+**Official patch**:
+The game developer's content patch that the game itself downloads and mounts on top of the base game.
+_Avoid_: update file, game patch
+
+**Farmer patch**:
+A copy of the current official patch with the farmer added; it is mounted instead of the official patch.
+_Avoid_: mod, pack, farmer build
+
+**Farmer hash**:
+The fingerprint of everything the farmer patch is built from on the app side; when it changes, the farmer patch must be rebuilt even if the official patch did not change.
+_Avoid_: farmer version, app version
+
+**Game update**:
+A new official patch replacing the previous one, which also removes the farmer patch from the game.
+_Avoid_: update, patch change
+
+**Game reinstall**:
+A new build of the game itself that wipes every installed patch, official and farmer alike; distinct from a game update.
+_Avoid_: new build, reinstall update
+
+**App update**:
+A new version of the farmer application itself, independent of game updates.
+_Avoid_: update, upgrade
+
+**Operator**:
+The person who runs AFK sessions on their own machines; the only intended user of the application.
+_Avoid_: user, player
