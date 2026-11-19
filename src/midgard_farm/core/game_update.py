@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -129,7 +130,12 @@ class Quarantine:
     log_path: Path | None
 
 
-type PipelineResult = Ready | Wait | Blocked | Quarantine
+@dataclass(frozen=True)
+class Stopped:
+    """Service shutdown interrupted preparation; the journal remains resumable."""
+
+
+type PipelineResult = Ready | Wait | Blocked | Quarantine | Stopped
 
 
 class _Stage(StrEnum):
@@ -180,12 +186,15 @@ class GameUpdatePipeline:
         self, os_: Platform, profile: Path, events: PipelineEvents, *,
         close_grace_seconds: float = GAME_CLOSE_GRACE_SECONDS,
         sources: Path | None = None, gdre: Gdre | None = None,
+        stop_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self.os = os_
         self.profile = profile
         self.events = events
         self.sources = sources
         self.gdre = gdre
+        self._stop_requested = stop_requested
+        self._fingerprint: str | None = None
         self._grace = close_grace_seconds
         self._was_running = False
         self._closed_until = 0.0
@@ -195,6 +204,8 @@ class GameUpdatePipeline:
 
     def run(self, *, check_again: bool = False, unattended: bool = True) -> PipelineResult:
         """Prepare once; call again on Wait. Invalid prerequisites raise PreflightError."""
+        if self._stop_requested():
+            return Stopped()
         pending = self._load()
         if check_again and pending is not None and pending.reason is not None:
             pending = replace(pending, stage=_Stage.BUILD, reason=None, detail="", log_path=None, unattended=False)
@@ -209,23 +220,22 @@ class GameUpdatePipeline:
             return self._wait(WAITING_FOR_GAME)
 
         mounted = _inspect(self.os, self.profile)
-        if mounted is None:
-            self.events.state("farmer_unavailable", START_GAME_AND_UPDATE)
-            if not self._reinstall_reported:
-                self.events.history({
-                    "kind": "game_update", "classification": "game_reinstall",
-                    "outcome": "blocked", "reason": START_GAME_AND_UPDATE,
-                })
-                self._reinstall_reported = True
-            return Blocked(START_GAME_AND_UPDATE)
-        self._reinstall_reported = False
+        if mounted is None or not self._official_available(mounted.official):
+            return self._reinstall()
 
-        fingerprint = _farmer_hash(self.sources)
+        if self._fingerprint is None:
+            self._fingerprint = _farmer_hash(self.sources)
+        fingerprint = self._fingerprint
         classification = mounted.classify(fingerprint)
         if pending is None and classification is GameUpdateState.CURRENT:
+            self._reinstall_reported = False
             return self._ready()
 
-        key = self._patch_hash(mounted.official), fingerprint
+        try:
+            key = self._patch_hash(mounted.official), fingerprint
+        except FileNotFoundError:
+            return self._reinstall()
+        self._reinstall_reported = False
         interrupted = pending is not None
         if pending is not None and pending.key != key:
             pending = None
@@ -268,13 +278,27 @@ class GameUpdatePipeline:
             self._save(pending)
         return self._prepare(pending, mounted, unattended)
 
+    def _reinstall(self) -> Blocked:
+        self.events.state("farmer_unavailable", START_GAME_AND_UPDATE)
+        if not self._reinstall_reported:
+            self.events.history({
+                "kind": "game_update", "classification": "game_reinstall",
+                "outcome": "blocked", "reason": START_GAME_AND_UPDATE,
+            })
+            self._reinstall_reported = True
+        return Blocked(START_GAME_AND_UPDATE)
+
     def _prepare(self, pending: _Transaction, mounted: _MountedPatch, unattended: bool) -> PipelineResult:
         try:
+            if self._stop_requested():
+                return Stopped()
             if pending.stage is _Stage.BUILD:
                 if not mounted.mounted:
                     self.events.state("rebuilding", "refreshing official state")
                     farmer_patch.snapshot_official_state(self.os, self.profile)
                 self.events.state("rebuilding", "building farmer patch")
+                if self._stop_requested():
+                    return Stopped()
                 info = farmer_patch.build(self.os, self.profile, sources=self.sources, gdre=self.gdre)
                 if (info.patch_sha256, info.farmer_hash) != pending.key:
                     return self._wait("patch inputs changed; checking again")
@@ -282,24 +306,32 @@ class GameUpdatePipeline:
                 self._save(pending)
             if pending.stage is _Stage.SMOKE:
                 self.events.state("rebuilding", "running smoke in the sandbox")
-                verdict = smoke.run_smoke(self.os, self.profile)
+                if self._stop_requested():
+                    return Stopped()
+                verdict = smoke.run_smoke(self.os, self.profile, stop_requested=self._stop_requested)
+                if verdict.outcome is smoke.SmokeOutcome.STOPPED:
+                    return Stopped()
                 if verdict.outcome is smoke.SmokeOutcome.BUSY:
                     return self._busy()
                 if verdict.outcome is smoke.SmokeOutcome.FAILED:
-                    return self._fail(pending, mounted.mounted, FailureReason.SMOKE_FAILED,
+                    return self._fail(pending, mounted, FailureReason.SMOKE_FAILED,
                                       verdict.reason, verdict.log_path)
                 pending = replace(pending, stage=_Stage.INSTALL)
                 self._save(pending)
             self.events.state("rebuilding", "installing farmer patch")
+            if self._stop_requested():
+                return Stopped()
             farmer_patch.install(self.os, self.profile)
         except farmer_patch.GameRunning:
             return self._busy()
         except farmer_patch.AnchorsBroken as exc:
-            return self._fail(pending, mounted.mounted, FailureReason.ANCHORS_BROKEN, str(exc), exc.log_path)
+            return self._fail(pending, mounted, FailureReason.ANCHORS_BROKEN, str(exc), exc.log_path)
         except farmer_patch.BuildFailed as exc:
-            return self._fail(pending, mounted.mounted, FailureReason.BUILD_FAILED, str(exc), exc.log_path)
+            return self._fail(pending, mounted, FailureReason.BUILD_FAILED, str(exc), exc.log_path)
         except farmer_patch.InstallFailed as exc:
-            return self._fail(pending, mounted.mounted, FailureReason.BUILD_FAILED, f"install: {exc}", None)
+            return self._fail(pending, mounted, FailureReason.BUILD_FAILED, f"install: {exc}", None)
+        except farmer_patch.OfficialPatchMissing:
+            return self._reinstall()
         except (farmer_patch.PatchStateError, OSError) as exc:
             raise PreflightError(str(exc)) from exc
 
@@ -310,20 +342,28 @@ class GameUpdatePipeline:
         return self._ready()
 
     def _fail(
-        self, pending: _Transaction, mounted: bool, reason: FailureReason, detail: str, log_path: Path | None,
+        self, pending: _Transaction, mounted: _MountedPatch, reason: FailureReason, detail: str, log_path: Path | None,
     ) -> PipelineResult:
+        if self._stop_requested():
+            return Stopped()
+        if not self._official_available(mounted.official):
+            return self._reinstall()
         pending = replace(pending, stage=_Stage.RESTORE, reason=reason, detail=" ".join(detail.splitlines()) or reason,
                           log_path=str(log_path) if log_path is not None else None)
         self._save(pending)
-        return self._restore_and_quarantine(pending, mounted)
+        return self._restore_and_quarantine(pending, mounted.mounted)
 
     def _restore_and_quarantine(self, pending: _Transaction, mounted: bool) -> PipelineResult:
+        if self._stop_requested():
+            return Stopped()
         if mounted:
             try:
                 # A failed Farmer-hash rebuild must not leave even the previous farmer patch mounted.
                 farmer_patch.restore(self.os, self.profile)
             except farmer_patch.GameRunning:
                 return self._busy()
+            except farmer_patch.OfficialPatchMissing:
+                return self._reinstall()
             except (farmer_patch.PatchStateError, OSError) as exc:
                 pending = replace(pending, detail=f"{pending.detail}; could not restore official patch: {exc}")
         reason = pending.reason
@@ -358,6 +398,13 @@ class GameUpdatePipeline:
         except OSError as exc:
             raise PreflightError(f"cannot write {self._journal}: {exc}") from exc
 
+    @staticmethod
+    def _official_available(path: Path) -> bool:
+        try:
+            return path.is_file()
+        except OSError as exc:
+            raise PreflightError(f"cannot inspect official patch {path}: {exc}") from exc
+
     def _patch_hash(self, path: Path) -> str:
         try:
             st = path.stat()
@@ -365,6 +412,8 @@ class GameUpdatePipeline:
             if self._official_digest is None or self._official_digest[0] != stamp:
                 self._official_digest = (stamp, sha256(path))
             return self._official_digest[1]
+        except FileNotFoundError:
+            raise
         except OSError as exc:
             raise PreflightError(f"cannot read official patch {path}: {exc}") from exc
 

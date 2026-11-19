@@ -6,13 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from midgard_farm.core import commands
+from midgard_farm.core import commands, game_update
 from midgard_farm.core.history import read_history
 from midgard_farm.core.state import StateKind, read_state
 
 from test_game_update import SAVE_CODE, UpdateFarm, farmer_sources, snapshot
 from test_profile import godot_root, make_profile
 from test_supervisor import Farm, wait_for
+from test_platform import lock_freed_within
 
 
 RUNNER = [sys.executable, str(Path(__file__).with_name("fake_update_service.py"))]
@@ -54,8 +55,8 @@ def test_game_update_night_waits_rebuilds_and_runs_one_attempt(update_service):
         assert not farm.plan.with_suffix(".count").exists()
         update.running.unlink()
         outcome, _ = farm.outcome()
-        wait_for(lambda: farm.notifications() == ["game_update_handled", "goal"])
-        wait_for(lambda: desktop.exists() and len(desktop.read_bytes().splitlines()) == 2)
+        wait_for(lambda: farm.notifications() == ["goal"])
+        wait_for(lambda: desktop.exists() and b"Midgard farmer: goal" in desktop.read_bytes())
         assert not request.exists()
         wait_for(lambda: read_state(farm.os_).last_outcome)
     assert outcome["kind"] == "finished" and outcome["reason"] == "goal"
@@ -69,7 +70,7 @@ def test_game_update_night_waits_rebuilds_and_runs_one_attempt(update_service):
     assert farmed["kind"] == "session" and farmed["outcome"] == "finished"
     assert json.loads((update.patches / "state.json").read_bytes())["file"] == "patch_farmer.pck"
     assert {json.loads(line)["title"]: json.loads(line)["priority"] for line in desktop.read_bytes().splitlines()} == {
-        "Midgard farmer: game_update_handled": "low", "Midgard farmer: goal": "normal",
+        "Midgard farmer: goal": "normal",
     }
 
 
@@ -100,7 +101,24 @@ def test_service_refuses_start_until_retry_block_is_lifted(update_service, monke
             update.running.touch()
             command = commands.submit(farm.os_, "check_again")
             wait_for(lambda: not command.exists())
+            waiting = read_state(farm.os_)
+            assert waiting.kind is StateKind.WAITING_FOR_GAME and waiting.quarantine is None
+            queued_start = farm.start()
+            wait_for(lambda: not queued_start.exists())
+            assert not commands.rejection_path(farm.os_, queued_start).exists()
             update.running.unlink()
+            outcome, _ = farm.outcome()
+            assert outcome["kind"] == "finished" and len(outcome["attempts"]) == 1
+            wait_for(lambda: read_state(farm.os_).last_outcome)
+            assert read_state(farm.os_).quarantine is None
+            wait_for(lambda: farm.notifications() == ["goal"])
+            failed, rebuilt, farmed = read_history(farm.os_)
+            assert failed["outcome"] == "quarantine" and rebuilt["outcome"] == "ready"
+            assert failed["official_patch_sha256"] == rebuilt["official_patch_sha256"]
+            assert failed["farmer_hash"] == rebuilt["farmer_hash"]
+            assert farmed["kind"] == "session"
+            assert [entry["stage"] for entry in update.observations()] == ["build", "smoke", "smoke", "build", "smoke"]
+            return
         elif lift == "official_sha":
             update.publish_official(save_code=SAVE_CODE + "# new official patch bytes\n")
         if lift != "farmer_hash":
@@ -121,8 +139,7 @@ def test_service_refuses_start_until_retry_block_is_lifted(update_service, monke
     assert (failed["official_patch_sha256"] != rebuilt["official_patch_sha256"]) is (lift == "official_sha")
     assert (failed["farmer_hash"] != rebuilt["farmer_hash"]) is (lift == "farmer_hash")
     assert farmed["kind"] == "session"
-    notices = {json.loads(line)["title"] for line in desktop.read_bytes().splitlines()}
-    assert ("Midgard farmer: game_update_handled" in notices) is (lift == "official_sha")
+    assert "Midgard farmer: game_update_handled" not in desktop.read_text(encoding="utf-8")
     assert [entry["stage"] for entry in update.observations()] == ["build", "smoke", "smoke", "build", "smoke"]
 
 
@@ -159,6 +176,7 @@ def test_update_before_a_restart_does_not_count_as_an_attempt(update_service, mo
         update.publish_official(save_code=SAVE_CODE + "# second update\n", version="3")
         outcome, _ = farm.outcome()
         wait_for(lambda: read_state(farm.os_).last_outcome)
+        wait_for(lambda: farm.notifications() == ["fail", "game_update_handled", "goal"])
     assert outcome["kind"] == "finished"
     assert [(item["number"], item["outcome"]) for item in outcome["attempts"]] == [(1, "failed"), (2, "finished")]
     assert [entry["stage"] for entry in update.observations()] == ["build", "smoke", "build", "smoke"]
@@ -218,3 +236,57 @@ def test_startup_build_failures_publish_named_high_priority_quarantine(update_se
     assert row["kind"] == "game_update" and row["reason"] == reason
     assert json.loads(desktop.read_bytes()) == {"priority": "high", "title": f"Midgard farmer: {reason}"}
     assert not farm.plan.with_suffix(".count").exists()
+
+
+@pytest.mark.parametrize("mounted", [False, True])
+def test_missing_named_official_pack_refuses_start_without_quarantine(update_service, mounted):
+    farm, update, _, _ = update_service
+    if mounted:
+        assert isinstance(update.pipeline().run(), game_update.Ready)
+    (update.patches / "official.pck").unlink()
+    with farm.service(runner=RUNNER):
+        request = farm.start()
+        refusal = commands.rejection_path(farm.os_, request)
+        assert wait_for(lambda: json.loads(farm.os_.read_shared(refusal)), seconds=3)["reason"] == (
+            "start the game and accept the update"
+        )
+        state = read_state(farm.os_)
+        assert state.kind is StateKind.FARMER_UNAVAILABLE and state.quarantine is None
+        assert not list(farm.data.glob("logs/supervisor-*/outcome.json"))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="exercise the service's SIGTERM handler")
+def test_service_stop_cancels_smoke_and_can_resume_without_rebuilding(update_service, monkeypatch):
+    farm, update, _, _ = update_service
+    monkeypatch.setenv("FAKE_SMOKE_MODES", '["hang", "pass"]')
+    original = (update.patches / "state.json").read_bytes()
+    with farm.service(runner=RUNNER) as proc:
+        wait_for(lambda: (update.records / "grandchild.ready").exists())
+        farm.stop(proc)
+        assert proc.wait(timeout=5) == 0
+        assert lock_freed_within(update.records / "grandchild.lock", 5)
+    assert (update.patches / "state.json").read_bytes() == original and not read_history(farm.os_)
+    assert [entry["stage"] for entry in update.observations()] == ["build", "smoke"]
+
+    with farm.service(runner=RUNNER):
+        wait_for(lambda: read_state(farm.os_).kind is StateKind.IDLE and read_history(farm.os_))
+    assert [entry["stage"] for entry in update.observations()] == ["build", "smoke", "smoke"]
+    assert json.loads((update.patches / "state.json").read_bytes())["file"] == "patch_farmer.pck"
+
+
+def test_active_update_gate_polls_game_at_most_once_a_second(update_service, monkeypatch, tmp_path):
+    farm, update, _, _ = update_service
+    poll_trace = tmp_path / "game-polls"
+    monkeypatch.setenv("FAKE_UPDATE_POLL_TRACE", str(poll_trace))
+    update.running.touch()
+
+    with farm.service(runner=RUNNER):
+        farm.start()
+        wait_for(lambda: read_state(farm.os_),
+                 lambda state: state.kind is StateKind.WAITING_FOR_GAME and state.session_id is not None)
+        # Skip the event-driven startup and Start checks, then observe periodic checks.
+        lines = wait_for(lambda: farm.os_.read_shared(poll_trace).splitlines(), lambda rows: len(rows) >= 6)
+        assert not update.observations()
+
+    stamps = [float(row) for row in lines[-3:]]
+    assert all(later - earlier >= 0.99 for earlier, later in zip(stamps, stamps[1:]))

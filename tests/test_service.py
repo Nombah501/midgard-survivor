@@ -159,3 +159,26 @@ def test_frozen_systemd_unit_executes_the_binary_directly(tmp_path):
     assert exec_start == 'ExecStart="/opt/Midgard Farm %%local/$$current/service"'
     assert "KillMode=mixed\n" in result.stdout
     assert "TimeoutStopSec=90\n" in result.stdout
+
+
+def test_service_reports_both_ambiguous_profiles_in_state_and_refusal(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    os_ = platform.current()
+    make_profile(godot_root(tmp_path), "First game profile")
+    make_profile(godot_root(tmp_path), "Second game profile")
+    request = submit(os_, Start(Character("archer", 1), tmp_path / "preset.json"))
+    with subprocess.Popen(SERVICE, env=service_env(tmp_path), stdout=subprocess.DEVNULL) as child:
+        try:
+            deadline = time.monotonic() + 5
+            while not (state := read_state(os_)).command_refusals:
+                assert child.poll() is None and time.monotonic() < deadline
+                time.sleep(0.01)
+            assert state.kind is StateKind.FARMER_UNAVAILABLE
+            assert state.reason.startswith("several profiles under ")
+            assert "First game profile, Second game profile" in state.reason
+            assert state.command_refusals[0]["reason"] == state.reason
+            assert state.command_refusals[0]["request"] == request.name
+        finally:
+            child.terminate()
+            child.wait(timeout=5)

@@ -13,6 +13,10 @@ class ProfileNotFound(Exception):
     pass
 
 
+class AmbiguousProfile(ProfileNotFound):
+    """Several marked directories exist; the service must not pick one."""
+
+
 def find_profile(user_data_root: Path) -> Path:
     """Return the single folder under the Godot user-data root holding every marker."""
     try:
@@ -26,5 +30,5 @@ def find_profile(user_data_root: Path) -> Path:
         )
     if len(found) > 1:
         names = ", ".join(p.name for p in found)
-        raise ProfileNotFound(f"several profiles under {user_data_root}: {names}")
+        raise AmbiguousProfile(f"several profiles under {user_data_root}: {names}")
     return found[0]

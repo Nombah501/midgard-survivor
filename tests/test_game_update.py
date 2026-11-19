@@ -419,3 +419,33 @@ def test_missing_game_is_a_legacy_preflight_error(farm):
         farm.pipeline().run()
     assert snapshot(farm.profile) == before and not farm.observations()
     assert not farm.events.records and not farm.events.notifications
+
+
+def test_farmer_hash_is_pinned_until_service_restart(farm, tmp_path):
+    sources = tmp_path / "farmer sources"
+    script = farmer_sources(sources)
+    running_service = farm.pipeline(sources=sources)
+    assert isinstance(running_service.run(), game_update.Ready)
+    script.unlink()
+
+    assert isinstance(running_service.run(), game_update.Ready)
+    with pytest.raises(PreflightError, match="cannot read farmer build inputs"):
+        farm.pipeline(sources=sources).run()
+
+
+@pytest.mark.parametrize(("stage", "stages"), [
+    ("running smoke in the sandbox", ["build"]),
+    ("installing farmer patch", ["build", "smoke"]),
+])
+def test_stop_between_update_stages_leaves_profile_consistent_and_reuses_candidate(farm, stage, stages):
+    def stop_at_stage():
+        return ("rebuilding", stage) in farm.events.states
+
+    before = snapshot(farm.profile)
+    assert isinstance(farm.pipeline(stop_requested=stop_at_stage).run(), game_update.Stopped)
+    assert [entry["stage"] for entry in farm.observations()] == stages
+    assert snapshot(farm.profile) == before | {"patches/official-state.json": before["patches/state.json"]}
+    assert not farm.events.records and not farm.events.notifications
+
+    assert isinstance(farm.pipeline().run(), game_update.Ready)
+    assert [entry["stage"] for entry in farm.observations()] == ["build", "smoke"]

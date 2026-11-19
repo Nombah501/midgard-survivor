@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import sys
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,9 @@ class FakeGamePlatform(type(platform.current())):
     game_exe_name = "midgard-update-fixture.exe" if sys.platform == "win32" else "midgard-update-fixture"
 
     def game_pids(self):
+        if path := os.environ.get("FAKE_UPDATE_POLL_TRACE"):
+            with open(path, "a", encoding="utf-8") as trace:
+                print(time.monotonic(), file=trace)
         return {1} if Path(os.environ["FAKE_UPDATE_RUNNING"]).exists() else set()
 
     def check_network_isolation(self):

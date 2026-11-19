@@ -63,3 +63,21 @@ def test_state_reader_bounds_reported_refresh_and_tolerates_small_clock_skew(
     state = read_state(os_)
     assert state.refresh_interval == expected_interval
     assert state.kind is kind
+
+
+def test_unchanged_transition_leaves_publication_to_timer(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    os_ = platform.current()
+    with StateReporter(os_, refresh_interval=1) as reporter:
+        reporter.set(StateKind.WAITING_FOR_GAME, "Close the game")
+        published = os_.read_shared(state_path(os_))
+        reporter.set(StateKind.WAITING_FOR_GAME, "Close the game")
+        assert os_.read_shared(state_path(os_)) == published
+        deadline = time.monotonic() + 3
+        while os_.read_shared(state_path(os_)) == published:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        current = read_state(os_)
+        assert current.kind is StateKind.WAITING_FOR_GAME
+        assert current.updated_at > json.loads(published)["updated_at"]

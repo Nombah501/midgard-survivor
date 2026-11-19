@@ -615,7 +615,7 @@ def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm, tm
     assert "Restart=on-failure\n" in unit
     command = shlex.split(next(line.removeprefix("ExecStart=") for line in unit.splitlines()
                                if line.startswith("ExecStart=")))
-    (farm.profile / "patches/patch_official.pck").unlink()
+    (farm.profile / "patches/patch_official.pck").write_bytes(b"changed without state update")
     fake_bin = tmp_path / "notification-bin"
     fake_bin.mkdir()
     fake_notify = fake_bin / "notify-send"
@@ -633,7 +633,7 @@ def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm, tm
 
 
 def test_crash_recovery_reuses_session_without_replaying_the_start(farm):
-    (farm.profile / "patches/patch_official.pck").unlink()
+    (farm.profile / "patches/patch_official.pck").write_bytes(b"changed without state update")
     start = {"character": {"class": "archer", "job_path": 1}, "preset": str(farm.preset)}
     request = farm.send("start", **start)
     session_id = "afk-" + uuid.uuid4().hex

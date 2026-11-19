@@ -15,7 +15,7 @@ from .core.game_update import START_GAME_AND_UPDATE
 from .core.launch import GameBusy, run_attempt, shutdown_request
 from .core.notify import Notifier
 from .core.preflight import PreflightError
-from .core.profile import ProfileNotFound, find_profile
+from .core.profile import AmbiguousProfile, ProfileNotFound, find_profile
 from .core.state import StateKind, StateReporter
 from .core.supervisor import InvalidSavedSession, Policy, Supervisor, log, pending_commands, refuse_command
 
@@ -94,15 +94,16 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
                 profile = find_profile(os_.godot_user_data_root())
             except ProfileNotFound as exc:
                 reason = str(exc)
+                guidance = reason if isinstance(exc, AmbiguousProfile) else START_GAME_AND_UPDATE
                 if reason != last_missing:
                     last_missing = reason
-                    state.set(StateKind.FARMER_UNAVAILABLE, START_GAME_AND_UPDATE)
+                    state.set(StateKind.FARMER_UNAVAILABLE, guidance)
                     log(f"profile not found: {reason}")
                 for path, command in pending_commands(os_):
                     if isinstance(command, Start):
-                        refuse_command(os_, state, path, "start", START_GAME_AND_UPDATE)
+                        refuse_command(os_, state, path, "start", guidance)
                     elif command == "check_again":
-                        refuse_command(os_, state, path, command, START_GAME_AND_UPDATE)
+                        refuse_command(os_, state, path, command, guidance)
                     else:
                         path.unlink()
                 time.sleep(1)

@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -17,6 +19,7 @@ from .patch_info import INSTALLED_PACK
 
 _TIMEOUT_SECONDS = 300
 _BUSY_REASON = "the game is running; close it first"
+_STOP_REASON = "service stopped during smoke"
 _SCRIPT_ERROR = re.compile(rb"SCRIPT ERROR|Parse Error|Invalid call|Cannot call method")
 _FINISH = re.compile(rb"^(?:FARMER \S+ )?FINISH\b")
 
@@ -40,6 +43,7 @@ class SmokeOutcome(Enum):
     PASSED = "passed"
     FAILED = "failed"
     BUSY = "busy"
+    STOPPED = "stopped"
 
 
 @dataclass(frozen=True)
@@ -120,25 +124,48 @@ def _judge(os_: Platform, profile: Path, log_path: Path) -> str:
     return ""
 
 
-def _attempt(os_: Platform, profile: Path, app_dir: Path, game: Path, log_path: Path) -> str:
+class _SmokeStopped(Exception):
+    pass
+
+
+def _attempt(
+    os_: Platform, profile: Path, app_dir: Path, game: Path, log_path: Path, stop_requested: Callable[[], bool],
+) -> str:
     data_home = Path(tempfile.mkdtemp(dir=app_dir, prefix="smoke-"))
     try:
         godot_root, env = os_.godot_sandbox(data_home)
         sandbox = godot_root / profile.name
+        if stop_requested():
+            raise _SmokeStopped
         _copy_profile(os_, profile, sandbox)
+        if stop_requested():
+            raise _SmokeStopped
         farmer_patch.install(os_, sandbox, backup_dir=data_home / "install-backups")
         os_.write_atomic(sandbox / "farmer.cfg", json.dumps(_ONE_RUN).encode())
         env["FARMER_SESSION"] = "1"
         env.pop("FARMER_SESSION_ID", None)
         if os_.game_running():
             raise farmer_patch.GameRunning(_BUSY_REASON)
+        if stop_requested():
+            raise _SmokeStopped
         with log_path.open("wb") as output:
             try:
                 with os_.spawn_tree(
                     [str(game), "--headless"], cwd=game.parent, env=env, stdout=output,
                     stderr=subprocess.STDOUT, isolate_network=True,
                 ) as tree:
-                    code = tree.wait(timeout=_TIMEOUT_SECONDS)
+                    deadline = time.monotonic() + _TIMEOUT_SECONDS
+                    while not stop_requested():
+                        seconds_left = deadline - time.monotonic()
+                        if seconds_left <= 0:
+                            raise subprocess.TimeoutExpired([str(game), "--headless"], _TIMEOUT_SECONDS)
+                        try:
+                            code = tree.wait(timeout=min(seconds_left, 0.2))
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    else:
+                        raise _SmokeStopped
             except subprocess.TimeoutExpired:
                 # Leaving the tree context kills it and reaps the game before a retry.
                 return f"game timed out after {_TIMEOUT_SECONDS:g} s"
@@ -151,8 +178,12 @@ def _attempt(os_: Platform, profile: Path, app_dir: Path, game: Path, log_path: 
         shutil.rmtree(data_home)
 
 
-def run_smoke(os_: Platform, profile: Path) -> SmokeVerdict:
-    """Play the smoke preset with up to two fresh sandboxes; preserve the process logs."""
+def run_smoke(
+    os_: Platform, profile: Path, *, stop_requested: Callable[[], bool] = lambda: False,
+) -> SmokeVerdict:
+    """Play at most two fresh sandbox attempts; stop promptly if requested."""
+    if stop_requested():
+        return SmokeVerdict(SmokeOutcome.STOPPED, _STOP_REASON, 0, None)
     try:
         if os_.game_running():
             return SmokeVerdict(SmokeOutcome.BUSY, _BUSY_REASON, 0, None)
@@ -174,14 +205,22 @@ def run_smoke(os_: Platform, profile: Path) -> SmokeVerdict:
     for attempt in (1, 2):
         log_path = log_dir / f"attempt-{attempt}.log"
         try:
+            if stop_requested():
+                return SmokeVerdict(SmokeOutcome.STOPPED, _STOP_REASON, attempt - 1, last_log)
             if os_.game_running():
                 return SmokeVerdict(SmokeOutcome.BUSY, _BUSY_REASON, attempt - 1, last_log)
-            reason = _attempt(os_, profile, app_dir, game, log_path)
+            reason = _attempt(os_, profile, app_dir, game, log_path, stop_requested)
+        except _SmokeStopped:
+            if log_path.exists():
+                return SmokeVerdict(SmokeOutcome.STOPPED, _STOP_REASON, attempt, log_path)
+            return SmokeVerdict(SmokeOutcome.STOPPED, _STOP_REASON, attempt - 1, last_log)
         except farmer_patch.GameRunning as exc:
             return SmokeVerdict(SmokeOutcome.BUSY, str(exc), attempt - 1, last_log)
         except (OSError, farmer_patch.InstallFailed, subprocess.SubprocessError) as exc:
             reason = " ".join(str(exc).splitlines()) or type(exc).__name__
         last_log = log_path if log_path.is_file() else None
+        if stop_requested():
+            return SmokeVerdict(SmokeOutcome.STOPPED, _STOP_REASON, attempt, last_log)
         if not reason:
             return SmokeVerdict(SmokeOutcome.PASSED, "smoke passed", attempt, last_log)
     return SmokeVerdict(SmokeOutcome.FAILED, reason, attempt, last_log)

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from midgard_farm.core.profile import ProfileNotFound, find_profile
+from midgard_farm.core.profile import AmbiguousProfile, ProfileNotFound, find_profile
 
 
 def make_profile(root: Path, name: str) -> Path:
@@ -41,5 +41,5 @@ def test_two_candidate_profiles_are_refused_not_guessed(tmp_path):
     make_profile(tmp_path, "Midgard Survivors")
     make_profile(tmp_path, "Ragnarok Survivors")
 
-    with pytest.raises(ProfileNotFound, match="Midgard Survivors.*Ragnarok Survivors"):
+    with pytest.raises(AmbiguousProfile, match="Midgard Survivors.*Ragnarok Survivors"):
         find_profile(tmp_path)

@@ -111,7 +111,10 @@ class Supervisor:
         self.session_path = os_.app_data_dir() / "session.json"
         self.queue = commands.directory(os_)
         self.mailbox = profile / "farmer_command"
-        self._update = game_update.GameUpdatePipeline(os_, profile, _UpdateEvents(os_, state, notify))
+        self._update = game_update.GameUpdatePipeline(
+            os_, profile, _UpdateEvents(os_, state, notify),
+            stop_requested=lambda: stop_requested_at() is not None,
+        )
         self._quarantine_path = self.session_path.parent / "quarantine.json"
         saved_quarantine = read_state(os_).quarantine
         self._update_quarantine = (saved_quarantine if saved_quarantine
@@ -156,7 +159,7 @@ class Supervisor:
         if recovered := self._recover_session():
             session_id, start, request = recovered
             log(f"continuing unfinished session {session_id}")
-            self._run_session(session_id, start, request)
+            self._run_session(session_id, start, request, recovered_session=True)
         elif self.stop_requested_at() is None:
             self._idle_update()
 
@@ -164,6 +167,9 @@ class Supervisor:
         while self.stop_requested_at() is None:
             for path, command in self._pending():
                 gate = self._idle_update(check_again=command == "check_again")
+                if isinstance(gate, game_update.Stopped) or self.stop_requested_at() is not None:
+                    return
+                next_check = time.monotonic() + UPDATE_POLL
                 if command == "check_again":
                     path.unlink()
                     continue
@@ -202,17 +208,19 @@ class Supervisor:
             return None
 
     def _check_update(
-        self, *, session: bool = False, check_again: bool = False,
+        self, *, session: bool = False, check_again: bool = False, unattended: bool = False,
     ) -> game_update.PipelineResult:
         check_again = check_again or self._check_again
         self._check_again = False
-        result = self._update.run(check_again=check_again, unattended=not check_again)
+        if check_again and self._update_quarantine is not None:
+            self._clear_update_quarantine()
+            self.state.set(StateKind.REBUILDING, "checking for a Game update", quarantine=None)
+        result = self._update.run(check_again=check_again, unattended=unattended and not check_again)
         if isinstance(result, game_update.Ready):
             kind = StateKind.ACTIVE if session else StateKind.IDLE
             reason = "AFK session in progress" if session else ""
             if self._update_quarantine is not None:
-                self._quarantine_path.unlink(missing_ok=True)
-                self._update_quarantine = None
+                self._clear_update_quarantine()
                 self.state.set(kind, reason, quarantine=None)
             else:
                 self.state.set(kind, reason)
@@ -224,7 +232,14 @@ class Supervisor:
                 self._write(self._quarantine_path, record)
                 self._update_quarantine = record
             self.state.set(StateKind.FARMER_UNAVAILABLE, result.reason, quarantine=self._update_quarantine)
+        elif isinstance(result, game_update.Blocked) and self._update_quarantine is not None:
+            self._clear_update_quarantine()
+            self.state.set(StateKind.FARMER_UNAVAILABLE, result.reason, quarantine=None)
         return result
+
+    def _clear_update_quarantine(self) -> None:
+        self._quarantine_path.unlink(missing_ok=True)
+        self._update_quarantine = None
 
     @staticmethod
     def _update_record(result: game_update.Quarantine | game_update.Blocked) -> dict:
@@ -265,7 +280,7 @@ class Supervisor:
             raise InvalidSavedSession(f"{path}: {exc}") from exc
         return outcome, quarantine
 
-    def _run_session(self, session_id: str, start: Start, request: str) -> None:
+    def _run_session(self, session_id: str, start: Start, request: str, *, recovered_session: bool = False) -> None:
         log_dir = self.os.app_data_dir() / "logs" / f"supervisor-{session_id}"
         log_dir.mkdir(parents=True, exist_ok=True)
         outcome_path = log_dir / "outcome.json"
@@ -287,7 +302,7 @@ class Supervisor:
         else:
             if isinstance(status, dict) and status.get("session") == session_id:
                 self._remember_totals(status)
-        attempts = []
+        attempts: list[Attempt] = []
         failures: deque[float] = deque()
         number = max((int(p.stem.removeprefix("attempt-")) for p in log_dir.glob("attempt-*.log")), default=0)
         delay = 0.0
@@ -302,23 +317,27 @@ class Supervisor:
                     break
                 self.state.set(StateKind.ACTIVE, "AFK session in progress")
             preflight_error = None
+            next_check = 0.0
             while self.stop_requested_at() is None:
+                if time.monotonic() < next_check:
+                    if stopped := self._between_attempts_commands():
+                        reason = stopped
+                        break
+                    time.sleep(POLL)
+                    continue
                 try:
-                    gate = self._check_update(session=True)
+                    gate = self._check_update(session=True, unattended=recovered_session or bool(attempts))
                 except PreflightError as exc:
                     preflight_error = exc
                     break
-                if isinstance(gate, game_update.Ready):
+                if isinstance(gate, (game_update.Ready, game_update.Stopped)):
                     break
                 if isinstance(gate, (game_update.Quarantine, game_update.Blocked)):
                     if gate.reason in UPDATE_FAILURES:
                         kind, update_quarantine = "quarantined", self._update_record(gate)
                     reason = gate.reason
                     break
-                if stopped := self._between_attempts_commands():
-                    reason = stopped
-                    break
-                time.sleep(POLL)
+                next_check = time.monotonic() + UPDATE_POLL
             if reason != "operator" or self.stop_requested_at() is not None:
                 break
             number += 1

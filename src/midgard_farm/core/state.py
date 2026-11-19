@@ -153,7 +153,10 @@ class StateReporter:
             changes["quarantine"] = _quarantine(quarantine)
         with self._lock:
             prior_cutoff = self._state.refusals_superseded_through
-            self._state = replace(self._state, kind=kind, reason=reason, **changes)
+            updated = replace(self._state, kind=kind, reason=reason, **changes)
+            if updated == self._state and self._error is None:
+                return
+            self._state = updated
             if (cutoff := self._state.refusals_superseded_through) != prior_cutoff:
                 self._state = replace(self._state, command_refusals=self._read_refusals(cutoff))
             self._publish()
