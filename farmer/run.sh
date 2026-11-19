@@ -103,13 +103,13 @@ failed=""
 finish_reason=""
 exit_code=""
 if [[ -f "$DATA/farmer_status.json" ]]; then
-	IFS=$'\t' read -r phase failed finish_reason exit_code < <(python3 - "$DATA/farmer_status.json" <<'PY'
+	IFS='|' read -r phase failed finish_reason exit_code < <(python3 - "$DATA/farmer_status.json" <<'PY'
 import json,sys
 try:
     d=json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     d={}
-print("%s\t%s\t%s\t%s" % (
+print("%s|%s|%s|%s" % (
     d.get("phase", ""),
     "true" if d.get("failed", False) else "false",
     d.get("finish_reason", ""),
@@ -118,11 +118,9 @@ print("%s\t%s\t%s\t%s" % (
 PY
 ) || true
 fi
-clean=0
+# A headless clean finish hard-exits with SIGKILL (137) after a verified flush.
+# Only that post-flush code is accepted; any other non-zero child code propagates.
 if [[ "$phase" == "done" && "$failed" != "true" && ( "$code" == "0" || "$code" == "137" ) ]]; then
-	clean=1
-fi
-if [[ "$clean" == "1" ]]; then
 	echo "farmer: finished cleanly (exit $code${finish_reason:+ reason=$finish_reason})"
 	[[ -f "$DATA/farmer_status.json" ]] && python3 - "$DATA/farmer_status.json" <<'PY'
 import json,sys

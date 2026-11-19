@@ -160,6 +160,7 @@ def need(cond, msg):
 
 
 need(d.get("phase") == "done", "phase != done")
+need(bool(d.get("terminal")), "terminal false")
 need(not bool(d.get("failed", False)), "failed true")
 need(str(d.get("finish_reason") or "") != "", "finish_reason empty")
 need(str(d.get("last_transition") or "") != "", "last_transition empty")
@@ -203,6 +204,7 @@ def need(cond, msg):
 
 
 need(d.get("phase") == "failed", "phase != failed")
+need(bool(d.get("terminal")), "terminal false")
 need(bool(d.get("failed")), "failed false")
 need(str(d.get("finish_reason") or "") == "flush_failed", "finish_reason != flush_failed")
 need(int(d.get("exit_code") or 0) != 0, "exit_code == 0")
@@ -233,6 +235,7 @@ row = {
     "exit": int(rc),
     "reason": reason,
     "phase": d.get("phase"),
+    "terminal": d.get("terminal"),
     "failed": d.get("failed"),
     "finish_reason": d.get("finish_reason"),
     "exit_code": d.get("exit_code"),
@@ -256,7 +259,7 @@ PY
 }
 
 run_scenario() {
-	local name="$1" cfg="$2" timeout_s="$3" marker="$4" expect_fail="${5:-0}"
+	local name="$1" cfg="$2" timeout_s="$3" marker="$4" expect_fail="${5:-0}" extra_env="${6:-}"
 	local run_log="$OUT_DIR/$name.run.log"
 	local status="$OUT_DIR/$name.status.json"
 	local farmer_log="$OUT_DIR/$name.farmer.log"
@@ -266,8 +269,8 @@ run_scenario() {
 	echo "=== $name (timeout ${timeout_s}s) ==="
 	set +e
 	local env_args=("XDG_DATA_HOME=$SB" "GAME_DIR=$GAME_DIR")
-	if [[ "$name" == "flush-fail" ]]; then
-		env_args+=("FARMER_TEST_FLUSH_FAIL=1")
+	if [[ -n "$extra_env" ]]; then
+		env_args+=("$extra_env")
 	fi
 	env "${env_args[@]}" timeout --foreground -k 15 "$timeout_s" \
 		"$FARMER_DIR/run.sh" "$cfg" >"$run_log" 2>&1
@@ -339,7 +342,7 @@ for scenario in "${SCENARIOS[@]}"; do
 		one-run) run_scenario one-run "$OUT_DIR/one-run.json" 300 FINISH || break ;;
 		stop) run_scenario stop "$OUT_DIR/stop.json" 180 'STOP max_minutes' || break ;;
 		endless) run_scenario endless "$OUT_DIR/endless.json" 360 ENDLESS_DONE || break ;;
-		flush-fail) run_scenario flush-fail "$OUT_DIR/flush-fail.json" 180 'FAIL flush_failed' 1 || break ;;
+		flush-fail) run_scenario flush-fail "$OUT_DIR/flush-fail.json" 180 'FAIL flush_failed' 1 "FARMER_TEST_FLUSH_FAIL=1" || break ;;
 	esac
 done
 

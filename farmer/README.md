@@ -172,7 +172,7 @@ AFK-цикл: забег идёт до смерти/победы (на SinX D25 
 `stage|danger`), `last` (последний забег), `maint` (что куплено/слито),
 `profile` (зеньги, склад, материалы) и `game` (hp/level/time).
 
-Терминальный контракт: `failed`, `finish_reason`, `last_error`,
+Терминальный контракт: `terminal`, `failed`, `finish_reason`, `last_error`,
 `last_transition`, `exit_code`, `run_id`, `heartbeat_seq`. При сбое статус
 получает `phase=failed` и `exit_code!=0`; `phase=done` пишется только после
 подтверждённой записи профиля. `run.sh` возвращает 0 только для чистого

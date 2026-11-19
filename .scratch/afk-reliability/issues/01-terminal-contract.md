@@ -16,6 +16,7 @@
 
 ## Result
 
-- Build: `d7a2ded3ff1a9791a3d6a32c266b27d29cffb934ce52e8282ca65aa3ecbbdb03`.
-- `./tools/verify.sh --one-run --flush-fail`: PASS. `one-run` — `phase=done`, exit 0; `flush-fail` — `phase=failed`, `finish_reason=flush_failed`, exit 1.
+- Build: `cfbb34b080e947fa1918be2f88f358943978593d60df2ea19b741adf319be503`.
+- `./tools/verify.sh --one-run --flush-fail`: PASS. `one-run` — `phase=done`, `terminal=true`, exit 0; `flush-fail` — `phase=failed`, `finish_reason=flush_failed`, `terminal=true`, exit 1.
 - `./tools/check.sh`: OK.
+- Review follow-up: the flush fingerprint now forces a content change (`farmer_flush_marker`), so a successful write cannot be mistaken for a failed one; status parsing uses a non-whitespace delimiter; the status exposes an explicit `terminal` flag.
