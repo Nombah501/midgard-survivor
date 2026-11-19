@@ -2,14 +2,26 @@ import fcntl
 import os
 import signal
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Never
 
-from . import InstanceLock, LockHeld, Platform, ProcessTree, check_argv
+from . import InstanceLock, LockHeld, NetworkIsolationError, Platform, ProcessTree, check_argv
 
 
 def _xdg_data_home() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+
+
+def exec_isolated_game(args: list[str]) -> Never:
+    """Prove namespace entry over a private pipe, then exec without a shell."""
+    fd, outer_netns, *argv = args
+    if os.readlink("/proc/self/ns/net") == outer_netns:
+        raise SystemExit("network namespace did not change")
+    os.write(int(fd), b"1")
+    os.close(int(fd))
+    os.execv(argv[0], argv)
 
 
 class _FlockLock(InstanceLock):
@@ -44,6 +56,7 @@ class _GroupTree(ProcessTree):
 class LinuxPlatform(Platform):
     release_os = "linux"
     game_exe_name = "MidgardSurvivors.x86_64"
+    game_exit_status_reliable = True
 
     def godot_user_data_root(self) -> Path:
         return _xdg_data_home() / "godot" / "app_userdata"
@@ -79,10 +92,48 @@ class LinuxPlatform(Platform):
             raise
         return _FlockLock(fd)
 
-    def spawn_tree(self, argv: Sequence[str], **popen_kwargs) -> ProcessTree:
-        # A new session makes the child the leader of a process group that
-        # its descendants inherit, so killpg reaches the grandchildren too.
-        return _GroupTree(subprocess.Popen(check_argv(argv), start_new_session=True, **popen_kwargs))
+    def check_network_isolation(self) -> None:
+        try:
+            subprocess.run(["unshare", "-cn", "--", "true"], capture_output=True, check=True)
+        except (FileNotFoundError, PermissionError, subprocess.CalledProcessError) as exc:
+            detail = (
+                exc.stderr.decode(errors="replace").strip()
+                if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+            )
+            raise NetworkIsolationError(
+                "network isolation requires util-linux unshare -cn and permission to create user/network namespaces"
+                f"; no game launched: {detail}"
+            ) from exc
+
+    def spawn_tree(self, argv: Sequence[str], *, isolate_network: bool = False, **popen_kwargs) -> ProcessTree:
+        command = check_argv(argv)
+        if not isolate_network:
+            return _GroupTree(subprocess.Popen(command, start_new_session=True, **popen_kwargs))
+        # unshare execs the helper, which execs the game in the same killable group.
+        helper = [sys.executable, "--_isolated-exec"] if getattr(sys, "frozen", False) else [
+            sys.executable, "-m", "midgard_farm.platform.linux",
+        ]
+        outer_netns = os.readlink("/proc/self/ns/net")
+        reader, writer = os.pipe()
+        try:
+            try:
+                tree = _GroupTree(subprocess.Popen(
+                    ["unshare", "-cn", "--", *helper, str(writer), outer_netns, *command],
+                    start_new_session=True, pass_fds=(writer,), **popen_kwargs,
+                ))
+            except (FileNotFoundError, PermissionError) as exc:
+                raise NetworkIsolationError(f"network isolation could not start unshare: {exc}") from exc
+            finally:
+                os.close(writer)
+            try:
+                if os.read(reader, 1) != b"1":
+                    raise NetworkIsolationError("network isolation failed before the supervised game could launch")
+            except BaseException:
+                tree.kill()
+                raise
+            return tree
+        finally:
+            os.close(reader)
 
     def replace_atomic(self, src, dst) -> None:
         os.replace(src, dst)
@@ -91,3 +142,7 @@ class LinuxPlatform(Platform):
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+
+
+if __name__ == "__main__":
+    exec_isolated_game(sys.argv[1:])

@@ -175,3 +175,11 @@ def test_game_executable_follows_game_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("GAME_DIR", str(tmp_path / "Midgard Survivors"))
 
     assert OS.game_executable() == tmp_path / "Midgard Survivors" / OS.game_exe_name
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows v1 policy")
+def test_windows_v1_warns_that_afk_network_isolation_is_unavailable():
+    warning = OS.check_network_isolation()
+    assert warning is not None
+    assert "no network isolation" in warning
+    assert "updater" in warning and "CloudSave" in warning

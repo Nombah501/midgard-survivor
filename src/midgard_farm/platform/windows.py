@@ -110,6 +110,7 @@ class _JobTree(ProcessTree):
 class WindowsPlatform(Platform):
     release_os = "windows"
     game_exe_name = "MidgardSurvivors.exe"
+    game_exit_status_reliable = False
 
     def godot_user_data_root(self) -> Path:
         return _env_dir("APPDATA") / "Godot" / "app_userdata"
@@ -144,7 +145,12 @@ class WindowsPlatform(Platform):
             raise ctypes.WinError(err)
         return _FileLock(fd)
 
-    def spawn_tree(self, argv: Sequence[str], **popen_kwargs) -> ProcessTree:
+    def check_network_isolation(self) -> str:
+        return ("Windows v1 has no network isolation: the updater prompt can stall an AFK session "
+                "and CloudSave can race a cloud-linked profile.")
+
+    def spawn_tree(self, argv: Sequence[str], *, isolate_network: bool = False, **popen_kwargs) -> ProcessTree:
+        # Windows v1 deliberately runs supervised games on the host network.
         # Start suspended so the child joins the Job Object before it can
         # spawn anything; descendants then inherit the job.
         job = _CreateJobObjectW(None, None)

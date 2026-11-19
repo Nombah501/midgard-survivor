@@ -16,6 +16,10 @@ class LockHeld(Exception):
     """Another process holds the single-instance lock."""
 
 
+class NetworkIsolationError(OSError):
+    """A supervised Linux game cannot enter its own network namespace."""
+
+
 class InstanceLock(abc.ABC):
     """A held single-instance lock; the OS frees it when the holder dies."""
 
@@ -91,8 +95,12 @@ class Platform(abc.ABC):
         """Take the exclusive lock on `path` without waiting; raise LockHeld if taken."""
 
     @abc.abstractmethod
-    def spawn_tree(self, argv: Sequence[str], **popen_kwargs) -> ProcessTree:
-        """Start `argv` in a group that `ProcessTree.kill` ends as a whole."""
+    def check_network_isolation(self) -> str | None:
+        """Raise if isolation cannot be set up; return an operator warning if unsupported."""
+
+    @abc.abstractmethod
+    def spawn_tree(self, argv: Sequence[str], *, isolate_network: bool = False, **popen_kwargs) -> ProcessTree:
+        """Start a killable group and, when requested, isolate its network where supported."""
 
     @abc.abstractmethod
     def replace_atomic(self, src: str | os.PathLike, dst: str | os.PathLike) -> None:
@@ -112,6 +120,14 @@ class Platform(abc.ABC):
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
+
+
+def run_isolation_helper() -> None:
+    """Reenter the Linux exec helper when running from a frozen service binary."""
+    if sys.platform != "win32" and sys.argv[1:2] == ["--_isolated-exec"]:
+        from .linux import exec_isolated_game
+
+        exec_isolated_game(sys.argv[2:])
 
 
 def check_argv(argv: Sequence[str]) -> list[str]:
