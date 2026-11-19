@@ -96,7 +96,9 @@ class Farm:
 
     @contextmanager
     def service(self, *, runner=SERVICE, **policy):
-        timing = dict(heartbeat_interval=0.15, startup_grace=3.0, backoff_base=0.05,
+        # Stale after heartbeat_interval x 3: keep that above Windows' up-to-1 s
+        # read_shared retry on a status file being replaced (0.15 s flaked there).
+        timing = dict(heartbeat_interval=0.5, startup_grace=3.0, backoff_base=0.05,
                       backoff_max=0.2, max_failures=3, failure_window=60.0,
                       kill_grace=0.5, stop_grace=0.85) | policy
         command = [*self.prefix, *runner]
