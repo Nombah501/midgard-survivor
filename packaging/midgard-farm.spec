@@ -4,6 +4,9 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 scripts = Path(SPECPATH)
+sys.path.insert(0, str(scripts))
+from qt_bundle import keep_qt_file
+
 windows = sys.platform == "win32"
 other_platform = "linux" if windows else "windows"
 excludes = [f"midgard_farm.platform.{other_platform}"]
@@ -20,6 +23,10 @@ window = Analysis(
     hiddenimports=["PySide6.QtQuick"],  # QtQml's hook collects the QtQuick QML modules and Fusion.
     excludes=excludes,
 )
+
+# The QtQml hook discovers every shipped QML module, not just the app's imports.
+window.binaries = [entry for entry in window.binaries if keep_qt_file(entry[0])]
+window.datas = [entry for entry in window.datas if keep_qt_file(entry[0])]
 
 # Two bootloaders preserve the service's direct task/unit command and keep Qt out
 # of its runtime. COLLECT shares their external files in a single directory.

@@ -12,6 +12,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 from midgard_farm.core.farmer_patch import farmer_hash
+from qt_bundle import keep_qt_file
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -49,7 +50,28 @@ def check_registration(executable: Path, definition: str, env: dict[str, str], h
         assert f'ExecStart="{escaped}"' in definition.splitlines(), definition
 
 
+def check_qt_files(onedir: Path) -> float:
+    internal = onedir / "_internal"
+    rejected = []
+    size = 0
+    platforms = set()
+    for path in onedir.rglob("*"):
+        if not path.is_file():
+            continue
+        if not path.is_symlink():
+            size += path.stat().st_size
+        if path.is_relative_to(internal) and not keep_qt_file(path.relative_to(internal).as_posix()):
+            rejected.append(path.relative_to(onedir))
+        if path.parent.name == "platforms":
+            platforms.add(path.stem.removeprefix("lib"))
+    assert not rejected, f"Unexpected Qt modules or plugins: {sorted(rejected)}"
+    required = {"qoffscreen", "qwindows"} if os.name == "nt" else {"qoffscreen", "qxcb", "qwayland"}
+    assert required <= platforms, f"Missing desktop platform plugins: {required - platforms}"
+    return size / 2**20
+
+
 def check(onedir: Path) -> None:
+    size_mib = check_qt_files(onedir)
     checkout = _ROOT / "farmer"
     version = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     presets = sorted(checkout.glob("presets/*.json"))
@@ -94,10 +116,20 @@ def check(onedir: Path) -> None:
         assert window["version"] == version, window
         assert window["presets"] == [path.name for path in presets], window
         assert expected_characters <= set(window["characters"]), window
-    print(f"{version}: service, registration command and offscreen QML passed; Farmer hash {expected_hash}")
+    print(f"{version}: {size_mib:.1f} MiB onedir; service, registration command and offscreen QML passed; "
+          f"Farmer hash {expected_hash}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("onedir", type=Path)
-    check(parser.parse_args().onedir.resolve(strict=True))
+    parser.add_argument("bundle", type=Path, help="onedir or release archive")
+    bundle = parser.parse_args().bundle.resolve(strict=True)
+    if bundle.is_dir():
+        check(bundle)
+    else:
+        with tempfile.TemporaryDirectory(prefix="midgard farm extracted ") as directory:
+            shutil.unpack_archive(bundle, directory, filter="data" if bundle.name.endswith(".tar.gz") else None)
+            root = Path(directory)
+            onedir = root / "midgard-farm"
+            assert list(root.iterdir()) == [onedir] and onedir.is_dir(), "Archive must contain only midgard-farm/"
+            check(onedir)

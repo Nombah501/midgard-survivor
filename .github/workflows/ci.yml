@@ -42,6 +42,9 @@ jobs:
 
   package:
     needs: test
+    outputs:
+      # Both runners classify the same installed package version.
+      prerelease: ${{ steps.archive.outputs.prerelease }}
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
@@ -65,21 +68,27 @@ jobs:
         run: python -m pip install ".[freeze]"
       - name: Build the shared onedir
         run: python -m PyInstaller --noconfirm --clean packaging/midgard-farm.spec
-      - name: Smoke-test both roles with no Python on PATH
-        run: python packaging/check_onedir.py dist/midgard-farm
       - name: Check the tag and archive the onedir
+        id: archive
         shell: bash
         run: python packaging/archive_release.py dist/midgard-farm release-assets "$GITHUB_REF_NAME"
+      - name: Smoke-test both extracted roles with no Python on PATH
+        env:
+          RELEASE_ARCHIVE: ${{ steps.archive.outputs.archive }}
+        shell: bash
+        run: python packaging/check_onedir.py "release-assets/$RELEASE_ARCHIVE"
       - uses: actions/upload-artifact@v4
         with:
           name: midgard-farm-${{ runner.os }}
           path: release-assets/
           if-no-files-found: error
+          overwrite: true
           compression-level: 0
 
   release:
     needs: package
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    concurrency: release-${{ github.ref }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -93,6 +102,7 @@ jobs:
         working-directory: release-assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ needs.package.outputs.prerelease }}
         shell: bash
         run: |
           base="midgard-farm-${GITHUB_REF_NAME#v}"
@@ -100,5 +110,15 @@ jobs:
           windows="$base-windows-x86_64.zip"
           sha256sum --check "$linux.sha256" "$windows.sha256"
           test "$(gh repo view "$GITHUB_REPOSITORY" --json isPrivate --jq .isPrivate)" = true
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
-            "$linux" "$linux.sha256" "$windows" "$windows.sha256"
+          test "$PRERELEASE" = true || test "$PRERELEASE" = false
+          assets=("$linux" "$linux.sha256" "$windows" "$windows.sha256")
+          if flags=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | join(" ")'); then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+            if [ "$flags" != "false $PRERELEASE" ]; then
+              gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease="$PRERELEASE"
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              --prerelease="$PRERELEASE" "${assets[@]}"
+          fi

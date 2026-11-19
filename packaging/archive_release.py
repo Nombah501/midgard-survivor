@@ -1,4 +1,11 @@
-"""Archive the tested onedir for its runner OS and write a sha256 sidecar."""
+"""Build the release assets for the current OS.
+
+Tag v<version> must match the installed package version. PEP 440 prerelease
+or development versions are GitHub prereleases. Assets are
+midgard-farm-<version>-linux-x86_64.tar.gz and
+midgard-farm-<version>-windows-x86_64.zip, each with a top-level midgard-farm/
+and an <archive>.sha256 sidecar in sha256sum format.
+"""
 
 import argparse
 import hashlib
@@ -7,6 +14,8 @@ import platform
 import shutil
 import tarfile
 from pathlib import Path
+
+from packaging.version import Version
 
 from midgard_farm.assets import version
 
@@ -17,6 +26,8 @@ def archive_release(onedir: Path, output: Path, tag: str) -> None:
         raise SystemExit(f"Release tag {tag!r} does not match package version {app_version}; expected v{app_version}")
     if platform.machine().lower() not in {"amd64", "x86_64"}:
         raise SystemExit(f"Release archives require x86_64, got {platform.machine()}")
+    if onedir.name != "midgard-farm":
+        raise SystemExit("The onedir must be named midgard-farm")
     output.mkdir(parents=True, exist_ok=True)
     base = f"midgard-farm-{app_version}"
     if os.name == "nt":
@@ -30,7 +41,11 @@ def archive_release(onedir: Path, output: Path, tag: str) -> None:
     with archive.open("rb") as file:
         digest = hashlib.file_digest(file, "sha256").hexdigest()
     archive.with_name(archive.name + ".sha256").write_bytes(f"{digest}  {archive.name}\n".encode("ascii"))
-    print(f"{digest}  {archive.name}")
+    print(f"{digest}  {archive.name} ({archive.stat().st_size / 2**20:.1f} MiB)")
+    if github_output := os.environ.get("GITHUB_OUTPUT"):
+        with Path(github_output).open("a", encoding="utf-8", newline="\n") as file:
+            print(f"archive={archive.name}", file=file)
+            print(f"prerelease={str(Version(app_version).is_prerelease).lower()}", file=file)
 
 
 if __name__ == "__main__":
