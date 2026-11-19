@@ -103,7 +103,7 @@ class _Backend(QObject):
 
 
 def load_window(model: SessionModel) -> QQmlApplicationEngine:
-    if sys.platform == "linux" and QQuickStyle.name() != "Fusion":
+    if QQuickStyle.name() != "Fusion":
         QQuickStyle.setStyle("Fusion")
     engine = QQmlApplicationEngine()
     backend = _Backend(model, engine)

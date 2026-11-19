@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -215,6 +216,8 @@ def test_service_start_uses_only_the_platform_service_tool(farm, monkeypatch):
 def qt_app(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     monkeypatch.setenv("QT_QUICK_BACKEND", "software")
+    if os.name == "nt" and not os.environ.get("QT_QPA_FONTDIR"):
+        monkeypatch.setenv("QT_QPA_FONTDIR", str(Path(os.environ["SystemRoot"]) / "Fonts"))
     from PySide6.QtGui import QGuiApplication
 
     return QGuiApplication.instance() or QGuiApplication([])
