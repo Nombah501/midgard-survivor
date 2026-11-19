@@ -17,6 +17,7 @@ const ARMS_PATH := "user://farmer_arms.json"
 const RUNS_PATH := "user://farmer_runs.jsonl"
 const CHECKPOINT_PATH := "user://farmer_session.json"
 const LOG_PATH := "user://farmer.log"
+const COMMAND_PATH := "user://farmer_command"
 const STOP_PATH := "user://farmer_stop"
 const LOCK_PATH := "user://farmer.lock"
 const BUILD_PATH := "user://farmer_build.json"
@@ -79,10 +80,11 @@ var _stall_tries := 0
 var _paused_since_ms := 0
 var _pause_tries := 0
 var _settle_ms := 0
-var _stop_after_settle := false
-var _soft_stop := false
+var _finish_after_run := ""
+var _pause_requested := false
 var _hard_finished := false
 var _lock_pid := 0
+var _test_wait_at_keep := false
 
 var _potential_script = null
 var _vanilla_input_seen := false
@@ -109,6 +111,8 @@ func _ready() -> void:
 	session_id = OS.get_environment("FARMER_SESSION_ID")
 	if session_id == "":
 		session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
+	if session_id.begins_with("verify-"):
+		_test_wait_at_keep = OS.get_environment("FARMER_TEST_WAIT_AT_KEEP") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
 	_mark_transition("boot")
@@ -150,7 +154,12 @@ func _process(_delta: float) -> void:
 		# Scene swapped (loading/end screen). Re-acquire next frame.
 		world = null
 		return
-	_check_stop(now)
+	_check_command(now)
+	if failed or _hard_finished:
+		return
+	_check_limits(now)
+	if failed or _hard_finished:
+		return
 	match phase:
 		"idle":
 			if now >= next_action_ms:
@@ -160,8 +169,11 @@ func _process(_delta: float) -> void:
 		"settle":
 			_tick_settle(now)
 		"keep":
-			_do_keep()
-			phase = "maint"
+			# Sandbox verification can publish abort before optional keep starts.
+			if not _test_wait_at_keep:
+				_do_keep()
+				if not failed and not _hard_finished:
+					phase = "maint"
 		"maint":
 			_do_maintenance()
 			_complete_run(now)
@@ -190,7 +202,7 @@ func _on_world_ready() -> void:
 	# Keep the game from auto-ending the run after the MVP; the farmer decides
 	# at the victory point. This meta has no other effect in 0.2.3.
 	GameData.set_meta("karma_test", true)
-	phase = "idle"
+	phase = "paused" if _pause_requested else "idle"
 	next_action_ms = _now() + 400
 	_log("WORLD_READY map=%s" % str(world.map.map_name))
 	_write_status()
@@ -464,6 +476,7 @@ func _check_settle() -> void:
 		var mode := str(world.menus._mode)
 		if mode == "end":
 			phase = "keep"
+			_write_status()
 			return
 		if mode == "victory":
 			# We expected to settle but a victory choice is still open.
@@ -564,41 +577,64 @@ func _check_watchdog(now: int) -> void:
 			_end_run_safe(false)
 
 
-func _check_stop(now: int) -> void:
-	if _soft_stop:
-		return
-	if FileAccess.file_exists(STOP_PATH):
-		_log("STOP signal")
-		_soft_stop = true
-		_begin_stop()
+func _check_command(now: int) -> void:
+	var command := ""
+	if FileAccess.file_exists(COMMAND_PATH):
+		# Claim by rename before reading; a concurrent publisher can safely
+		# install the next command without it being removed with this one.
+		var path := ProjectSettings.globalize_path(COMMAND_PATH)
+		var claimed := path + ".claimed"
+		if DirAccess.rename_absolute(path, claimed) == OK:
+			command = FileAccess.get_file_as_string(claimed).strip_edges()
+			DirAccess.remove_absolute(claimed)
+	if FileAccess.file_exists(STOP_PATH) and DirAccess.remove_absolute(ProjectSettings.globalize_path(STOP_PATH)) == OK:
+		if command != "abort":
+			command = "finish"
+	match command:
+		"finish":
+			_request_finish("finish")
+		"abort":
+			# Native settlement can finish between farmer ticks.
+			if phase == "run" and str(menus._mode) == "end":
+				_begin_settle(now)
+			elif phase == "settle" and str(menus._mode) == "end":
+				_check_settle()
+			_finish("abort")
+		"pause", "resume":
+			_pause_requested = command == "pause"
+			if phase == "idle" or phase == "paused":
+				phase = "paused" if _pause_requested else "idle"
+				_mark_transition(command)
+				_write_status()
+		"":
+			pass
+		_:
+			_log("COMMAND ignored: " + command)
+
+
+func _check_limits(now: int) -> void:
+	if _finish_after_run != "":
 		return
 	var max_minutes := float(cfg.get("max_minutes", 0.0))
 	if max_minutes > 0.0 and now - boot_ms >= int(max_minutes * 60000.0):
 		_log("STOP max_minutes")
-		_soft_stop = true
-		_begin_stop()
-		return
-	if int(cfg.get("max_runs", 0)) > 0 and runs_done >= int(cfg.get("max_runs", 0)):
+		_request_finish("stop")
+	elif int(cfg.get("max_runs", 0)) > 0 and runs_done >= int(cfg.get("max_runs", 0)):
 		_log("STOP max_runs")
-		_soft_stop = true
-		_begin_stop()
-		return
-	if int(cfg.get("stop_after_wins", 0)) > 0 and wins >= int(cfg.get("stop_after_wins", 0)):
+		_request_finish("stop")
+	elif int(cfg.get("stop_after_wins", 0)) > 0 and wins >= int(cfg.get("stop_after_wins", 0)):
 		_log("STOP stop_after_wins")
-		_soft_stop = true
-		_begin_stop()
-		return
+		_request_finish("stop")
 
 
-func _begin_stop() -> void:
-	if phase == "run" and world != null and is_instance_valid(world) and world.running:
-		_stop_after_settle = true
+func _request_finish(reason: String) -> void:
+	_finish_after_run = reason
+	if phase == "run" and world.running:
 		run_state["forced"] = true
-		run_state["force_reason"] = "stop"
+		run_state["force_reason"] = reason
 		_end_run_safe(false)
-		return
-	if phase == "idle" or phase == "done":
-		_finish("stop")
+	elif phase == "idle" or phase == "paused":
+		_finish(reason)
 
 
 func _results_forced(reason: String, now: int) -> void:
@@ -2128,20 +2164,27 @@ func _total_card_copies() -> int:
 	return n
 
 
-func _complete_run(now: int) -> void:
+func _record_run() -> bool:
 	_mark_transition("run_complete")
 	var r := _build_result()
-	# Refresh after maintenance: totals now hold maintenance effects (claimed
-	# achievement coins) and the result is exactly what the journal gets.
 	if not _write_checkpoint("settled", r):
-		return
+		return false
 	if not _account_run(r, true):
-		return
+		return false
 	_test_crash("journaled")
 	if not _write_checkpoint("idle"):
-		return
-	_write_status()
+		return false
 	_log("END " + JSON.stringify(r))
+	return true
+
+
+func _complete_run(now: int) -> void:
+	# Refresh the pending result after maintenance before it goes to the journal.
+	if not _record_run():
+		return
+	if _finish_after_run == "finish":
+		_finish("finish")
+		return
 	if int(cfg.get("max_runs", 0)) > 0 and runs_done >= int(cfg.get("max_runs", 0)):
 		_finish("max_runs")
 		return
@@ -2151,11 +2194,14 @@ func _complete_run(now: int) -> void:
 	if _goal_done() and bool(cfg.get("goal_stop", false)):
 		_finish("goal")
 		return
-	if _stop_after_settle or _soft_stop:
-		_finish("stop")
+	if _finish_after_run != "":
+		_finish(_finish_after_run)
 		return
 	next_action_ms = now + int(float(cfg.get("restart_seconds", 1.0)) * 1000.0)
-	phase = "idle"
+	phase = "paused" if _pause_requested else "idle"
+	if phase == "paused":
+		_mark_transition("paused")
+	_write_status()
 
 
 # Adds one settled run to the session totals. append_log=false is the
@@ -2284,7 +2330,7 @@ func _journal_has(run_id: String) -> bool:
 
 # Test-only seam used by verify.sh; never set in a real session.
 func _test_crash(point: String) -> void:
-	if OS.get_environment("FARMER_TEST_CRASH_AT") == point:
+	if session_id.begins_with("verify-") and OS.get_environment("FARMER_TEST_CRASH_AT") == point:
 		_log("TEST_CRASH " + point)
 		OS.kill(OS.get_process_id())
 
@@ -2646,7 +2692,7 @@ func _profile_fingerprint() -> String:
 
 func _flush_profile_verified() -> bool:
 	# Test-only seam used by verify.sh; never set in a real session.
-	if OS.get_environment("FARMER_TEST_FLUSH_FAIL") == "1":
+	if session_id.begins_with("verify-") and OS.get_environment("FARMER_TEST_FLUSH_FAIL") == "1":
 		return false
 	var before := _profile_fingerprint()
 	# Force a content change so a successful write must alter the fingerprint.
@@ -2727,11 +2773,22 @@ func _finish(reason: String) -> void:
 		return
 	finish_reason = reason
 	exit_code = 0
-	_mark_transition("finish:" + reason)
-	_log("FINISH %s runs=%d wins=%d losses=%d zeny=%d" % [reason, runs_done, wins, losses, total_zeny])
 	if not _flush_profile_verified():
 		_fail_session("flush_failed", false)
 		return
+	if reason == "abort":
+		if phase == "keep":
+			run_state["settled"] = _reward_snapshot()
+		if runs_started > runs_done + runs_lost and run_state.has("settled"):
+			# Journal what was already banked, including any keep already done.
+			if not _record_run():
+				return
+		elif phase == "run" or phase == "settle":
+			runs_lost += 1
+			if not _write_checkpoint("idle"):
+				return
+	_mark_transition("finish:" + reason)
+	_log("FINISH %s runs=%d wins=%d losses=%d zeny=%d" % [reason, runs_done, wins, losses, total_zeny])
 	phase = "done"
 	_write_status()
 	_release_lock()

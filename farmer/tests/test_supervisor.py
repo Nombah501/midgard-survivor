@@ -6,6 +6,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ FAST = Policy(
     max_failures=3,
     failure_window=60.0,
     kill_grace=1.0,
+    stop_grace=1.0,
 )
 
 
@@ -62,6 +64,90 @@ def test_goal_finish_notifies_goal(farm):
 
     assert sup.run().reason == "goal"
     assert sent == ["goal"]
+
+
+def wait_status(path, predicate):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            status = json.loads(path.read_text())
+        except FileNotFoundError:
+            time.sleep(0.01)
+            continue
+        if predicate(status):
+            return status
+        time.sleep(0.01)
+    pytest.fail(f"expected status not observed at {path}")
+
+
+def send_command(path, command):
+    temp = path.with_name("farmer_command.tmp")
+    temp.write_text(command + "\n")
+    temp.replace(path.with_name("farmer_command"))
+
+
+@pytest.mark.parametrize("command", ["finish", "abort"])
+def test_operator_terminal_command_notifies_stop_without_restart(farm, command):
+    sup, sent, _ = farm("commands", "crash")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(sup.run)
+        try:
+            wait_status(sup.status_path, lambda d: d["phase"] == "run")
+            send_command(sup.status_path, command)
+            result = future.result(timeout=3)
+        finally:
+            sup.request_stop()
+    assert (result.kind, result.reason) == ("finished", command)
+    assert len(result.attempts) == 1
+    assert sent == ["stop"]
+
+
+def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm):
+    sup, sent, _ = farm("commands", "crash")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(sup.run)
+        try:
+            running = wait_status(sup.status_path, lambda d: d["phase"] == "run")
+            send_command(sup.status_path, "pause")
+            paused = wait_status(sup.status_path, lambda d: d["phase"] == "paused")
+            wait_status(sup.status_path, lambda d: (
+                d["phase"] == "paused" and d["heartbeat_seq"] >= paused["heartbeat_seq"] + 8
+            ))
+            send_command(sup.status_path, "resume")
+            resumed = wait_status(sup.status_path, lambda d: d["phase"] == "run")
+            send_command(sup.status_path, "finish")
+            result = future.result(timeout=3)
+        finally:
+            sup.request_stop()
+    assert running["pid"] == paused["pid"] == resumed["pid"]
+    assert (result.kind, result.reason) == ("finished", "finish")
+    assert len(result.attempts) == 1
+    assert sent == ["stop"]
+
+
+@pytest.mark.parametrize("step", ["commands", "commands:preboot", "commands:no-exit"])
+def test_supervisor_stop_requests_finish_before_signalling_child(farm, step):
+    policy = dataclasses.replace(FAST, kill_grace=0.2)
+    sup, sent, plan = farm(step, "crash", policy=policy)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(sup.run)
+        try:
+            if step == "commands:preboot":
+                deadline = time.monotonic() + 3
+                while not plan.with_suffix(".preboot").exists():
+                    assert time.monotonic() < deadline, "child never reached pre-boot"
+                    time.sleep(0.01)
+                assert not sup.status_path.exists()
+            else:
+                wait_status(sup.status_path, lambda d: d["phase"] == "run")
+            sup.request_stop()
+            result = future.result(timeout=3)
+        finally:
+            sup.request_stop()
+    expected = ("stopped", "no_exit_after_terminal") if step.endswith("no-exit") else ("finished", "finish")
+    assert (result.kind, result.reason) == expected
+    assert len(result.attempts) == 1
+    assert sent == ["stop"]
 
 
 def test_crash_restarts_with_exponential_backoff(farm):
@@ -166,13 +252,16 @@ def test_fatal_preflight_or_config_quarantines_without_retry(farm, step, reason)
 
 
 def test_operator_stop_kills_the_group_and_does_not_restart(farm):
-    sup, sent, plan = farm("hang")
+    policy = dataclasses.replace(FAST, stale_intervals=30)
+    sup, sent, plan = farm("hang", policy=policy)
     threading.Timer(0.5, sup.request_stop).start()
 
     result = sup.run()
 
     assert result.kind == "stopped"
+    assert result.reason == "operator_timeout"
     assert len(result.attempts) == 1
+    assert result.attempts[0].exit_code == -9
     grandchild = int(plan.with_suffix(".grandchild").read_text())
     assert not _alive(grandchild)
     assert sent == ["stop"]

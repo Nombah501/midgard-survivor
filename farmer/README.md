@@ -24,11 +24,8 @@ cd /home/n501/orca/projects/midgard-survivor/farmer
 ./run.sh presets/steady.json    # бесконечный авто-фарм
 ```
 
-Остановка:
-
-```bash
-touch "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer_stop"
-```
+Команды `finish`, `abort`, `pause`, `resume` описаны в
+[управлении сессией](#управление-сессией).
 
 Статус и лог:
 
@@ -61,13 +58,14 @@ Supervisor запускает `run.sh` в отдельной группе про
 | exit 0 и `phase=done` | конец сессии, уведомление `stop`/`goal` |
 | crash, выход без терминального статуса, heartbeat не менялся 3×5 с | kill всей группы, уведомление `fail`, рестарт через 15 с × 2ⁿ (до 10 мин) |
 | 4 сбоя за час, exit 78, `cfg_invalid` | quarantine: без рестарта, уведомление, exit 2 |
-| SIGTERM/SIGINT | SIGTERM группе, через 20 с SIGKILL, уведомление `stop`, exit 0 |
+| SIGTERM/SIGINT | запрос `finish` даже при загрузке; до 45 с на весь выход и до 20 с после терминального статуса, затем SIGKILL всей группе, без рестарта |
 
 Все рестарты одного supervisor'а — одна AFK-сессия: он передаёт фермеру
 `FARMER_SESSION_ID`, и фермер продолжает `farmer_session.json` (checkpoint):
 totals, счётчики, `run_id`, цель, pre-run snapshot. Checkpoint пишется
-атомарно на границах `run` (забег начат), `settled` (профиль записан после
-keep, результат готов) и `idle` (результат в журнале). При старте:
+атомарно на границах `run` (забег начат), `settled` (профиль записан и
+результат готов; обычно после keep, при `abort` — только settlement) и
+`idle` (завершённый run учтён). При старте:
 `run` → забег потерян (`totals.lost`, ADR 0001), `settled` → результат
 засчитывается один раз; в `farmer_runs.jsonl` он дописывается, только если
 его `run_id` там ещё нет. Разовый запуск без `FARMER_SESSION_ID` (GUI,
@@ -85,6 +83,67 @@ systemd держит только сам supervisor: `Restart=on-failure`,
 рестартов в час. `systemctl --user enable` включает автозапуск при входе.
 Тесты на фейковом child, без игры: `python3 -m pytest farmer/tests`.
 
+### Управление сессией
+
+Команды работают и в AFK-сессии, и при разовом запуске. Отправляйте их
+активному фермеру по одной: `farmer_command` — один запрос, не очередь.
+Пишите во временный файл в том же каталоге, затем переименуйте его:
+
+```bash
+data="${XDG_DATA_HOME:-$HOME/.local/share}/godot/app_userdata/Midgard Survivors"
+cmd=pause  # finish | abort | pause | resume
+tmp="$(mktemp "$data/.farmer-command.XXXXXX")" &&
+  printf '%s\n' "$cmd" > "$tmp" &&
+  mv -f -- "$tmp" "$data/farmer_command"
+```
+
+| Команда | Что происходит |
+| --- | --- |
+| `finish` | Если run ещё идёт, передаёт его игре на settlement, затем выполняет keep и maintenance. Выход с `finish_reason=finish`. |
+| `abort` | Выход с `finish_reason=abort` без новых keep или maintenance. Если settlement ещё не произошло, run помечается потерянным; если произошло — учитывается один раз, без повторного settlement. |
+| `pause` | Текущий run продолжается до settlement, keep и maintenance. Новые run не стартуют; `phase=paused` и heartbeat продолжают обновляться. |
+| `resume` | Снимает pause без перезапуска процесса. |
+
+`touch "$data/farmer_stop"` и кнопка GUI — алиасы `finish`, тоже
+с `finish_reason=finish`. Из `paused` команды `finish` и `abort` не запускают
+run. Pause действует в текущем процессе; она не отменяет лимиты сессии.
+`finish` и `abort` штатны только после подтверждённого flush профиля:
+supervisor уведомляет `stop` и не перезапускает фермера.
+
+Для штатного `systemctl --user stop` обновите ранее сгенерированный unit
+через `--print-unit` и `systemctl --user daemon-reload`: `KillMode=mixed`
+оставляет фермеру время на подтверждённый flush, `TimeoutStopSec=90`
+покрывает ожидание и отправку уведомлений.
+
+### Сетевая изоляция и known-good backup
+
+Непустой `FARMER_SESSION_ID` включает сетевую изоляцию для процесса игры:
+`run.sh` запускает его через `unshare -cn` в отдельном network namespace
+без внешних интерфейсов и маршрутов. Cloud sync недоступен даже при
+`offline:false`; при необходимости синхронизируйте профиль вручную между
+AFK-сессиями. Supervisor остаётся в обычной сети и может отправлять ntfy.
+Для `unshare -c` нужен util-linux 2.38 или новее. Если `unshare` недоступен
+или Linux запрещает создать user/network namespace, игра не запускается:
+код 78 ведёт к карантину.
+Разовый запуск из GUI или `run.sh` без `FARMER_SESSION_ID` не меняет сеть.
+
+Known-good backup обновляется только после чистого финиша AFK-сессии с
+причиной `finish`, `stop`, `max_runs`, `wins`, `goal` или `no_target`.
+`abort`, `lost_world` и другие причины не заменяют существующий снимок.
+`run.sh` выполняет побайтовую проверку копирования: `profile.json` и
+присутствующие сопутствующие файлы должны быть непустыми, а SHA-256
+файлов, скопированных из снимка во временный `user://`, — совпадать с
+исходными. Это не проверка загрузки профиля игрой. Только после неё новый
+снимок атомарно публикуется в `farmer/backups/known-good/` с `SHA256SUMS`;
+обновление использует GNU `mv --exchange` на поддерживающей обмен файловой
+системе. При ошибке проверки копирования или публикации `run.sh`
+предупреждает и оставляет прежний known-good backup. Рестарты после сбоя
+обновляют только обычные снимки; до первого подходящего финиша known-good
+backup может отсутствовать.
+
+Для sandbox-запуска `FARMER_BACKUP_DIR` задаёт отдельный каталог для снимков
+`install.sh` и `run.sh`, чтобы не затрагивать снимки основного профиля.
+
 ## Проверка
 
 ```bash
@@ -92,6 +151,7 @@ systemd держит только сам supervisor: `Restart=on-failure`,
 ./tools/verify.sh --one-run      # быстрый smoke в sandbox
 ./tools/verify.sh                # все сценарии, у каждого свой timeout
 ./tools/verify.sh --crash-settled  # падение после settlement + рестарт сессии
+./tools/verify.sh --cmd-abort-settled --cmd-pause-resume
 ```
 
 `verify.sh` читает реальный `user://`, но запускает игру на копии профиля в
@@ -101,6 +161,9 @@ systemd держит только сам supervisor: `Restart=on-failure`,
 таймаут — FAIL. `--crash-run|--crash-settled|--crash-journaled` убивают фермера
 на границе checkpoint (`FARMER_TEST_CRASH_AT`), перезапускают ту же сессию и
 проверяют, что totals совпадают с журналом и каждый `run_id` в нём один раз.
+Сценарии `--cmd-*` отправляют запросы в sandbox: проверяют терминальную
+причину, журнал при `abort` до и после settlement, heartbeat во время pause
+и `resume` с тем же PID.
 
 ## GUI
 
@@ -233,9 +296,9 @@ AFK-цикл: забег идёт до смерти/победы (на SinX D25 
 
 ## Безопасность
 
-- `install.sh`/`run.sh` делают уникальные бэкапы `profile.json`,
-  `profile.bak.json`, `profile.run` в `farmer/backups/` (10 последних +
-  `official-state.json`).
+- `install.sh`/`run.sh` сохраняют снимки профиля и сопутствующих файлов.
+  `run.sh` хранит 10 последних обычных снимков в `farmer/backups/`; ротация
+  не затрагивает `official-state.json` и `known-good/`.
 - `run.sh` держит `flock`, проверяет отсутствие второго процесса игры, сверяет
   SHA официального патча и собранного фермера.
 - Фермер держит `user://farmer.lock`, пишет статус атомарно, а при

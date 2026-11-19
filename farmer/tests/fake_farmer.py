@@ -7,6 +7,7 @@ PLAN_FILE holds one behaviour per line; attempt N plays line N (the last line
 repeats). The attempt counter lives next to the plan file. Behaviours:
 
   clean:<reason>   heartbeat, write phase=done, exit 0
+  commands         read operator commands and keep heartbeats while paused
   fail:<reason>    heartbeat, write phase=failed, exit 1
   crash            heartbeat, exit 1 without a terminal status
   hang             heartbeat once, spawn a grandchild, then stop beating
@@ -55,6 +56,12 @@ def beat(times=3):
 
 if kind == "exit":
     sys.exit(int(arg))
+stop_path = status_path.with_name("farmer_stop")
+if kind == "commands" and arg == "preboot":
+    plan_path.with_suffix(".preboot").touch()
+    while not stop_path.exists():
+        time.sleep(0.01)
+    stop_path.unlink()  # the launcher clears the legacy alias before boot
 beat()
 if kind == "clean":
     write("done", reason=arg)
@@ -69,4 +76,28 @@ if kind == "hang":
     plan_path.with_suffix(".grandchild").write_text(str(child.pid))
     while True:
         time.sleep(1)
+if kind == "commands":
+    phase = "run"
+    command_path = status_path.with_name("farmer_command")
+    while True:
+        command = ""
+        if command_path.exists():
+            command = command_path.read_text().strip()
+            command_path.unlink()
+        if stop_path.exists():
+            stop_path.unlink()
+            if command != "abort":
+                command = "finish"
+        if command in ("finish", "abort"):
+            write("done", reason=command)
+            if arg == "no-exit":
+                while True:
+                    time.sleep(1)
+            sys.exit(0)
+        if command == "pause":
+            phase = "paused"
+        elif command == "resume":
+            phase = "run"
+        write(phase)
+        time.sleep(0.05)
 sys.exit(f"unknown plan step: {step}")

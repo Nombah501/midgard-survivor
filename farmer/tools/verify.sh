@@ -6,12 +6,16 @@
 # a timeout, a non-zero exit, a missing status, or a failed assertion is FAIL.
 #
 # Usage: ./tools/verify.sh [--one-run] [--stop] [--endless] [--flush-fail]
-#                          [--crash-run] [--crash-settled] [--crash-journaled] [--all] [--keep]
+#                          [--crash-run] [--crash-settled] [--crash-journaled]
+#                          [--cmd-finish] [--cmd-abort] [--cmd-abort-settled]
+#                          [--cmd-pause-resume] [--cmd-legacy] [--all] [--keep]
 # Default: --all.
 #
 # --crash-* kill the farmer at one checkpoint boundary (run start, after
 # settlement, after the journal write), relaunch the same session and assert
 # that totals and the journal hold every settled run exactly once.
+#
+# --cmd-* publish commands inside the sandbox and check heartbeat and accounting.
 #
 # Artifacts: farmer/logs/verify-<stamp>/{summary.json,*.log,*.status.json}
 set -euo pipefail
@@ -25,14 +29,17 @@ PCK="$FARMER_DIR/patch_farmer.pck"
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"
 OUT_DIR="$FARMER_DIR/logs/verify-$STAMP"
 SB="${VERIFY_SANDBOX:-$REPO_DIR/.sandbox/verify-$STAMP}"
+export FARMER_BACKUP_DIR="$SB/backups"
 SB_DATA="$SB/godot/app_userdata/Midgard Survivors"
 SNAP="$SB/snapshot"
 KEEP=0
 FAILED=0
 SCENARIOS=()
+ALL_SCENARIOS=(one-run stop endless flush-fail crash-run crash-settled crash-journaled
+	cmd-finish cmd-abort cmd-abort-settled cmd-pause-resume cmd-legacy)
 
 usage() {
-	sed -n '2,14p' "$0"
+	sed -n '2,18p' "$0"
 }
 
 die() {
@@ -50,14 +57,16 @@ for arg in "$@"; do
 		--crash-run) SCENARIOS+=(crash-run) ;;
 		--crash-settled) SCENARIOS+=(crash-settled) ;;
 		--crash-journaled) SCENARIOS+=(crash-journaled) ;;
-		--all) SCENARIOS=(one-run stop endless flush-fail crash-run crash-settled crash-journaled) ;;
+		--cmd-finish|--cmd-abort|--cmd-abort-settled|--cmd-pause-resume|--cmd-legacy)
+			SCENARIOS+=("${arg#--}") ;;
+		--all) SCENARIOS=("${ALL_SCENARIOS[@]}") ;;
 		--keep) KEEP=1 ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown argument: $arg" ;;
 	esac
 done
 if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
-	SCENARIOS=(one-run stop endless flush-fail crash-run crash-settled crash-journaled)
+	SCENARIOS=("${ALL_SCENARIOS[@]}")
 fi
 
 [[ -x "$GAME_DIR/MidgardSurvivors.x86_64" ]] || die "game not found at $GAME_DIR"
@@ -140,12 +149,15 @@ reset_profile() {
 		fi
 	done
 	rm -f \
+		"$SB_DATA/farmer_command" \
+		"$SB_DATA/farmer_command.claimed" \
 		"$SB_DATA/farmer_stop" \
 		"$SB_DATA/farmer_status.json" \
 		"$SB_DATA/farmer.cfg" \
 		"$SB_DATA/farmer.log" \
 		"$SB_DATA/farmer.log.prev" \
 		"$SB_DATA/farmer.run.lock" \
+		"$SB_DATA/farmer_runs.jsonl" \
 		"$SB_DATA/farmer_session.json"
 }
 
@@ -175,7 +187,8 @@ need(str(d.get("finish_reason") or "") != "", "finish_reason empty")
 need(str(d.get("last_transition") or "") != "", "last_transition empty")
 need(int(d.get("heartbeat_seq") or 0) > 0, "heartbeat_seq == 0")
 need(str(d.get("run_id") or "") != "", "run_id empty")
-need(int(tot.get("runs") or 0) >= 1, "runs == 0")
+if name != "cmd-abort":
+    need(int(tot.get("runs") or 0) >= 1, "runs == 0")
 if name == "one-run":
     need(int(tot.get("wins") or 0) >= 1, "wins == 0")
     need(bool(last.get("victory")), "last.victory false")
@@ -221,6 +234,112 @@ need(str(d.get("last_transition") or "") != "", "last_transition empty")
 
 print("; ".join(err))
 sys.exit(1 if err else 0)
+PY
+}
+
+drive_command() {
+	local name="$1"
+	shift
+	python3 - "$SB_DATA" "$name" "$@" <<'PY'
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+data = Path(sys.argv[1])
+name = sys.argv[2]
+proc = subprocess.Popen(sys.argv[3:])
+status_path = data / "farmer_status.json"
+
+
+def wait_status(phase, predicate=lambda _: True):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and proc.poll() is None:
+        try:
+            state = json.loads(status_path.read_text())
+        except FileNotFoundError:
+            pass
+        else:
+            if state["phase"] == phase and predicate(state):
+                return state
+            if state["terminal"]:
+                break
+        time.sleep(0.01)
+    raise AssertionError(f"{name}: expected phase {phase!r} was not observed")
+
+
+def publish(command):
+    temp = data / "verify-command.tmp"
+    temp.write_text(command + "\n")
+    temp.replace(data / "farmer_command")
+
+
+try:
+    running = wait_status("run")
+    if name == "cmd-abort-settled":
+        settled = wait_status("keep")
+        assert settled["run_id"] == running["run_id"]
+        publish("abort")
+    elif name == "cmd-pause-resume":
+        publish("pause")
+        paused = wait_status("paused")
+        assert not paused["terminal"] and paused["totals"]["runs"] == 1
+        assert paused["run_id"] == running["run_id"]
+        still_paused = wait_status("paused", lambda d: d["heartbeat_seq"] > paused["heartbeat_seq"])
+        assert still_paused["totals"]["started"] == 1
+        publish("resume")
+        resumed = wait_status("run", lambda d: d["run_id"] != running["run_id"])
+        assert resumed["pid"] == still_paused["pid"] == running["pid"]
+        print(f"paused heartbeat {paused['heartbeat_seq']} -> {still_paused['heartbeat_seq']}; "
+              f"resumed in pid {resumed['pid']}", flush=True)
+    elif name == "cmd-legacy":
+        (data / "farmer_stop").touch()
+    else:
+        publish(name.removeprefix("cmd-"))
+except AssertionError as error:
+    print(error, file=sys.stderr, flush=True)
+    proc.wait()  # the surrounding timeout still bounds the launcher
+    sys.exit(1)
+sys.exit(proc.wait())
+PY
+}
+
+assert_command_status() {
+	local status="$1" name="$2" farmer_log="$3"
+	python3 - "$status" "$name" "$farmer_log" "$SB_DATA" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+status, name, log, data = sys.argv[1:]
+data = Path(data)
+d = json.loads(Path(status).read_text())
+log = Path(log).read_text()
+checkpoint = json.loads((data / "farmer_session.json").read_text())
+journal = data / "farmer_runs.jsonl"
+rows = [json.loads(line) for line in journal.read_text().splitlines()] if journal.exists() else []
+rows = [r for r in rows if r["session"] == d["session"]]
+abort = name.startswith("cmd-abort")
+paused = name == "cmd-pause-resume"
+started = 2 if paused else 1
+lost = int(name == "cmd-abort")
+assert d["finish_reason"] == ("abort" if abort else "max_runs" if paused else "finish"), d
+assert d["exit_code"] == 0
+assert checkpoint["phase"] == "idle" and checkpoint["session"] == d["session"]
+assert checkpoint["totals"] == d["totals"]
+assert (d["totals"]["started"], d["totals"]["runs"], d["totals"]["lost"]) == (started, started - lost, lost)
+assert [r["run_id"] for r in rows] == [f"{d['session']}-r{i}" for i in range(1, started - lost + 1)]
+assert d["totals"]["zeny"] == sum(r["zeny_gain"] for r in rows)
+assert all(not (data / f).exists() for f in ("farmer_command", "farmer_command.claimed", "farmer_stop"))
+assert log.count(" SETTLE ") == started - lost
+if abort:
+    assert " KEEP_DONE " not in log and " MAINT " not in log
+    assert all(not r["kept"] for r in rows)
+else:
+    assert log.count(" KEEP_DONE ") == log.count(" MAINT ") == started
+    reason = "run_timeout" if paused else "finish"
+    assert all(r["force_reason"] == reason for r in rows)
 PY
 }
 
@@ -278,11 +397,18 @@ run_scenario() {
 	echo "=== $name (timeout ${timeout_s}s) ==="
 	set +e
 	local env_args=("XDG_DATA_HOME=$SB" "GAME_DIR=$GAME_DIR")
+	if [[ "$name" == cmd-* || "$name" == flush-fail ]]; then
+		env_args+=("FARMER_SESSION_ID=verify-$name-$STAMP")
+	fi
 	if [[ -n "$extra_env" ]]; then
 		env_args+=("$extra_env")
 	fi
-	env "${env_args[@]}" timeout --foreground -k 15 "$timeout_s" \
-		"$FARMER_DIR/run.sh" "$cfg" >"$run_log" 2>&1
+	local launch=(env "${env_args[@]}" timeout --foreground -k 15 "$timeout_s" "$FARMER_DIR/run.sh" "$cfg")
+	if [[ "$name" == cmd-* ]]; then
+		drive_command "$name" "${launch[@]}" >"$run_log" 2>&1
+	else
+		"${launch[@]}" >"$run_log" 2>&1
+	fi
 	rc=$?
 	set -e
 
@@ -318,6 +444,9 @@ run_scenario() {
 			reason="no farmer.log"
 		elif ! grep -Fq -- "$marker" "$farmer_log"; then
 			reason="missing log marker: $marker"
+		elif [[ "$name" == cmd-* ]] && ! assert_command_status "$status" "$name" "$farmer_log" \
+			>"$OUT_DIR/$name.assert.log" 2>&1; then
+			reason="command status/journal (see $name.assert.log)"
 		fi
 	fi
 	if [[ -z "$reason" ]] && grep -Eq 'SCRIPT ERROR|Parse Error|Invalid call|Cannot call method' "$run_log"; then
@@ -462,6 +591,7 @@ write_cfg flush-fail '{"speed":10.0,"max_runs":1,"run_minutes":0.2,"max_minutes"
 # Short forced runs: settlement and keep still happen, a run takes seconds.
 write_cfg crash-run '{"speed":10.0,"max_runs":1,"run_minutes":0.2,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
 write_cfg crash-settled '{"speed":10.0,"max_runs":2,"run_minutes":0.2,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
+write_cfg commands '{"speed":10.0,"max_runs":2,"run_minutes":0.2,"stall_seconds":10.0,"auto_keep":true,"keep_on_defeat":true,"hard_exit":true,"endless":false,"display":false}'
 
 for scenario in "${SCENARIOS[@]}"; do
 	case "$scenario" in
@@ -472,6 +602,8 @@ for scenario in "${SCENARIOS[@]}"; do
 		crash-run) run_crash_scenario crash-run "$OUT_DIR/crash-run.json" run 'RUN_LOST' 180 || break ;;
 		crash-settled) run_crash_scenario crash-settled "$OUT_DIR/crash-settled.json" settled 'journal=appended' 180 || break ;;
 		crash-journaled) run_crash_scenario crash-journaled "$OUT_DIR/crash-settled.json" journaled 'journal=present' 180 || break ;;
+		cmd-abort-settled) run_scenario "$scenario" "$OUT_DIR/commands.json" 75 FINISH 0 FARMER_TEST_WAIT_AT_KEEP=1 || break ;;
+		cmd-*) run_scenario "$scenario" "$OUT_DIR/commands.json" 75 FINISH || break ;;
 	esac
 done
 

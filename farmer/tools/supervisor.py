@@ -14,8 +14,9 @@ The supervisor owns the AFK terminal outcome (docs/adr/0003):
   (exit 78: missing game/patch, stale build, bad preset) or an invalid
   farmer config put the session in quarantine: no restart,
   diagnostics stay in the session log directory, the supervisor exits 2;
-- SIGTERM/SIGINT stop the supervisor: the farmer's process group gets
-  SIGTERM, then SIGKILL after kill_grace.
+- SIGTERM/SIGINT request finish via the farmer_stop alias; if the farmer
+  cannot exit within stop_grace, the supervisor kills the process group.
+  A terminal status still starts the shorter kill_grace exit wait.
 
 Notifications go to notify-send and, when FARMER_NTFY_URL (or --ntfy-url) is
 set, to ntfy. They run in background threads; a failed notification never
@@ -61,7 +62,8 @@ class Policy:
     backoff_max: float = 600.0
     max_failures: int = 4
     failure_window: float = 3600.0
-    kill_grace: float = 20.0  # SIGTERM -> SIGKILL; also exit wait after a terminal status
+    kill_grace: float = 20.0  # exit wait after a terminal status
+    stop_grace: float = 45.0  # finish wait on SIGTERM/SIGINT (includes settlement)
 
 
 @dataclass
@@ -125,12 +127,16 @@ class Supervisor:
             attempt = self._attempt(len(outcome.attempts) + 1, delay)
             outcome.attempts.append(attempt)
             if attempt.outcome == "stopped":
+                outcome.reason = attempt.reason
                 return self._stopped(outcome)
             if attempt.outcome == "finished":
                 outcome.kind, outcome.reason = "finished", attempt.reason
                 event = "goal" if attempt.reason == "goal" else "stop"
                 self.notify(event, f"farmer finished: {attempt.reason}")
                 return outcome
+            if self._stopping:
+                outcome.reason = attempt.reason
+                return self._stopped(outcome)
             if attempt.outcome == "fatal":
                 return self._quarantine(outcome, attempt.reason)
             now = time.monotonic()
@@ -153,8 +159,8 @@ class Supervisor:
             time.sleep(min(left, 0.2))
 
     def _stopped(self, outcome):
-        log("stopped by operator")
-        self.notify("stop", "supervisor stopped by operator")
+        log(f"stopped by operator ({outcome.reason})")
+        self.notify("stop", f"supervisor stopped by operator: {outcome.reason}")
         return outcome
 
     def _quarantine(self, outcome, reason):
@@ -183,7 +189,7 @@ class Supervisor:
                 self.command, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
             )
             code, status, reason = self._watch(proc, since_ns)
-        if reason == "operator":
+        if reason == "operator_timeout":
             outcome = "stopped"
         elif reason is None:
             outcome, reason = self._classify(code, status)
@@ -204,14 +210,13 @@ class Supervisor:
         stale = p.heartbeat_interval * p.stale_intervals
         tick = max(0.05, p.heartbeat_interval / 5)
         last_seq, last_change, status = None, time.monotonic(), None
+        stop_deadline = None
+        requested_before_boot = False
         while True:
             if self._exited(proc):
                 status = read_status(self.status_path, since_ns) or status
                 self._kill_group(proc, signal.SIGKILL)  # leftovers of a dead child
                 return proc.wait(), status, None
-            if self._stopping:
-                self._terminate(proc)
-                return proc.returncode, read_status(self.status_path, since_ns) or status, "operator"
             current = read_status(self.status_path, since_ns)
             now = time.monotonic()
             if current is not None:
@@ -219,13 +224,31 @@ class Supervisor:
                 seq = current.get("heartbeat_seq")
                 if seq != last_seq:
                     last_seq, last_change = seq, now
-            if status is not None and status.get("terminal"):
+            terminal = status is not None and status.get("terminal")
+            if self._stopping:
+                first_request = stop_deadline is None
+                if first_request:
+                    stop_deadline = now + p.stop_grace
+                    requested_before_boot = status is None
+                # run.sh clears the legacy alias before launch. Publish again
+                # once a fresh status proves startup passed that cleanup.
+                if not terminal and (first_request or (requested_before_boot and status is not None)):
+                    requested_before_boot = status is None
+                    try:
+                        self.status_path.with_name("farmer_stop").touch()
+                        log("requested finish")
+                    except OSError as exc:
+                        log(f"could not request finish: {exc}")
+                if now >= stop_deadline:
+                    self._kill_group(proc, signal.SIGKILL)
+                    return proc.wait(), read_status(self.status_path, since_ns) or status, "operator_timeout"
+            if terminal:
                 limit, reason = p.kill_grace, "no_exit_after_terminal"
             elif last_seq is None:
                 limit, reason = p.startup_grace, "no_heartbeat"
             else:
                 limit, reason = stale, "heartbeat_stale"
-            if now - last_change > limit and not self._exited(proc):
+            if (terminal or stop_deadline is None) and now - last_change > limit and not self._exited(proc):
                 log(f"{reason}: {now - last_change:.1f}s without a heartbeat")
                 self._kill_group(proc, signal.SIGKILL)  # a hung farmer cannot flush (ADR 0001)
                 return proc.wait(), status, reason
@@ -245,14 +268,6 @@ class Supervisor:
         if not status:
             return "failed", f"exit_{code}_no_status"
         return "failed", f"exit_{code}_phase_{status.get('phase', '')}"
-
-    def _terminate(self, proc):
-        self._kill_group(proc, signal.SIGTERM)
-        deadline = time.monotonic() + self.policy.kill_grace
-        while not self._exited(proc) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        self._kill_group(proc, signal.SIGKILL)
-        proc.wait()
 
     @staticmethod
     def _exited(proc):
@@ -319,8 +334,8 @@ UNIT = """\
 # - exit 2 (quarantine): not restarted, inspect farmer/logs/supervisor-*;
 # - any other failure of the supervisor itself: restarted after 30s,
 #   at most 3 times per hour.
-# Stop sends SIGTERM; the supervisor terminates the farmer's process group.
-# KillMode=control-group also reaps anything left in the cgroup.
+# Stop sends SIGTERM only to the supervisor, so the farmer can flush first.
+# KillMode=mixed gives systemd a cgroup-wide SIGKILL fallback.
 [Unit]
 Description=Midgard Survivors AFK farmer supervisor
 StartLimitIntervalSec=1h
@@ -334,8 +349,8 @@ EnvironmentFile=-%h/.config/midgard-farmer.env
 Restart=on-failure
 RestartSec=30
 RestartPreventExitStatus=2
-KillMode=control-group
-TimeoutStopSec=60
+KillMode=mixed
+TimeoutStopSec=90
 
 [Install]
 WantedBy=default.target
@@ -388,7 +403,7 @@ def main():
     outcome = sup.run()
     SESSION_FILE.unlink(missing_ok=True)  # terminal outcome: the next start is a new session
     log(f"session {outcome.kind}: {outcome.reason} after {len(outcome.attempts)} attempt(s)")
-    notify.drain(25)  # below TimeoutStopSec minus kill_grace
+    notify.drain(25)  # below TimeoutStopSec minus stop_grace
     if outcome.kind == "quarantined":
         return EXIT_QUARANTINE
     return 0
