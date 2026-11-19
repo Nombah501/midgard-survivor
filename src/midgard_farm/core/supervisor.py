@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 from ..platform import NetworkIsolationError, Platform
-from . import commands, game_update
+from . import commands, farmer_patch, game_update
 from .commands import Start
 from .history import append_event, read_history, session_totals
 from .launch import SHUTDOWN_GRACE_SECONDS, GameBusy, request_finish, run_attempt
@@ -21,6 +21,15 @@ FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt"}
 POLL = 0.2
 UPDATE_POLL = 1.0
 UPDATE_FAILURES = tuple(game_update.FailureReason)
+_SESSION_ACTIVE = "AFK session running"
+
+
+def session_log_dir(os_: Platform, session_id: str) -> Path:
+    """Return the supervisor's outcome and quarantine record directory for a valid session ID."""
+    prefix, _, value = session_id.partition("-")
+    if prefix not in ("afk", "verify") or len(value) != 32 or uuid.UUID(hex=value).hex != value:
+        raise ValueError("invalid AFK session id")
+    return os_.app_data_dir() / "logs" / f"supervisor-{session_id}"
 
 
 class InvalidSavedSession(Exception):
@@ -84,6 +93,9 @@ class _UpdateEvents:
     reporter: StateReporter
     send_notification: Callable[[str, str], None]
 
+    def classification(self, state: game_update.GameUpdateState) -> None:
+        self.reporter.patch_status(game_update_classification=state.value)
+
     def state(self, kind: game_update.PipelineState, reason: str | None) -> None:
         if kind != "ready":
             self.reporter.set(StateKind(kind), reason or "")
@@ -118,7 +130,9 @@ class Supervisor:
             stop_requested=lambda: stop_requested_at() is not None,
         )
         self._quarantine_path = self.session_path.parent / "quarantine.json"
-        saved_quarantine = read_state(os_).quarantine
+        previous = read_state(os_)
+        self._keep_official = previous.keep_official
+        saved_quarantine = previous.quarantine
         self._update_quarantine = (saved_quarantine if saved_quarantine
                                    and saved_quarantine.get("reason") in UPDATE_FAILURES else None)
         self._check_again = False
@@ -139,8 +153,7 @@ class Supervisor:
             prefix = f"{self.session_prefix}-"
             if not isinstance(session_id, str) or not session_id.startswith(prefix):
                 raise ValueError("invalid saved AFK session id")
-            if session_id != f"{prefix}{uuid.UUID(hex=session_id.removeprefix(prefix)).hex}":
-                raise ValueError("invalid saved AFK session id")
+            session_log_dir(self.os, session_id)  # Validate before using a recovered ID.
             start = commands.decode(saved.get("start"))
             if not isinstance(start, Start):
                 raise ValueError("saved AFK session has no Start command")
@@ -169,6 +182,12 @@ class Supervisor:
         next_check = time.monotonic() + UPDATE_POLL
         while self.stop_requested_at() is None:
             for path, command in self._pending():
+                if command == "restore_official":
+                    self._restore_official(path)
+                    continue
+                if self._keep_official and (isinstance(command, Start) or command == "check_again"):
+                    self._keep_official = False
+                    self.state.patch_status(keep_official=False)
                 gate = self._idle_update(check_again=command == "check_again")
                 if isinstance(gate, game_update.Stopped) or self.stop_requested_at() is not None:
                     return
@@ -201,6 +220,33 @@ class Supervisor:
     def _write(self, path: Path, data: dict) -> None:
         self.os.write_atomic(path, json.dumps(data, indent=2).encode())
 
+    def _restore_official(self, path: Path) -> None:
+        try:
+            farmer_patch.restore(self.os, self.profile)
+        except farmer_patch.GameRunning:
+            refuse_command(self.os, self.state, path, "restore_official",
+                           "Close the game before restoring the official patch.")
+            return
+        except farmer_patch.OfficialPatchMissing:
+            outcome, reason = "official_patch_missing", game_update.START_GAME_AND_UPDATE
+            self.state.patch_status(game_update_classification=game_update.GameUpdateState.GAME_REINSTALL.value)
+            self.state.set(StateKind.FARMER_UNAVAILABLE, reason)
+        except (farmer_patch.PatchStateError, OSError) as exc:
+            outcome, reason = "restore_failed", f"Could not restore the official patch: {exc}"
+        else:
+            outcome, reason = "restored", "Official patch restored."
+            # Otherwise the next idle check would immediately reinstall the farmer patch.
+            self._keep_official = True
+        record = {"request": path.name, "outcome": outcome, "reason": reason}
+        try:
+            append_event(self.os, "game_update", action="restore_official", **record)
+        except (OSError, ValueError) as exc:
+            log(f"could not record official patch restoration in history: {exc}")
+        self.state.patch_status(last_restore=record, keep_official=self._keep_official)
+        path.unlink()
+        if outcome == "restored":
+            self._idle_update()
+
     def _idle_update(self, *, check_again: bool = False) -> game_update.PipelineResult | None:
         try:
             return self._check_update(check_again=check_again)
@@ -218,11 +264,13 @@ class Supervisor:
         if check_again and self._update_quarantine is not None:
             self._clear_update_quarantine()
             self.state.set(StateKind.REBUILDING, "checking for a Game update", quarantine=None)
-        result = self._update.run(check_again=check_again, unattended=unattended and not check_again)
+        prepare = session or not self._keep_official
+        result = self._update.run(check_again=check_again, unattended=unattended and not check_again,
+                                  prepare=prepare)
         if isinstance(result, game_update.Ready):
             kind = StateKind.ACTIVE if session else StateKind.IDLE
             reason = "AFK session in progress" if session else ""
-            if self._update_quarantine is not None:
+            if prepare and self._update_quarantine is not None:
                 self._clear_update_quarantine()
                 self.state.set(kind, reason, quarantine=None)
             else:
@@ -284,7 +332,7 @@ class Supervisor:
         return outcome, quarantine
 
     def _run_session(self, session_id: str, start: Start, request: str, *, recovered_session: bool = False) -> None:
-        log_dir = self.os.app_data_dir() / "logs" / f"supervisor-{session_id}"
+        log_dir = session_log_dir(self.os, session_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         outcome_path = log_dir / "outcome.json"
         if (recovered := self._recover_outcome(log_dir, session_id)) is not None:
@@ -366,6 +414,11 @@ class Supervisor:
             self.notify("fail", f"farmer failed: {attempt.reason}; restarting")
             delay = min(self.policy.backoff_max, self.policy.backoff_base * 2 ** (len(failures) - 1))
 
+        # A restore may have arrived during blocking rebuild or terminal process cleanup.
+        for path, command in self._pending():
+            if command == "restore_official":
+                refuse_command(self.os, self.state, path, command, _SESSION_ACTIVE)
+
         diagnostics = [asdict(attempt) for attempt in attempts]
         quarantine = None
         if kind == "quarantined":
@@ -437,6 +490,9 @@ class Supervisor:
         for path, command in self._pending():
             if isinstance(command, Start):
                 self._refuse_start(path)
+                continue
+            if command == "restore_official":
+                refuse_command(self.os, self.state, path, command, _SESSION_ACTIVE)
                 continue
             path.unlink()
             if command in ("finish", "abort"):
@@ -533,9 +589,8 @@ class Supervisor:
                             break
                         self._refuse_start(path)
                         continue
-                    if command == "check_again":
-                        # Never rebuild under a live attempt or forward service commands to Godot.
-                        refuse_command(self.os, self.state, path, command, "AFK session running")
+                    if command in ("check_again", "restore_official"):
+                        refuse_command(self.os, self.state, path, command, _SESSION_ACTIVE)
                         continue
                     self.os.write_atomic(self.mailbox, (command + "\n").encode())
                     closing = closing or command in ("finish", "abort")

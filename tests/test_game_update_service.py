@@ -255,6 +255,95 @@ def test_missing_named_official_pack_refuses_start_without_quarantine(update_ser
         assert not list(farm.data.glob("logs/supervisor-*/outcome.json"))
 
 
+@pytest.mark.parametrize("resume", ["start", "check_again"])
+def test_restore_official_stays_restored_while_idle_and_across_service_restart(update_service, resume):
+    farm, update, _, _ = update_service
+    original_profile = (farm.profile / "profile.json").read_bytes()
+    with farm.service(runner=RUNNER):
+        wait_for(lambda: read_history(farm.os_), lambda rows: rows and rows[-1]["outcome"] == "ready")
+        state = wait_for(lambda: read_state(farm.os_), lambda state: state.kind is StateKind.IDLE)
+        assert state.game_update_classification == "current"
+        request = commands.submit(farm.os_, "restore_official")
+        wait_for(lambda: read_state(farm.os_).last_restore,
+                 lambda result: result and result["request"] == request.name)
+        state = wait_for(lambda: read_state(farm.os_),
+                         lambda state: state.game_update_classification == "farmer_removed_or_stale")
+        assert state.last_restore["outcome"] == "restored"
+        assert state.kind is StateKind.IDLE
+        assert (update.patches / "state.json").read_bytes() == (update.patches / "official-state.json").read_bytes()
+        assert not (update.patches / "patch_farmer.pck").exists()
+        assert (farm.profile / "profile.json").read_bytes() == original_profile
+        row = read_history(farm.os_)[-1]
+        assert (row["kind"], row["action"], row["outcome"]) == ("game_update", "restore_official", "restored")
+    with farm.service(runner=RUNNER):
+        # A second successful restore after startup also exercises the idle command loop.
+        request = commands.submit(farm.os_, "restore_official")
+        wait_for(lambda: read_state(farm.os_).last_restore,
+                 lambda result: result and result["request"] == request.name)
+        assert not (update.patches / "patch_farmer.pck").exists()
+        assert [row["outcome"] for row in read_history(farm.os_)] == ["ready", "restored", "restored"]
+        if resume == "start":
+            farm.start()
+            outcome, _ = farm.outcome()
+            assert outcome["kind"] == "finished"
+        else:
+            request = commands.submit(farm.os_, "check_again")
+            wait_for(lambda: not request.exists())
+            assert not farm.plan.with_suffix(".count").exists()
+        assert not read_state(farm.os_).keep_official
+    assert json.loads((update.patches / "state.json").read_bytes())["file"] == "patch_farmer.pck"
+    assert [entry["stage"] for entry in update.observations()] == ["build", "smoke"]
+
+
+def test_restore_official_reports_missing_official_file_without_touching_profile(update_service):
+    farm, update, _, _ = update_service
+    with farm.service(runner=RUNNER):
+        wait_for(lambda: read_history(farm.os_))
+        (update.patches / "official.pck").unlink()
+        before = snapshot(update.patches)
+        request = commands.submit(farm.os_, "restore_official")
+        result = wait_for(lambda: read_state(farm.os_).last_restore,
+                          lambda result: result and result["request"] == request.name)
+        assert result["outcome"] == "official_patch_missing"
+        assert result["reason"] == "start the game and accept the update"
+        assert read_state(farm.os_).game_update_classification == "game_reinstall"
+        row = next(row for row in read_history(farm.os_) if row.get("action") == "restore_official")
+        assert row["reason"] == result["reason"]
+        assert snapshot(update.patches) == before
+
+
+@pytest.mark.parametrize("busy", ["game", "attempt", "backoff", "waiting"])
+def test_restore_official_refuses_while_game_or_session_is_active(update_service, busy):
+    farm, update, _, _ = update_service
+    farm.plan.write_text("crash\n" if busy == "backoff" else "commands\n", encoding="utf-8")
+    with farm.service(runner=RUNNER, backoff_base=30.0, backoff_max=30.0):
+        wait_for(lambda: read_history(farm.os_))
+        if busy in ("game", "waiting"):
+            update.running.touch()
+        if busy != "game":
+            farm.start()
+            if busy == "backoff":
+                wait_for(lambda: read_state(farm.os_).reason, lambda reason: reason.startswith("Restarting"))
+            elif busy == "waiting":
+                wait_for(lambda: read_state(farm.os_),
+                         lambda state: state.session_id and state.kind is StateKind.WAITING_FOR_GAME)
+            else:
+                farm.status("run")
+        before = snapshot(update.patches)
+        request = commands.submit(farm.os_, "restore_official")
+        refusal = commands.rejection_path(farm.os_, request)
+        reason = "Close the game before restoring the official patch." if busy == "game" else "AFK session running"
+        assert wait_for(lambda: json.loads(farm.os_.read_shared(refusal))) == {
+            "command": "restore_official", "reason": reason,
+        }
+        wait_for(lambda: any(row["request"] == request.name for row in read_state(farm.os_).command_refusals))
+        assert snapshot(update.patches) == before
+        assert not any(row.get("action") == "restore_official" for row in read_history(farm.os_))
+        if busy != "game":
+            commands.submit(farm.os_, "finish")
+            farm.outcome()
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="exercise the service's SIGTERM handler")
 def test_service_stop_cancels_smoke_and_can_resume_without_rebuilding(update_service, monkeypatch):
     farm, update, _, _ = update_service

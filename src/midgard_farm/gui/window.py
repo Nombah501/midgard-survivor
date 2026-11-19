@@ -9,7 +9,7 @@ import sys
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from functools import partial
 from typing import Any, cast
 
@@ -18,14 +18,24 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
-from ..core.commands import Control
+from ..core.commands import Control, PatchCommand
 from ..platform import current
 from . import _resources  # noqa: F401  # Qt registers the embedded QML on import.
 from .model import SessionModel, SessionView
 
+_AFK_FIELDS = tuple(item.name for item in fields(SessionView)
+                    if item.name not in ("history", "updates", "quarantine"))
+
+
+def _snapshot(view: SessionView) -> dict[str, Any]:
+    return {**{name: getattr(view, name) for name in _AFK_FIELDS},
+            "updates": asdict(view.updates), "quarantine": asdict(view.quarantine)}
+
+
 
 class _Backend(QObject):
     changed = Signal()
+    historyChanged = Signal()
 
     def __init__(self, model: SessionModel, parent: QObject):
         super().__init__(parent)
@@ -35,7 +45,8 @@ class _Backend(QObject):
         executor = self._executor
         parent.destroyed.connect(lambda: executor.shutdown(wait=False))
         self._view = SessionView()
-        self._snapshot = asdict(self._view)
+        self._snapshot = _snapshot(self._view)
+        self._history = asdict(self._view.history)
         self._completion = QTimer(self)
         self._completion.setInterval(25)
         self._completion.timeout.connect(self._publish)
@@ -70,8 +81,12 @@ class _Backend(QObject):
                 logging.getLogger(__name__).exception("AFK window refresh failed")
                 view = replace(self._view, action_error="Could not refresh the AFK session.")
             if view != self._view:
+                history_changed = view.history != self._view.history
                 self._view = view
-                self._snapshot = asdict(view)
+                self._snapshot = _snapshot(view)
+                if history_changed:
+                    self._history = asdict(view.history)
+                    self.historyChanged.emit()
                 self.changed.emit()
         if not self._pending:
             self._completion.stop()
@@ -79,6 +94,10 @@ class _Backend(QObject):
     @Property(dict, notify=changed)
     def snapshot(self) -> dict[str, Any]:
         return self._snapshot
+
+    @Property(dict, notify=historyChanged)
+    def history(self) -> dict[str, Any]:
+        return self._history
 
     @Slot(int)
     def selectCharacter(self, index: int) -> None:
@@ -96,6 +115,11 @@ class _Backend(QObject):
     def control(self, action: str, session_id: str) -> None:
         if action in ("pause", "resume", "finish", "abort"):
             self._enqueue(partial(self._model.control, cast(Control, action), session_id=session_id))
+
+    @Slot(str)
+    def patchCommand(self, action: str) -> None:
+        if action in ("check_again", "restore_official"):
+            self._enqueue(partial(self._model.patch_command, cast(PatchCommand, action)))
 
     @Slot()
     def startService(self) -> None:

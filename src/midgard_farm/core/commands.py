@@ -30,14 +30,15 @@ class Start:
         }, "preset": str(self.preset.absolute())}
 
 
-type Command = Start | Control | Literal["check_again"]
+PatchCommand = Literal["check_again", "restore_official"]
+type Command = Start | Control | PatchCommand
 
 
 def decode(payload: object) -> Command:
     if not isinstance(payload, dict):
         raise ValueError("command must be a JSON object")
     match payload.get("command"):
-        case "pause" | "resume" | "finish" | "abort" | "check_again" as action:
+        case "pause" | "resume" | "finish" | "abort" | "check_again" | "restore_official" as action:
             return action
         case "start":
             preset = payload.get("preset")

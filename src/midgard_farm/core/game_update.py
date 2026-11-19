@@ -101,6 +101,7 @@ class FailureReason(StrEnum):
 
 
 class PipelineEvents(Protocol):
+    def classification(self, state: GameUpdateState) -> None: ...
     def state(self, kind: PipelineState, reason: str | None) -> None: ...
     def history(self, event: dict[str, str]) -> None: ...
     def notify(self, event: str, message: str) -> None: ...
@@ -202,11 +203,11 @@ class GameUpdatePipeline:
         self._journal = os_.app_data_dir() / "game-update.json"
         self._official_digest: tuple[tuple[Path, int, int, int, int, int], str] | None = None
 
-    def run(self, *, check_again: bool = False, unattended: bool = True) -> PipelineResult:
-        """Prepare once; call again on Wait. Invalid prerequisites raise PreflightError."""
+    def run(self, *, check_again: bool = False, unattended: bool = True, prepare: bool = True) -> PipelineResult:
+        """Prepare once; call again on Wait. With prepare=False, only observe the patch."""
         if self._stop_requested():
             return Stopped()
-        pending = self._load()
+        pending = self._load() if prepare else None
         if check_again and pending is not None and pending.reason is not None:
             pending = replace(pending, stage=_Stage.BUILD, reason=None, detail="", log_path=None, unattended=False)
             self._save(pending)
@@ -227,7 +228,8 @@ class GameUpdatePipeline:
             self._fingerprint = _farmer_hash(self.sources)
         fingerprint = self._fingerprint
         classification = mounted.classify(fingerprint)
-        if pending is None and classification is GameUpdateState.CURRENT:
+        if not prepare or (pending is None and classification is GameUpdateState.CURRENT):
+            self.events.classification(classification)
             self._reinstall_reported = False
             return self._ready()
 
@@ -235,6 +237,10 @@ class GameUpdatePipeline:
             key = self._patch_hash(mounted.official), fingerprint
         except FileNotFoundError:
             return self._reinstall()
+        info = mounted.info
+        if not mounted.mounted and info is not None and info.patch_sha256 != key[0]:
+            classification = GameUpdateState.GAME_UPDATE
+        self.events.classification(classification)
         self._reinstall_reported = False
         interrupted = pending is not None
         if pending is not None and pending.key != key:
@@ -252,14 +258,11 @@ class GameUpdatePipeline:
         if not game.is_file() or not os.access(game, os.X_OK):
             raise PreflightError(f"game not found or not executable at {game}")
 
-        info = mounted.info
         candidate = patch_info.built_pack_path(self.os)
         has_candidate = (
             mounted.same_base and info is not None and (info.patch_sha256, info.farmer_hash) == key
             and candidate.is_file()
         )
-        if not mounted.mounted and info is not None and info.patch_sha256 != key[0]:
-            classification = GameUpdateState.GAME_UPDATE
         if pending is None:
             # An interrupted build may already have published a candidate for the new key without smoking it.
             stage = _Stage.BUILD
@@ -279,6 +282,7 @@ class GameUpdatePipeline:
         return self._prepare(pending, mounted, unattended)
 
     def _reinstall(self) -> Blocked:
+        self.events.classification(GameUpdateState.GAME_REINSTALL)
         self.events.state("farmer_unavailable", START_GAME_AND_UPDATE)
         if not self._reinstall_reported:
             self.events.history({
@@ -336,6 +340,7 @@ class GameUpdatePipeline:
             raise PreflightError(str(exc)) from exc
 
         self._journal.unlink()
+        self.events.classification(GameUpdateState.CURRENT)
         self._history(pending, "ready")
         if pending.classification is GameUpdateState.GAME_UPDATE and pending.unattended and unattended:
             self.events.notify("game_update_handled", "Game update handled; the farmer patch is ready")

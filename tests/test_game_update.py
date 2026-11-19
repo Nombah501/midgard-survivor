@@ -47,6 +47,10 @@ class Events:
         self.states = []
         self.records = []
         self.notifications = []
+        self.classifications = []
+
+    def classification(self, state):
+        self.classifications.append(state)
 
     def state(self, kind, reason):
         self.states.append((kind, reason))
@@ -196,6 +200,7 @@ def test_game_update_refreshes_then_builds_then_smokes_before_real_install(farm)
         "official_patch_sha256": info.patch_sha256, "farmer_hash": info.farmer_hash,
     }]
     assert [event for event, _ in farm.events.notifications] == ["game_update_handled"]
+    assert farm.events.classifications == [game_update.GameUpdateState.GAME_UPDATE, game_update.GameUpdateState.CURRENT]
     assert farm.events.states[-1] == ("ready", None)
 
 

@@ -9,6 +9,8 @@ from threading import Event
 import pytest
 
 from midgard_farm.core import commands
+from midgard_farm.core.history import append_event, history_path
+from midgard_farm.core.supervisor import session_log_dir
 from midgard_farm.platform import Platform, current
 
 
@@ -92,7 +94,7 @@ def test_poll_displays_only_matching_run_and_uses_farmer_rates(farm, monkeypatch
     assert view.heartbeat_age == "7 s ago"
     assert view.zeny == "—"
     assert view.current_run == "—"
-    assert model.history[0]["session_id"] == "older-afk"
+    assert view.history.rows[0].session_id == "older-afk"
 
     active_status(farm)
     view = model.poll()
@@ -154,16 +156,43 @@ def test_quarantine_uses_the_matching_session_diagnostic(farm):
     from midgard_farm.gui.model import SessionModel
 
     session = "afk-" + "1" * 32
-    logs = farm.data / "logs" / f"supervisor-{session}"
+    logs = session_log_dir(farm.platform, session)
     logs.mkdir(parents=True)
     (logs / "quarantine.json").write_text(
-        '{"reason":"heartbeat_stale","detail":"No new heartbeat for 15 seconds"}', encoding="utf-8",
+        '{"reason":"heartbeat_stale","detail":"No new heartbeat for 15 seconds\\nMore detail",'
+        '"attempts":[{"number":1,"outcome":"failed","reason":"heartbeat_stale"}]}', encoding="utf-8",
     )
-    farm.state(quarantine={"reason": "heartbeat_stale"}, last_outcome={"kind": "quarantined", "session": session})
+    (logs / "attempt-01.log").touch()
+    (logs / "attempt-01.status.json").touch()
+    farm.state(quarantine={"reason": "heartbeat_stale", "diagnostics": logs.relative_to(farm.data).as_posix()},
+               last_outcome={"kind": "quarantined", "session": session})
     view = SessionModel(farm.platform).poll()
     assert view.phase == "Quarantine"
-    assert view.start_reason == "No new heartbeat for 15 seconds"
-    assert not view.can_start
+    assert view.quarantine.detail == "No new heartbeat for 15 seconds"
+    assert view.quarantine.action == "Start a new session"
+    assert view.quarantine.attempts == ["Attempt 1 · Failed · heartbeat_stale"]
+    assert set(map(Path, view.quarantine.paths)) == {
+        logs / "quarantine.json", logs / "attempt-01.log", logs / "attempt-01.status.json",
+    }
+    assert view.can_start  # A new session is explicit; the service won't retry the quarantined one.
+
+
+def test_idle_rebuild_quarantine_does_not_reuse_an_older_sessions_record(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    session = "afk-" + 32 * "3"
+    logs = session_log_dir(farm.platform, session)
+    logs.mkdir(parents=True)
+    (logs / "quarantine.json").write_text(
+        '{"reason":"smoke_failed","detail":"Previous session failed"}', encoding="utf-8",
+    )
+    log = str(farm.data / "latest-smoke.log")
+    farm.state("farmer_unavailable", quarantine={"reason": "smoke_failed", "detail": "Check again failed",
+                                                "log_path": log},
+               last_outcome={"kind": "quarantined", "session": session})
+    view = SessionModel(farm.platform).poll()
+    assert view.quarantine.detail == "Check again failed"
+    assert view.quarantine.paths == [log]
 
 
 def test_fixed_preset_uses_its_character_without_losing_normal_pick(farm):
@@ -212,6 +241,140 @@ def test_service_start_uses_only_the_platform_service_tool(farm, monkeypatch):
     assert not commands.directory(farm.platform).exists()
 
 
+def test_preset_decides_is_sent_as_null_and_remembered(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state()
+    model = SessionModel(farm.platform)
+    model.select_character(model.poll().characters.index("Preset decides"))
+    request = model.start()
+    assert request
+    result = commands.decode(json.loads(request.read_bytes()))
+    assert isinstance(result, commands.Start) and result.character is None
+    view = SessionModel(farm.platform).poll()
+    assert view.characters[view.character_index] == "Preset decides"
+
+
+def history_fixture(farm):
+    append_event(farm.platform, "session", timestamp=1_704_067_500, session_id="previous-night",
+                 outcome="stopped", reason="abort", totals={"runs": 3, "wins": 2, "zeny": 6000})
+    append_event(farm.platform, "app_update", timestamp=1_704_067_620, outcome="rolled_back", future={"foo": 1})
+    append_event(farm.platform, "game_update", timestamp=1_704_067_560,
+                 classification="game_update", outcome="ready")
+    append_event(farm.platform, "session", timestamp=1_704_067_680, session_id="last-night",
+                 outcome="finished", reason="max_minutes",
+                 totals={"runs": 12, "wins": 10, "lost": 1, "wall_s": 1800, "zeny": 7200, "xp": 560,
+                         "kills": 40, "coins": 3, "ymir": 2, "cards_gain": 4, "materials": {"ore": 4, "star_crumb": 2},
+                         "future": ["skip"]})
+    append_event(farm.platform, "future", timestamp=1_704_067_740, future=True)
+    with history_path(farm.platform).open("ab") as file:
+        file.write(b'{"v":1,"kind":"game_update"')
+
+
+def test_history_is_interleaved_in_timestamp_order_with_last_night_detailed(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state()
+    history_fixture(farm)
+    history = SessionModel(farm.platform).poll().history
+    assert [row.title for row in history.rows] == [
+        "AFK session · Finished", "App update · Rolled back", "Game update · Handled", "AFK session · Stopped",
+    ]
+    last_night, _, _, previous = history.rows
+    assert "12 runs · 10 wins · 7,200 zeny" in last_night.summary
+    assert "3 runs · 2 wins · 6,000 zeny" in previous.summary
+    assert last_night.session_id == "last-night"
+    assert dict((metric.label, metric.value) for metric in history.totals) == {
+        "Runs": "12", "Wins": "10", "Lost": "1", "Time in runs": "0.5 h",
+        "Zeny": "7,200", "XP": "560", "Kills": "40", "Cards": "4", "Coins": "3", "Ymir": "2",
+    }
+    assert history.rewards == "14,400 zeny · 1,120 XP · 6 coins · 4 Ymir · 8 cards"
+    assert history.materials == "Ore 4 · Star Crumb 2"
+
+
+@pytest.mark.parametrize(("classification", "kind", "state_title", "activity", "opens_game"), [
+    ("current", "idle", "Current", "", False),
+    ("game_update", "idle", "Game update", "", False),
+    ("farmer_removed_or_stale", "idle", "Farmer patch removed or stale", "", False),
+    ("game_reinstall", "farmer_unavailable", "Game reinstall", "", True),
+    ("game_update", "waiting_for_game", "Game update", "Waiting for the game to close", False),
+    ("game_update", "rebuilding", "Game update", "Rebuilding", False),
+])
+def test_updates_describes_the_classification_and_activity(farm, classification, kind, state_title,
+                                                         activity, opens_game):
+    from importlib.metadata import version
+
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state(kind, game_update_classification=classification)
+    updates = SessionModel(farm.platform).poll().updates
+    assert (updates.game_state, updates.activity) == (state_title, activity)
+    assert ("Open the game" in updates.game_detail) == opens_game
+    assert ("start the game and accept the update" in updates.game_detail) == opens_game
+    assert updates.app_version == version("midgard-farm")
+
+
+def test_updates_shows_package_version_in_an_uninstalled_checkout(farm, monkeypatch):
+    from importlib.metadata import PackageNotFoundError, version
+
+    from midgard_farm.gui import model
+
+    def unavailable(package):
+        raise PackageNotFoundError(package)
+
+    monkeypatch.setattr(model, "version", unavailable)
+    assert model.SessionModel(farm.platform).poll().updates.app_version == version("midgard-farm")
+
+
+@pytest.mark.parametrize(("outcome", "reason", "label"), [
+    ("ready", "", "Handled"),
+    ("quarantine", "build_failed", "Build failed"),
+    ("quarantine", "anchors_broken", "Anchors broke"),
+    ("quarantine", "smoke_failed", "Smoke failed"),
+])
+def test_last_game_update_outcome_ignores_restores_and_reinstalls(farm, outcome, reason, label):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state()
+    append_event(farm.platform, "game_update", classification="game_update", outcome=outcome, reason=reason)
+    append_event(farm.platform, "game_update", action="restore_official", outcome="restored")
+    append_event(farm.platform, "game_update", classification="game_reinstall", outcome="blocked")
+    assert SessionModel(farm.platform).poll().updates.last_outcome == label
+
+
+def test_update_controls_gate_active_sessions_and_show_correlated_restore_refusal(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state("waiting_for_game", session_id="afk-fixture")
+    model = SessionModel(farm.platform)
+    assert model.poll().updates.action_blocker == "An AFK session is already active."
+    assert model.patch_command("restore_official") is None
+    assert model.patch_command("check_again") is None
+    farm.state()
+    assert model.patch_command("check_again")
+    restore = model.patch_command("restore_official")
+    assert restore
+    farm.state(command_refusals=[
+        {"request": "other", "command": "restore_official", "reason": "Someone else's request"},
+        {"request": restore.name, "command": "restore_official",
+         "reason": "Close the game before restoring the official patch."},
+    ])
+    assert model.poll().updates.feedback == "Restore refused: Close the game before restoring the official patch."
+
+
+@pytest.mark.parametrize("reason", ["build_failed", "anchors_broken", "smoke_failed"])
+def test_rebuild_quarantine_offers_check_again(farm, reason):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state("farmer_unavailable", quarantine={"reason": reason, "detail": "Stopped before installation"})
+    model = SessionModel(farm.platform)
+    view = model.poll()
+    assert not view.can_start and view.quarantine.action == "Check again"
+    assert view.quarantine.can_check_again
+    request = model.patch_command("check_again")
+    assert request and commands.decode(json.loads(request.read_bytes())) == "check_again"
+
+
 @pytest.fixture
 def qt_app(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -244,6 +407,13 @@ def qml_item(window, name):
     from PySide6.QtCore import QObject
 
     item = window.findChild(QObject, name)
+    if item is None:
+        pending = [window.contentItem()]
+        while pending:
+            child = pending.pop()
+            if child.objectName() == name:
+                return child
+            pending.extend(child.childItems())
     assert item is not None, name
     return item
 
@@ -255,6 +425,53 @@ def wait_until(predicate):
     while not predicate():
         assert time.monotonic() < deadline, "Timed out waiting for the Qt window to update"
         QTest.qWait(20)
+
+
+def capture(window, tmp_path, name):
+    image = window.grabWindow()
+    assert not image.isNull()
+    assert image.save(str(tmp_path / f"{name}.png"))
+
+
+def click(window, name):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    # A published snapshot can change visibility before Qt polishes the layout.
+    assert not window.grabWindow().isNull()
+    item = qml_item(window, name)
+    assert item.property("visible") and item.property("enabled")
+    QTest.mouseClick(window, Qt.MouseButton.LeftButton, pos=item.mapToScene(item.boundingRect().center()).toPoint())
+
+
+def requested_commands(farm):
+    return [commands.decode(json.loads(path.read_bytes()))
+            for path in sorted(commands.directory(farm.platform).glob("*.json"))]
+
+
+@pytest.fixture
+def open_dashboard(qt_app, qt_warnings, farm):
+    from PySide6.QtTest import QTest
+
+    from midgard_farm.gui.model import SessionModel
+    from midgard_farm.gui.window import load_window
+
+    engine = window = None
+
+    def open_tab(tab):
+        nonlocal engine, window
+        engine = load_window(SessionModel(farm.platform))
+        [window] = engine.rootObjects()
+        assert QTest.qWaitForWindowExposed(window)
+        click(window, tab)
+        return window
+
+    yield open_tab
+    if window is not None:
+        window.close()
+        engine = None
+        qt_app.processEvents()
+    assert not qt_warnings
 
 
 @pytest.mark.parametrize(("screen", "phase", "extra"), [
@@ -296,9 +513,7 @@ def test_afk_screen_renders(qt_app, qt_warnings, farm, tmp_path, screen, phase, 
             assert qml_item(window, "sessionValue").property("text") == "afk-" + "1" * 32
             assert not qml_item(window, "pauseButton").property("enabled")
             assert qml_item(window, "abortButton").property("enabled")
-        image = window.grabWindow()
-        assert not image.isNull()
-        assert image.save(str(tmp_path / f"{screen}.png"))
+        capture(window, tmp_path, screen)
         window.close()
     finally:
         del engine
@@ -307,20 +522,10 @@ def test_afk_screen_renders(qt_app, qt_warnings, farm, tmp_path, screen, phase, 
 
 
 def test_afk_buttons_and_window_close(qt_app, qt_warnings, farm):
-    from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
 
     from midgard_farm.gui.model import SessionModel
     from midgard_farm.gui.window import load_window
-
-    def click(window, name):
-        # A published snapshot can change visibility before Qt polishes the layout.
-        assert not window.grabWindow().isNull()
-        item = qml_item(window, name)
-        assert item.property("visible") and item.property("enabled")
-        local = item.boundingRect().center()
-        QTest.mouseClick(window, Qt.MouseButton.LeftButton, pos=item.mapToScene(local).toPoint())
-        qt_app.processEvents()
 
     def requests():
         return [json.loads(p.read_text(encoding="utf-8"))["command"]
@@ -430,3 +635,121 @@ def test_slow_shared_read_keeps_published_state_and_qt_responsive(qt_app, qt_war
         del engine
         qt_app.processEvents()
     assert not qt_warnings
+
+
+def test_history_screen_renders_interleaved_rows_and_expands_last_night(open_dashboard, farm, tmp_path):
+    farm.state()
+    history_fixture(farm)
+    window = open_dashboard("historyTab")
+    wait_until(lambda: qml_item(window, "historyRows").property("count") == 4)
+    rows = [qml_item(window, f"historyRow{i}").property("text") for i in range(4)]
+    assert "12 runs · 10 wins · 7,200 zeny" in rows[0]
+    assert rows[1:3] == ["App update · Rolled back", "Game update · Handled"]
+    assert "3 runs · 2 wins · 6,000 zeny" in rows[3]
+    assert not qml_item(window, "lastNightDetails").property("visible")
+    capture(window, tmp_path, "history")
+    click(window, "lastNightDisclosure")
+    assert qml_item(window, "lastNightDetails").property("visible")
+    assert qml_item(window, "lastNightRewards").property("text").startswith("14,400 zeny")
+    assert qml_item(window, "lastNightMaterials").property("text") == "Ore 4 · Star Crumb 2"
+    capture(window, tmp_path, "history-expanded")
+
+
+def test_history_screen_renders_empty_history(open_dashboard, farm, tmp_path):
+    farm.state()
+    window = open_dashboard("historyTab")
+    assert qml_item(window, "historyRows").property("count") == 0
+    capture(window, tmp_path, "history-empty")
+
+
+@pytest.mark.parametrize(("classification", "kind", "title", "activity", "outcome", "reason", "last_outcome"), [
+    ("current", "idle", "Current", "", "ready", "", "Handled"),
+    ("game_update", "idle", "Game update", "", "quarantine", "build_failed", "Build failed"),
+    ("farmer_removed_or_stale", "idle", "Farmer patch removed or stale", "", "quarantine", "anchors_broken", "Anchors broke"),
+    ("game_reinstall", "farmer_unavailable", "Game reinstall", "", "blocked", "", "No outcome yet"),
+    ("game_update", "waiting_for_game", "Game update", "Waiting for the game to close", "quarantine", "smoke_failed", "Smoke failed"),
+    ("game_update", "rebuilding", "Game update", "Rebuilding", "ready", "", "Handled"),
+])
+def test_updates_screen_renders_states_and_outcomes(open_dashboard, farm, tmp_path, classification, kind,
+                                                   title, activity, outcome, reason, last_outcome):
+    from importlib.metadata import version
+
+    farm.state(kind, game_update_classification=classification)
+    append_event(farm.platform, "game_update", classification=classification, outcome=outcome, reason=reason)
+    window = open_dashboard("updatesTab")
+    wait_until(lambda: qml_item(window, "gameUpdateState").property("text") == title)
+    assert qml_item(window, "gameUpdateOutcome").property("text") == last_outcome
+    assert qml_item(window, "gameUpdateActivity").property("text") == activity
+    guidance = qml_item(window, "gameUpdateDetail").property("text")
+    assert ("Open the game" in guidance) == (classification == "game_reinstall")
+    assert qml_item(window, "installedAppVersion").property("text") == version("midgard-farm")
+    assert qml_item(window, "appUpdateCheck").property("text") == "No update check yet."
+    suffix = kind if activity else classification
+    capture(window, tmp_path, f"updates-{suffix.replace('_', '-')}")
+
+
+def test_updates_buttons_submit_without_confirmation_and_restore_disables_during_session(
+    open_dashboard, farm, tmp_path,
+):
+    farm.state(game_update_classification="current")
+    window = open_dashboard("updatesTab")
+    wait_until(lambda: qml_item(window, "restoreOfficialButton").property("enabled"))
+    click(window, "checkAgainButton")
+    click(window, "restoreOfficialButton")
+    wait_until(lambda: requested_commands(farm) == ["check_again", "restore_official"])
+    assert not qml_item(window, "abortDialog").property("visible")
+    farm.state(game_update_classification="farmer_removed_or_stale", keep_official=True,
+               last_restore={"outcome": "restored", "reason": "Official patch restored."})
+    wait_until(lambda: qml_item(window, "gameUpdateState").property("text") == "Farmer patch removed or stale")
+    capture(window, tmp_path, "updates-official-restored")
+    farm.state("active", session_id="afk-fixture", game_update_classification="current")
+    wait_until(lambda: not qml_item(window, "restoreOfficialButton").property("enabled"))
+    assert qml_item(window, "patchActionBlocker").property("text") == "An AFK session is already active."
+    capture(window, tmp_path, "updates-session-active")
+
+
+def test_quarantine_screen_renders_collapsed_diagnostics_and_links_to_afk(open_dashboard, farm, tmp_path):
+    session = "afk-" + 32 * "2"
+    logs = session_log_dir(farm.platform, session)
+    logs.mkdir(parents=True)
+    record = {"reason": "4 failures in 3600s", "detail": "No heartbeat for 15 seconds.",
+              "attempts": [{"number": 4, "outcome": "failed", "reason": "heartbeat_stale"}]}
+    record["diagnostics"] = logs.relative_to(farm.data).as_posix()
+    (logs / "quarantine.json").write_text(json.dumps(record), encoding="utf-8")
+    (logs / "attempt-04.log").touch()
+    farm.state(quarantine=record, last_outcome={"kind": "quarantined", "session": session})
+    window = open_dashboard("quarantineTab")
+    wait_until(lambda: qml_item(window, "quarantineDetail").property("text") == record["detail"])
+    assert not qml_item(window, "quarantineDiagnostics").property("visible")
+    capture(window, tmp_path, "quarantine")
+    click(window, "diagnosticsDisclosure")
+    assert qml_item(window, "quarantineDiagnostics").property("visible")
+    capture(window, tmp_path, "quarantine-expanded")
+    click(window, "quarantineNextAction")
+    assert qml_item(window, "screenTabs").property("currentIndex") == 0
+    assert qml_item(window, "startButton").property("enabled")
+    assert not requested_commands(farm)
+
+
+@pytest.mark.parametrize(("reason", "title"), [
+    ("build_failed", "Build failed"),
+    ("anchors_broken", "Anchors broke"),
+    ("smoke_failed", "Smoke failed"),
+])
+def test_quarantine_screen_retries_rebuild_reasons(open_dashboard, farm, tmp_path, reason, title):
+    farm.state("farmer_unavailable", quarantine={"reason": reason, "detail": "Stopped before installation.",
+                                                "log_path": str(farm.data / "rebuild.log")})
+    window = open_dashboard("quarantineTab")
+    wait_until(lambda: qml_item(window, "quarantineReason").property("text") == title)
+    action = qml_item(window, "quarantineNextAction")
+    assert action.property("text") == "Check again"
+    capture(window, tmp_path, f"quarantine-{reason.replace('_', '-')}")
+    click(window, "quarantineNextAction")
+    wait_until(lambda: requested_commands(farm) == ["check_again"])
+
+
+def test_quarantine_screen_renders_inactive_state(open_dashboard, farm, tmp_path):
+    farm.state()
+    window = open_dashboard("quarantineTab")
+    assert qml_item(window, "noQuarantine").property("visible")
+    capture(window, tmp_path, "quarantine-inactive")

@@ -42,6 +42,15 @@ class ServiceState:
     quarantine: dict[str, Any] | None = None
     command_refusals: tuple[dict[str, Any], ...] = ()
     refusals_superseded_through: str = ""
+    game_update_classification: str | None = None
+    last_restore: dict[str, Any] | None = None
+    keep_official: bool = False
+
+
+class _PatchChanges(TypedDict, total=False):
+    game_update_classification: str
+    last_restore: dict[str, Any]
+    keep_official: bool
 
 
 class _StateChanges(TypedDict, total=False):
@@ -100,12 +109,15 @@ def read_state(os_: Platform) -> ServiceState:
         kind, reason = StateKind.STALE, "Service is not running"
     outcome, quarantine = payload.get("last_outcome"), payload.get("quarantine")
     refusals = payload.get("command_refusals")
+    restore = payload.get("last_restore")
     return ServiceState(kind, reason, updated_at, interval, _text(payload.get("session_id")),
                         _text(payload.get("farmer_phase")), _number(payload.get("last_heartbeat")),
                         outcome if isinstance(outcome, dict) else None,
                         quarantine if isinstance(quarantine, dict) else None,
                         tuple(row for row in refusals if isinstance(row, dict)) if isinstance(refusals, list) else (),
-                        _text(payload.get("refusals_superseded_through")) or "")
+                        _text(payload.get("refusals_superseded_through")) or "",
+                        _text(payload.get("game_update_classification")),
+                        restore if isinstance(restore, dict) else None, payload.get("keep_official") is True)
 
 
 def _quarantine(record: dict[str, Any]) -> dict[str, Any]:
@@ -132,7 +144,9 @@ class StateReporter:
                                    last_outcome=previous.last_outcome,
                                    quarantine=_quarantine(quarantine) if quarantine is not None else None,
                                    command_refusals=self._read_refusals(previous.refusals_superseded_through),
-                                   refusals_superseded_through=previous.refusals_superseded_through)
+                                   refusals_superseded_through=previous.refusals_superseded_through,
+                                   game_update_classification=previous.game_update_classification,
+                                   last_restore=previous.last_restore, keep_official=previous.keep_official)
         self._thread = threading.Thread(target=self._refresh, daemon=True)
 
     def __enter__(self) -> "StateReporter":
@@ -160,6 +174,14 @@ class StateReporter:
             if (cutoff := self._state.refusals_superseded_through) != prior_cutoff:
                 self._state = replace(self._state, command_refusals=self._read_refusals(cutoff))
             self._publish()
+
+    def patch_status(self, **changes: Unpack[_PatchChanges]) -> None:
+        """Publish patch diagnostics without changing the session or service phase."""
+        with self._lock:
+            updated = replace(self._state, **changes)
+            if updated != self._state or self._error is not None:
+                self._state = updated
+                self._publish()
 
     def observe_farmer(self, status: dict[str, Any]) -> None:
         phase = _text(status.get("phase"))
