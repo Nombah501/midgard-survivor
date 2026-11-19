@@ -111,8 +111,7 @@ func _ready() -> void:
 	session_id = OS.get_environment("FARMER_SESSION_ID")
 	if session_id == "":
 		session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
-	if session_id.begins_with("verify-"):
-		_test_wait_at_keep = OS.get_environment("FARMER_TEST_WAIT_AT_KEEP") == "1"
+	_test_wait_at_keep = _test_env("WAIT_AT_KEEP") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
 	_mark_transition("boot")
@@ -2328,9 +2327,17 @@ func _journal_has(run_id: String) -> bool:
 	return false
 
 
-# Test-only seam used by verify.sh; never set in a real session.
+# Test-only seams for verify.sh. _test_env is the single reader of
+# FARMER_TEST_* (enforced by tools/check.sh): it answers only in verify-*
+# sessions, so a leaked variable cannot change a real session.
+func _test_env(name: String) -> String:
+	if not session_id.begins_with("verify-"):
+		return ""
+	return OS.get_environment("FARMER_TEST_" + name)
+
+
 func _test_crash(point: String) -> void:
-	if session_id.begins_with("verify-") and OS.get_environment("FARMER_TEST_CRASH_AT") == point:
+	if _test_env("CRASH_AT") == point:
 		_log("TEST_CRASH " + point)
 		OS.kill(OS.get_process_id())
 
@@ -2691,8 +2698,8 @@ func _profile_fingerprint() -> String:
 
 
 func _flush_profile_verified() -> bool:
-	# Test-only seam used by verify.sh; never set in a real session.
-	if session_id.begins_with("verify-") and OS.get_environment("FARMER_TEST_FLUSH_FAIL") == "1":
+	# Test-only seam used by verify.sh.
+	if _test_env("FLUSH_FAIL") == "1":
 		return false
 	var before := _profile_fingerprint()
 	# Force a content change so a successful write must alter the fingerprint.

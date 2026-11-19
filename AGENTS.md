@@ -13,3 +13,7 @@ Five canonical roles: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-fo
 ### Domain docs
 
 Single-context: root `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`.
+
+### Farmer code
+
+Before changing or reviewing the farmer, supervisor, `run.sh` or `verify.sh`, read `docs/agents/farmer-map.md`: lifecycle by function name, contracts, how to verify.

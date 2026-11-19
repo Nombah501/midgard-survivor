@@ -3,6 +3,9 @@
 # Safe: verifies hashes, backs up state/profile, copies atomically.
 set -euo pipefail
 
+# Parsed whole before it runs; safe to edit during an install (see run.sh).
+main() {
+
 FARMER_DIR="$(cd "$(dirname "$0")" && pwd)"
 GAME_DIR="${GAME_DIR:-$HOME/games/midgard-survivors}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/godot/app_userdata/Midgard Survivors"
@@ -84,3 +87,6 @@ echo "Installed $PATCHES/patch_farmer.pck"
 echo "  official: $PATCH_FILE"
 echo "  backup:   $BACKUP"
 echo "  next:     ./run.sh presets/one-run.json"
+}
+
+main "$@"

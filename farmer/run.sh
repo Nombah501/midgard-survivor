@@ -5,6 +5,10 @@
 #   FARMER_DISPLAY=1 ./run.sh        windowed instead of headless
 set -euo pipefail
 
+# The whole script is one function, parsed before it runs: editing this file
+# while a launch is in progress cannot change what that launch executes.
+main() {
+
 FARMER_DIR="$(cd "$(dirname "$0")" && pwd)"
 GAME_DIR="${GAME_DIR:-$HOME/games/midgard-survivors}"
 GAME="$GAME_DIR/MidgardSurvivors.x86_64"
@@ -197,3 +201,6 @@ if [[ "$code" == "0" ]]; then
 	exit 1
 fi
 exit "$code"
+}
+
+main "$@"

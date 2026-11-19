@@ -1,0 +1,32 @@
+# Farmer code map
+
+Where the AFK farmer's behaviour lives. Function names, not line numbers: `grep -n '^func <name>' farmer/src/farmer.gd`.
+
+## Run lifecycle (`farmer/src/farmer.gd`)
+
+`_process` drives one phase per frame:
+
+1. `idle` → `_prepare_run`: choose target, snapshot pre-run state, `world.start_run`, checkpoint `run`.
+2. `run` → `_tick_run`; the run ends via the game or `_end_run_safe`.
+3. `settle` → `_begin_settle` / `_check_settle` until the end screen.
+4. `keep` → `_do_keep`: keep, sell the rest, `Save.flush`, checkpoint `settled`.
+5. `maint` → `_do_maintenance`, then `_complete_run`: checkpoint `settled` again, `_account_run` (totals, journal `_append_run_log`, `_update_arm`), checkpoint `idle`.
+6. Terminal: `_finish(reason)` (verified flush via `_flush_profile_verified`, `phase=done`) or `_fail_session(reason)` (`phase=failed`).
+
+Cross-cutting:
+
+- Status (supervisor contract): `_write_status`, `_totals`.
+- Checkpoint and crash recovery: `_write_checkpoint`, `_restore_checkpoint`, `_journal_has`; session identity from `FARMER_SESSION_ID`.
+- Operator commands and limits: `_check_command` (claims `user://farmer_command`; legacy `farmer_stop` = finish), `_check_limits` (`max_minutes`, `max_runs`, `stop_after_wins`), both ending in `_request_finish`.
+
+## Around the game
+
+- `farmer/tools/supervisor.py`: restart, backoff, quarantine, notifications, the systemd unit (`--print-unit`). Its tests are in `farmer/tests/test_supervisor.py`.
+- `farmer/run.sh`: preflight (exit 78 = unfixable), network isolation for supervised sessions, backups and known-good. Its tests are in `farmer/tests/test_run_sh.py`.
+- Contracts and operator docs: `farmer/README.md` (AFK session, commands, isolation/backup, status). Decisions: `docs/adr/`.
+
+## Verification
+
+- `farmer/tools/check.sh`: static checks plus pytest when tools, tests or scripts are staged. Needs no game.
+- `farmer/tools/verify.sh [--scenario…]`: real-game scenarios on a sandbox copy of the profile. Run `./build.sh` first after any `farmer.gd` change. One game per machine: runs queue on `.sandbox/verify.lock`.
+- The real profile and the real install (`./install.sh`) are the operator's. Leave them to the operator.

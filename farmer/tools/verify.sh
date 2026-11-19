@@ -20,6 +20,9 @@
 # Artifacts: farmer/logs/verify-<stamp>/{summary.json,*.log,*.status.json}
 set -euo pipefail
 
+# Parsed whole before it runs; safe to edit during a verification (see run.sh).
+main() {
+
 FARMER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_DIR="$(cd "$FARMER_DIR/.." && pwd)"
 GAME_DIR="${GAME_DIR:-$HOME/games/midgard-survivors}"
@@ -67,6 +70,15 @@ for arg in "$@"; do
 done
 if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
 	SCENARIOS=("${ALL_SCENARIOS[@]}")
+fi
+
+# One game process per machine: concurrent verifications queue here instead
+# of racing for the game (VERIFY_LOCK_WAIT seconds, default 1 h).
+mkdir -p "$REPO_DIR/.sandbox"
+exec 8>"$REPO_DIR/.sandbox/verify.lock"
+if ! flock -n 8; then
+	echo "verify: another verification holds .sandbox/verify.lock; waiting"
+	flock -w "${VERIFY_LOCK_WAIT:-3600}" 8 || die "timed out waiting for .sandbox/verify.lock"
 fi
 
 [[ -x "$GAME_DIR/MidgardSurvivors.x86_64" ]] || die "game not found at $GAME_DIR"
@@ -643,3 +655,6 @@ else
 	rm -rf "$SB"
 	echo "verify: PASS"
 fi
+}
+
+main "$@"

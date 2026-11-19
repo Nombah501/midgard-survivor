@@ -66,6 +66,25 @@ then
 	fail=1
 fi
 
+# Test-only seams: FARMER_TEST_* is read only by farmer.gd's _test_env, which
+# ignores it outside verify-* sessions.
+seams="$(grep -n 'get_environment("FARMER_TEST_' "$FARMER/src/farmer.gd" || true)"
+if [[ "$(grep -c . <<<"$seams")" -ne 1 ]] || ! grep -q '"FARMER_TEST_" + name' <<<"$seams"; then
+	echo "check: FARMER_TEST_* must be read only through _test_env in farmer.gd:" >&2
+	echo "$seams" >&2
+	fail=1
+fi
+
+# Behaviour tests for supervisor.py and run.sh/install.sh (fake child, fake
+# game; no real game). Run when that code is staged, and always post-commit.
+if [[ "$MODE" != "pre-commit" ]] \
+	|| git diff --cached --name-only | grep -Eq '^farmer/(tools/|tests/|run\.sh$|install\.sh$)'; then
+	if ! (cd "$FARMER" && python3 -m pytest -q tests); then
+		echo "check: pytest failed" >&2
+		fail=1
+	fi
+fi
+
 # Game API identifiers used by farmer.gd. analysis/src is not committed.
 if [[ -d "$ROOT/analysis/src" ]]; then
 	if ! (cd "$FARMER" && python3 tools/check_api.py); then
