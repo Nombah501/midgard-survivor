@@ -19,3 +19,4 @@
 
 - 2026-11-19 (review of ticket 03): `farmer_patch.snapshot_official_state` raises while the farmer pack is mounted. Pipeline step 1, refreshing the official state, works after a Game update because the farmer pack is gone by then. On a Farmer hash change the farmer pack is still mounted, so the pipeline must skip the refresh and keep the existing `patches/official-state.json`. Cover this with a test.
 - Install re-checks for a running game after staging, but a narrow window remains before the state write, and no test covers it. The pipeline's "game running → wait" gate is the primary guard.
+- 2026-11-19 (from ticket 06): smoke is `core.smoke.run_smoke(os_, profile)`. BUSY means the game is open: wait, do not quarantine. FAILED, after its own single retry, maps to `smoke_failed`; do not retry it again in the pipeline.
