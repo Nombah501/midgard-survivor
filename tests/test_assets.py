@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import sys
@@ -79,3 +80,38 @@ def test_release_tag_matches_wheel_version_and_classifies_prereleases(tmp_path, 
         assert result.returncode == 0, result.stderr
         assert len(list(release.glob("*.sha256"))) == 1
         assert f"prerelease={prerelease}" in outputs.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="use a symlink to stand in for a Windows short path")
+def test_onedir_smoke_accepts_an_aliased_extraction_path(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(_REPO / "packaging"))
+    import check_onedir
+
+    extracted = tmp_path / "midgard farm extracted"
+    onedir = extracted / "midgard-farm"
+    inputs = onedir / "_internal" / "midgard_farm" / "_farmer"
+    checkout = _REPO / "farmer"
+    for name in ("src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py", "targets.json"):
+        target = inputs / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(checkout / name, target)
+    shutil.copytree(checkout / "presets", inputs / "presets")
+    plugins = onedir / "_internal" / "PySide6" / "Qt" / "plugins" / "platforms"
+    plugins.mkdir(parents=True)
+    for platform in ("qoffscreen", "qwayland", "qxcb"):
+        (plugins / f"lib{platform}.so").touch()
+    alias = tmp_path / "MIDGAR~1"
+    alias.symlink_to(extracted, target_is_directory=True)
+
+    def run_role(executable, flag, home, env):
+        if flag == "--self-check":
+            return {"version": assets.version(), "inputs": str(inputs.resolve()),
+                    "farmer_hash": farmer_hash(inputs), "registration": ""}
+        targets = json.loads((inputs / "targets.json").read_bytes())
+        return {"version": assets.version(), "loaded": True, "messages": [],
+                "presets": sorted(path.name for path in (inputs / "presets").glob("*.json")),
+                "characters": [row["label"] for row in targets["characters"].values()]}
+
+    monkeypatch.setattr(check_onedir, "run_role", run_role)
+    monkeypatch.setattr(check_onedir, "check_registration", lambda *args: None)
+    check_onedir.check(alias / "midgard-farm")

@@ -71,6 +71,8 @@ def check_qt_files(onedir: Path) -> float:
 
 
 def check(onedir: Path) -> None:
+    # Windows temp paths can use an 8.3 alias while the child reports the long path.
+    onedir = onedir.resolve(strict=True)
     size_mib = check_qt_files(onedir)
     checkout = _ROOT / "farmer"
     version = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
@@ -102,7 +104,7 @@ def check(onedir: Path) -> None:
         service_report = run_role(service, "--self-check", home, env)
         assert service_report["version"] == version, service_report
         assert service_report["farmer_hash"] == expected_hash, service_report
-        inputs = Path(service_report["inputs"])
+        inputs = Path(service_report["inputs"]).resolve(strict=True)
         assert inputs.is_relative_to(onedir), inputs
         expected = {source.relative_to(checkout): source.read_bytes() for source in expected_assets}
         actual = {path.relative_to(inputs): path.read_bytes() for path in inputs.rglob("*") if path.is_file()}
