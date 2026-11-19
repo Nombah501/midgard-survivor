@@ -9,9 +9,12 @@ from typing import Never
 
 from . import InstanceLock, LockHeld, NetworkIsolationError, Platform, ProcessTree, check_argv
 
+_GODOT_DATA_HOME = "XDG_DATA_HOME"
+_GODOT_USER_DATA = Path("godot", "app_userdata")
+
 
 def _xdg_data_home() -> Path:
-    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return Path(os.environ.get(_GODOT_DATA_HOME) or Path.home() / ".local" / "share")
 
 
 def exec_isolated_game(args: list[str]) -> Never:
@@ -59,7 +62,10 @@ class LinuxPlatform(Platform):
     game_exit_status_reliable = True
 
     def godot_user_data_root(self) -> Path:
-        return _xdg_data_home() / "godot" / "app_userdata"
+        return _xdg_data_home() / _GODOT_USER_DATA
+
+    def godot_sandbox(self, data_home: Path) -> tuple[Path, dict[str, str]]:
+        return data_home / _GODOT_USER_DATA, {**os.environ, _GODOT_DATA_HOME: str(data_home)}
 
     def app_data_dir(self) -> Path:
         return _xdg_data_home() / "midgard-farm"

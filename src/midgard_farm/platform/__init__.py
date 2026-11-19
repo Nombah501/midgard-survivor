@@ -5,6 +5,7 @@ The core asks `current()` for the implementation and never branches on the OS.
 
 import abc
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,19 @@ class Platform(abc.ABC):
     @abc.abstractmethod
     def godot_user_data_root(self) -> Path:
         """Godot's root for `user://` folders of apps without a custom user dir."""
+
+    @abc.abstractmethod
+    def godot_sandbox(self, data_home: Path) -> tuple[Path, dict[str, str]]:
+        """Return the Godot user-data root and child environment for an isolated data home."""
+
+    def link_sandbox_pack(self, source: Path, target: Path) -> None:
+        """Hard-link an immutable pack, or copy it where hard links are unavailable."""
+        source = source.resolve(strict=True)
+        try:
+            target.hardlink_to(source)
+        except OSError:
+            # Cross-volume hard links fail, and symlinks can require elevation on Windows.
+            shutil.copyfile(source, target)
 
     @abc.abstractmethod
     def app_data_dir(self) -> Path:

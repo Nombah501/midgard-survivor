@@ -13,6 +13,9 @@ from . import InstanceLock, LockHeld, Platform, ProcessTree, check_argv
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _ntdll = ctypes.WinDLL("ntdll")
 
+_GODOT_DATA_HOME = "APPDATA"
+_GODOT_USER_DATA = Path("Godot", "app_userdata")
+
 ERROR_ACCESS_DENIED = 5
 ERROR_SHARING_VIOLATION = 32
 ERROR_LOCK_VIOLATION = 33
@@ -113,7 +116,10 @@ class WindowsPlatform(Platform):
     game_exit_status_reliable = False
 
     def godot_user_data_root(self) -> Path:
-        return _env_dir("APPDATA") / "Godot" / "app_userdata"
+        return _env_dir(_GODOT_DATA_HOME) / _GODOT_USER_DATA
+
+    def godot_sandbox(self, data_home: Path) -> tuple[Path, dict[str, str]]:
+        return data_home / _GODOT_USER_DATA, {**os.environ, _GODOT_DATA_HOME: str(data_home)}
 
     def app_data_dir(self) -> Path:
         return _env_dir("LOCALAPPDATA") / "MidgardFarm"

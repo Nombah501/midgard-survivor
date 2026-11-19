@@ -35,6 +35,41 @@ def test_profile_is_found_under_this_os_godot_root(tmp_path, monkeypatch):
     assert find_profile(OS.godot_user_data_root()) == profile
 
 
+def test_godot_sandbox_paths_apply_only_to_the_child(tmp_path, monkeypatch):
+    real = tmp_path / "real data"
+    for name in ("XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(real))
+    sandbox = tmp_path / "sandbox data"
+
+    root, env = OS.godot_sandbox(sandbox)
+    expected = make_profile(godot_root(sandbox), "Renamed Game Profile")
+    with python(
+        """
+        from midgard_farm import platform
+        from midgard_farm.core.profile import find_profile
+        print(find_profile(platform.current().godot_user_data_root()))
+        """,
+        env=env,
+    ) as child:
+        stdout, _ = child.communicate(timeout=30)
+
+    assert child.returncode == 0
+    assert Path(stdout.strip()) == expected
+    assert root == godot_root(sandbox)
+    assert OS.godot_user_data_root() == godot_root(real)
+
+
+def test_sandbox_pack_link_shares_the_pack_and_can_be_removed(tmp_path):
+    pack = tmp_path / "official.pck"
+    pack.write_bytes(b"official pack")
+    link = tmp_path / "sandbox.pck"
+    OS.link_sandbox_pack(pack, link)
+
+    assert pack.samefile(link)
+    link.unlink()
+    assert pack.read_bytes() == b"official pack"
+
+
 def test_lock_is_exclusive_across_processes_and_freed_when_holder_dies(tmp_path):
     lock_path = tmp_path / "service.lock"
     holder = python(
