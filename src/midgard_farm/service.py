@@ -155,16 +155,17 @@ def main(*, policy: Policy = Policy()) -> int:
     if args.print_unit:
         print(render_unit(service_command(windowless=False)), end="")
         return 0
-    if args.print_task and sys.platform != "win32":
+    os_ = platform.current()
+    windows = os_.release_os == "windows"
+    if args.print_task and not windows:
         parser.error("--print-task is only available on Windows")
 
-    os_ = platform.current()
     if args.register or args.unregister or args.dry_run or args.print_task:
         try:
             if args.unregister:
                 os_.unregister_service()
             else:
-                argv = service_command(windowless=(sys.platform == "win32"))
+                argv = service_command(windowless=windows)
                 if args.dry_run or args.print_task:
                     print(os_.render_service(argv), end="")
                 else:
