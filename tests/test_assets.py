@@ -100,6 +100,15 @@ def test_onedir_smoke_accepts_an_aliased_extraction_path(tmp_path, monkeypatch):
     plugins.mkdir(parents=True)
     for platform in ("qoffscreen", "qwayland", "qxcb"):
         (plugins / f"lib{platform}.so").touch()
+    qt = plugins.parents[1]
+    libs = qt / "lib"
+    libs.mkdir()
+    for style in ("Basic", "Fusion"):
+        impl = qt / "qml" / "QtQuick" / "Controls" / style / "impl"
+        impl.mkdir(parents=True)
+        (impl / "qmldir").touch()
+        (impl / f"libqtquickcontrols2{style.lower()}styleimplplugin.so").touch()
+        (libs / f"libQt6QuickControls2{style}StyleImpl.so.6").touch()
     alias = tmp_path / "MIDGAR~1"
     alias.symlink_to(extracted, target_is_directory=True)
 
@@ -115,3 +124,20 @@ def test_onedir_smoke_accepts_an_aliased_extraction_path(tmp_path, monkeypatch):
     monkeypatch.setattr(check_onedir, "run_role", run_role)
     monkeypatch.setattr(check_onedir, "check_registration", lambda *args: None)
     check_onedir.check(alias / "midgard-farm")
+
+
+def test_qt_filter_keeps_fusion_implementation_in_windows_toc(monkeypatch):
+    monkeypatch.syspath_prepend(str(_REPO / "packaging"))
+    from qt_bundle import keep_qt_file
+
+    for destination in (
+        r"PySide6\qml\QtQuick\Controls\Fusion\impl\qmldir",
+        r"PySide6\qml\QtQuick\Controls\Fusion\impl\qtquickcontrols2fusionstyleimplplugin.dll",
+        r"PySide6\qml\QtQuick\Controls\Basic\impl\qmldir",
+        r"PySide6\qml\QtQuick\Controls\Basic\impl\qtquickcontrols2basicstyleimplplugin.dll",
+        r"PySide6\Qt6QuickControls2FusionStyleImpl.dll",
+        r"PySide6\Qt6QuickControls2BasicStyleImpl.dll",
+    ):
+        assert keep_qt_file(destination), destination
+    assert not keep_qt_file(r"PySide6\qml\QtQuick\Controls\Material\impl\qmldir")
+    assert not keep_qt_file(r"PySide6\Qt6WebEngineCore.dll")

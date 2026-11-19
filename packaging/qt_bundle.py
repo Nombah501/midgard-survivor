@@ -15,6 +15,7 @@ _QML_DIRS = frozenset("""
     QtQml QtQml/Models QtQml/WorkerScript
     QtQuick QtQuick/Window QtQuick/Layouts QtQuick/Templates
     QtQuick/Controls QtQuick/Controls/impl QtQuick/Controls/Basic QtQuick/Controls/Fusion
+    QtQuick/Controls/Basic/impl QtQuick/Controls/Fusion/impl
 """.lower().split())
 _PLATFORM_PLUGINS = frozenset("qoffscreen qxcb qwayland qwayland-egl qwindows".split())
 _PLUGIN_DIRS = frozenset("""

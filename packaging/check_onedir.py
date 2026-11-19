@@ -53,6 +53,7 @@ def check_registration(executable: Path, definition: str, env: dict[str, str], h
 def check_qt_files(onedir: Path) -> float:
     internal = onedir / "_internal"
     rejected = []
+    internal_files = set()
     size = 0
     platforms = set()
     for path in onedir.rglob("*"):
@@ -60,13 +61,30 @@ def check_qt_files(onedir: Path) -> float:
             continue
         if not path.is_symlink():
             size += path.stat().st_size
-        if path.is_relative_to(internal) and not keep_qt_file(path.relative_to(internal).as_posix()):
-            rejected.append(path.relative_to(onedir))
+        if path.is_relative_to(internal):
+            relative = path.relative_to(internal)
+            internal_files.add(relative.name.lower())
+            if not keep_qt_file(relative.as_posix()):
+                rejected.append(relative)
         if path.parent.name == "platforms":
             platforms.add(path.stem.removeprefix("lib"))
     assert not rejected, f"Unexpected Qt modules or plugins: {sorted(rejected)}"
     required = {"qoffscreen", "qwindows"} if os.name == "nt" else {"qoffscreen", "qxcb", "qwayland"}
     assert required <= platforms, f"Missing desktop platform plugins: {required - platforms}"
+    qt = internal / "PySide6"
+    if os.name != "nt":
+        qt /= "Qt"
+    for style in ("Basic", "Fusion"):
+        impl = qt / "qml" / "QtQuick" / "Controls" / style / "impl"
+        plugin = f"qtquickcontrols2{style.lower()}styleimplplugin"
+        library = f"qt6quickcontrols2{style.lower()}styleimpl"
+        if os.name == "nt":
+            plugin, library = f"{plugin}.dll", f"{library}.dll"
+        else:
+            plugin, library = f"lib{plugin}.so", f"lib{library}.so.6"
+        for path in (impl / "qmldir", impl / plugin):
+            assert path.is_file(), f"Missing Qt style implementation file: {path.relative_to(internal)}"
+        assert library in internal_files, f"Missing Qt style implementation library: {library}"
     return size / 2**20
 
 
