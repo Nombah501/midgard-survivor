@@ -36,15 +36,16 @@ def wait_for(read, predicate=bool, *, seconds=20):
     # Generous: a passing test returns as soon as the condition holds; the
     # budget only bounds a real failure, and windows-latest runs slowly.
     deadline = time.monotonic() + seconds
+    last: object = "<nothing read>"
     while time.monotonic() < deadline:
         try:
-            result = read()
-            if predicate(result):
-                return result
-        except (FileNotFoundError, ValueError):
-            pass
+            last = read()
+            if predicate(last):
+                return last
+        except (FileNotFoundError, ValueError) as exc:
+            last = exc
         time.sleep(0.01)
-    pytest.fail(f"condition not reached: {read}")
+    pytest.fail(f"condition not reached: {read}; last read: {last!r}")
 
 
 @dataclass
