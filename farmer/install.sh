@@ -11,6 +11,7 @@ STATE="$PATCHES/state.json"
 INFO="$FARMER_DIR/patch_farmer.info"
 PCK="$FARMER_DIR/patch_farmer.pck"
 BUILD_JSON="$FARMER_DIR/farmer_build.json"
+BACKUP_DIR="${FARMER_BACKUP_DIR:-$FARMER_DIR/backups}"
 
 die() { echo "install: $*" >&2; exit 1; }
 
@@ -44,8 +45,8 @@ LOCAL_SHA="$(sha256sum "$PCK" | cut -d' ' -f1)"
 [[ "$LOCAL_SHA" == "$FARMER_SHA" ]] || die "patch_farmer.pck does not match its manifest"
 
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"
-BACKUP="$FARMER_DIR/backups/$STAMP"
-mkdir -p "$BACKUP"
+BACKUP="$BACKUP_DIR/$STAMP"
+mkdir -p -- "$BACKUP"
 for name in state.json profile.json profile.bak.json profile.run profile.run.farmer_bak; do
 	if [[ -f "$DATA/$name" ]]; then
 		cp "$DATA/$name" "$BACKUP/$name"
@@ -55,9 +56,9 @@ for name in state.json profile.json profile.bak.json profile.run profile.run.far
 done
 
 # Keep one permanent pre-farmer state snapshot (only if it is official).
-if [[ ! -f "$FARMER_DIR/backups/official-state.json" ]]; then
+if [[ ! -f "$BACKUP_DIR/official-state.json" ]]; then
 	if [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("file",""))' "$STATE")" != "patch_farmer.pck" ]]; then
-		cp "$STATE" "$FARMER_DIR/backups/official-state.json"
+		cp "$STATE" "$BACKUP_DIR/official-state.json"
 	fi
 fi
 

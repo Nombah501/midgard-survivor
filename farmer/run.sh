@@ -13,6 +13,7 @@ PATCHES="$DATA/patches"
 STATE="$PATCHES/state.json"
 INFO="$FARMER_DIR/patch_farmer.info"
 LOG_DIR="$FARMER_DIR/logs"
+BACKUP_DIR="${FARMER_BACKUP_DIR:-$FARMER_DIR/backups}"
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"
 LOG="$LOG_DIR/run-$STAMP.log"
 
@@ -49,6 +50,12 @@ FARMER_SHA="$(info_get PATCH_FARMER_SHA256)"
 [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("file",""))' "$STATE")" == "patch_farmer.pck" ]] \
 	|| die "state.json does not mount patch_farmer.pck; run ./install.sh"
 
+if [[ -n "${FARMER_SESSION_ID:-}" ]]; then
+	if ! unshare -cn -- true; then
+		die "network isolation requires util-linux unshare -cn and permission to create user/network namespaces; no game launched"
+	fi
+fi
+
 mkdir -p "$LOG_DIR"
 if [[ $# -ge 1 ]]; then
 	[[ -f "$1" ]] || die "preset not found: $1"
@@ -67,13 +74,45 @@ PY
 fi
 
 # Unique backup; never overwrites a previous snapshot.
-BACKUP="$FARMER_DIR/backups/$STAMP"
-mkdir -p "$BACKUP"
-for name in profile.json profile.bak.json profile.run profile.run.farmer_bak; do
+BACKUP="$BACKUP_DIR/$STAMP"
+PROFILE_FILES=(profile.json profile.bak.json profile.run profile.run.farmer_bak)
+mkdir -p -- "$BACKUP"
+for name in "${PROFILE_FILES[@]}"; do
 	if [[ -f "$DATA/$name" ]]; then cp "$DATA/$name" "$BACKUP/$name"; fi
 done
-# Keep the 10 newest routine snapshots; never touch backups/official-state.json.
-{ ls -1dt "$FARMER_DIR"/backups/*/ 2>/dev/null || true; } | tail -n +11 | xargs -r rm -rf || true
+# Only timestamped snapshots participate in routine rotation.
+find "$BACKUP_DIR" -regextype posix-extended -mindepth 1 -maxdepth 1 -type d \
+	-regex '.*/[0-9]{8}-[0-9]{6}-[0-9]+' -printf '%T@ %p\0' |
+	sort -z -nr | tail -zn +11 | cut -z -d ' ' -f2- | xargs -0r rm -rf -- || true
+
+publish_known_good() (
+	local dir name
+	local -a files=(profile.json)
+	for name in "${PROFILE_FILES[@]:1}"; do
+		if [[ -e "$DATA/$name" ]]; then files+=("$name"); fi
+	done
+	for name in "${files[@]}"; do
+		[[ -f "$DATA/$name" && -s "$DATA/$name" ]] || exit 1
+	done
+
+	dir="$(mktemp -d -- "$BACKUP_DIR/.known-good.XXXXXXXX")" || exit 1
+	trap 'rm -rf -- "$dir"' EXIT
+	mkdir -- "$dir/snapshot" "$dir/user" || exit 1
+	(cd "$DATA" && sha256sum -- "${files[@]}") >"$dir/snapshot/SHA256SUMS" || exit 1
+	for name in "${files[@]}"; do
+		cp -- "$DATA/$name" "$dir/snapshot/$name" &&
+			cp -- "$dir/snapshot/$name" "$dir/user/$name" || exit 1
+	done
+	# The game stores binary profiles; verify the copy byte for byte.
+	# Hashing the second copy checks both the snapshot and copying it back out.
+	(cd "$dir/user" && sha256sum --check --status -) <"$dir/snapshot/SHA256SUMS" || exit 1
+
+	if [[ -e "$BACKUP_DIR/known-good" ]]; then
+		mv -T --exchange --no-copy -- "$dir/snapshot" "$BACKUP_DIR/known-good"
+	else
+		mv -T -- "$dir/snapshot" "$BACKUP_DIR/known-good"
+	fi
+)
 
 rm -f "$DATA/farmer_stop" "$DATA/farmer_status.json"
 if [[ -f "$DATA/farmer.log" ]]; then
@@ -96,11 +135,22 @@ fi
 # Do not pass user args starting with '--': the game's Updater disables all
 # patches when it sees one (updater.gd _enabled). The farmer uses the
 # GameData \"karma_test\" meta to keep the run open at the victory point.
+launch=("$GAME")
+if [[ -n "${FARMER_SESSION_ID:-}" ]]; then
+	ready="$(mktemp -- "$LOG_DIR/.net-$STAMP.XXXXXXXX")" || die "cannot prepare network isolation launch"
+	trap 'rm -f -- "$ready"' EXIT
+	# Signal actual namespace entry independently of the game's exit code.
+	# No --fork or new session: the game stays in the supervisor's process group.
+	launch=(unshare -cn -- "$BASH" -ec 'printf "1\n" >"$1"; shift; exec "$@"' bash "$ready" "$GAME")
+fi
 
 set +e
-"$GAME" "${args[@]}" 2>&1 | tee "$LOG"
+"${launch[@]}" "${args[@]}" 2>&1 | tee "$LOG"
 code=${PIPESTATUS[0]}
 set -e
+if [[ -n "${FARMER_SESSION_ID:-}" && ! -s "$ready" ]]; then
+	die "network isolation failed before the supervised game could launch; see $LOG"
+fi
 
 phase=""
 failed=""
@@ -126,6 +176,10 @@ fi
 # Only that post-flush code is accepted; any other non-zero child code propagates.
 if [[ "$phase" == "done" && "$failed" != "true" && ( "$code" == "0" || "$code" == "137" ) ]]; then
 	echo "farmer: finished cleanly (exit $code${finish_reason:+ reason=$finish_reason})"
+	if [[ -n "${FARMER_SESSION_ID:-}" && "$finish_reason" =~ ^(finish|stop|max_runs|wins|goal|no_target)$ ]] &&
+		! publish_known_good; then
+		echo "run: known-good copy verification failed or publication was unavailable; previous snapshot unchanged" >&2
+	fi
 	[[ -f "$DATA/farmer_status.json" ]] && python3 - "$DATA/farmer_status.json" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
