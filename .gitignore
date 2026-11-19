@@ -8,3 +8,5 @@ farmer/patch_farmer.info
 farmer/farmer_build.json
 __pycache__/
 .pytest_cache/
+.venv/
+*.egg-info/
