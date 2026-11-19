@@ -118,7 +118,7 @@ class Supervisor:
                                    and saved_quarantine.get("reason") in UPDATE_FAILURES else None)
         self._check_again = False
 
-    def _recover_session(self) -> tuple[str, Start] | None:
+    def _recover_session(self) -> tuple[str, Start, str] | None:
         try:
             saved = json.loads(self.os.read_shared(self.session_path))
         except FileNotFoundError:
@@ -150,13 +150,13 @@ class Supervisor:
             (self.queue / request).unlink(missing_ok=True)
         except OSError as exc:
             raise InvalidSavedSession(f"{self.session_path}: cannot acknowledge saved Start: {exc}") from exc
-        return session_id, start
+        return session_id, start, request
 
     def run(self) -> None:
         if recovered := self._recover_session():
-            session_id, start = recovered
+            session_id, start, request = recovered
             log(f"continuing unfinished session {session_id}")
-            self._run_session(session_id, start)
+            self._run_session(session_id, start, request)
         elif self.stop_requested_at() is None:
             self._idle_update()
 
@@ -181,7 +181,7 @@ class Supervisor:
                 self._write(self.session_path, {"id": session_id, "start": command.payload(),
                                                 "profile": str(self.profile.absolute()), "request": path.name})
                 path.unlink()
-                self._run_session(session_id, command)
+                self._run_session(session_id, command, path.name)
                 break
             else:
                 if time.monotonic() >= next_check:
@@ -237,27 +237,48 @@ class Supervisor:
     def _refuse_start(self, path: Path) -> None:
         refuse_command(self.os, self.state, path, "start", "AFK session already active")
 
-    def _run_session(self, session_id: str, start: Start) -> None:
+    def _recover_outcome(self, log_dir: Path, session_id: str) -> tuple[dict, dict | None] | None:
+        path = log_dir / "outcome.json"
+        quarantine_path = log_dir / "quarantine.json"
+        try:
+            try:
+                outcome = json.loads(self.os.read_shared(path))
+            except FileNotFoundError:
+                if not quarantine_path.exists():
+                    return None  # Neither terminal record has been committed.
+                raise
+            if (not isinstance(outcome, dict) or outcome.get("session") != session_id
+                    or outcome.get("kind") not in ("finished", "stopped", "quarantined")
+                    or not isinstance(outcome.get("reason"), str) or not isinstance(outcome.get("attempts"), list)
+                    or ("totals" in outcome and not isinstance(outcome["totals"], dict))
+                    or ("ended_at" in outcome and type(outcome["ended_at"]) not in (int, float))):
+                raise ValueError("invalid terminal outcome")
+            quarantine = None
+            if outcome["kind"] == "quarantined":
+                path = quarantine_path
+                quarantine = json.loads(self.os.read_shared(path))
+                if (not isinstance(quarantine, dict) or quarantine.get("reason") != outcome["reason"]
+                        or not isinstance(quarantine.get("detail"), str)
+                        or not isinstance(quarantine.get("attempts"), list)):
+                    raise ValueError("invalid quarantine record")
+        except (OSError, ValueError, RecursionError) as exc:
+            raise InvalidSavedSession(f"{path}: {exc}") from exc
+        return outcome, quarantine
+
+    def _run_session(self, session_id: str, start: Start, request: str) -> None:
         log_dir = self.os.app_data_dir() / "logs" / f"supervisor-{session_id}"
         log_dir.mkdir(parents=True, exist_ok=True)
         outcome_path = log_dir / "outcome.json"
-        if outcome_path.exists():
-            # A crash after publishing the outcome must not restart the session
-            # or append a duplicate history line.
-            outcome = json.loads(self.os.read_shared(outcome_path))
-            quarantine = (json.loads(self.os.read_shared(log_dir / "quarantine.json"))
-                          if outcome["kind"] == "quarantined" else None)
-            if not any(row.get("session_id") == session_id and row["kind"] == "session"
-                       for row in read_history(self.os)):
-                if "totals" not in outcome:
-                    outcome["totals"] = session_totals(self.os, self.profile, session_id, {})
-                self._append_outcome(outcome, log_dir)
-            self._publish_outcome(outcome, log_dir, quarantine)
+        if (recovered := self._recover_outcome(log_dir, session_id)) is not None:
+            # Publishing an outcome commits the session even if it never reached history.
+            outcome, quarantine = recovered
+            self._append_outcome(outcome, log_dir, recovering=True)
+            self._publish_outcome(outcome, log_dir, quarantine, request)
             return
         if self._update_quarantine is None:
             self._quarantine_path.unlink(missing_ok=True)
         self.state.set(StateKind.ACTIVE, "AFK session in progress", session_id=session_id, quarantine=None,
-                       last_heartbeat=None, farmer_phase=None)
+                       last_heartbeat=None, farmer_phase=None, refusals_superseded_through=request)
         self._last_totals = {}
         try:
             status = json.loads(self.os.read_shared(self.profile / "farmer_status.json"))
@@ -338,7 +359,7 @@ class Supervisor:
                    "ended_at": time.time()}
         self._write(outcome_path, outcome)
         self._append_outcome(outcome, log_dir)
-        self._publish_outcome(outcome, log_dir, quarantine)
+        self._publish_outcome(outcome, log_dir, quarantine, request)
         if kind == "quarantined":
             if update_quarantine is None and quarantine is not None:
                 self.notify("quarantine", f"farmer quarantined: {reason} (last: {quarantine['detail'] or reason})")
@@ -348,13 +369,22 @@ class Supervisor:
             self.notify("stop", f"supervisor stopped by operator: {reason}")
         log(f"session {kind}: {reason} after {len(attempts)} attempt(s); diagnostics in {log_dir}")
 
-    def _append_outcome(self, outcome: dict, log_dir: Path) -> None:
-        timing = {"timestamp": outcome["ended_at"]} if "ended_at" in outcome else {}
-        append_event(self.os, "session", session_id=outcome["session"], outcome=outcome["kind"],
-                     reason=outcome["reason"], totals=outcome["totals"],
-                     diagnostics=log_dir.relative_to(self.session_path.parent).as_posix(), **timing)
+    def _append_outcome(self, outcome: dict, log_dir: Path, *, recovering: bool = False) -> None:
+        try:
+            if recovering and any(row["kind"] == "session" and row.get("session_id") == outcome["session"]
+                                  for row in read_history(self.os)):
+                return
+            if "totals" not in outcome:  # An outcome written before history was introduced.
+                outcome["totals"] = session_totals(self.os, self.profile, outcome["session"], {})
+            timing = {"timestamp": outcome["ended_at"]} if "ended_at" in outcome else {}
+            append_event(self.os, "session", session_id=outcome["session"], outcome=outcome["kind"],
+                         reason=outcome["reason"], totals=outcome["totals"],
+                         diagnostics=log_dir.relative_to(self.session_path.parent).as_posix(), **timing)
+        except (OSError, ValueError) as exc:
+            log(f"could not record AFK session {outcome['session']} in history: {exc}")
+            self.notify("history_failed", f"Could not save AFK session history. Outcome saved in {log_dir}.")
 
-    def _publish_outcome(self, outcome: dict, log_dir: Path, quarantine: dict | None) -> None:
+    def _publish_outcome(self, outcome: dict, log_dir: Path, quarantine: dict | None, request: str) -> None:
         if quarantine is not None:
             quarantine = {**quarantine, "diagnostics": log_dir.relative_to(self.session_path.parent).as_posix()}
             if quarantine["reason"] in UPDATE_FAILURES:
@@ -364,7 +394,7 @@ class Supervisor:
                        or (quarantine is not None and quarantine["reason"] in UPDATE_FAILURES))
         self.state.set(StateKind.FARMER_UNAVAILABLE if unavailable else StateKind.IDLE,
                        outcome["reason"] if unavailable else "", session_id=None, farmer_phase=None,
-                       last_outcome=outcome, quarantine=quarantine)
+                       last_outcome=outcome, quarantine=quarantine, refusals_superseded_through=request)
         self.session_path.unlink()
 
     def _remember_totals(self, status: dict) -> None:

@@ -14,6 +14,9 @@ from ..platform import Platform
 
 REFRESH_INTERVAL = 1.0
 STALE_INTERVALS = 3
+_FUTURE_INTERVALS = 2
+_MIN_REFRESH_INTERVAL = 0.1
+_MAX_REFRESH_INTERVAL = 10.0
 
 
 class StateKind(StrEnum):
@@ -38,6 +41,7 @@ class ServiceState:
     last_outcome: dict[str, Any] | None = None
     quarantine: dict[str, Any] | None = None
     command_refusals: tuple[dict[str, Any], ...] = ()
+    refusals_superseded_through: str = ""
 
 
 class _StateChanges(TypedDict, total=False):
@@ -46,6 +50,7 @@ class _StateChanges(TypedDict, total=False):
     last_heartbeat: float | None
     last_outcome: dict[str, Any] | None
     quarantine: dict[str, Any] | None
+    refusals_superseded_through: str
 
 
 def state_path(os_: Platform) -> Path:
@@ -69,6 +74,13 @@ def _number(value: object) -> float | None:
     return None
 
 
+def _refresh_interval(value: object) -> float:
+    interval = _number(value)
+    if interval is None:
+        return REFRESH_INTERVAL
+    return min(_MAX_REFRESH_INTERVAL, max(_MIN_REFRESH_INTERVAL, interval))
+
+
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -77,14 +89,14 @@ def read_state(os_: Platform) -> ServiceState:
     """Classify missing, unreadable or expired state as stale, keeping readable diagnostics."""
     payload = _object(os_, state_path(os_)) or {}
     updated_at = _number(payload.get("updated_at"))
-    interval = _number(payload.get("refresh_interval")) or REFRESH_INTERVAL
+    interval = _refresh_interval(payload.get("refresh_interval"))
     reason = _text(payload.get("reason")) or ""
     try:
         kind = StateKind(_text(payload.get("kind")) or "")
     except ValueError:
         kind = StateKind.STALE
     if (kind is StateKind.STALE or updated_at is None
-            or not 0 <= time.time() - updated_at <= STALE_INTERVALS * interval):
+            or not -_FUTURE_INTERVALS * interval <= time.time() - updated_at <= STALE_INTERVALS * interval):
         kind, reason = StateKind.STALE, "Service is not running"
     outcome, quarantine = payload.get("last_outcome"), payload.get("quarantine")
     refusals = payload.get("command_refusals")
@@ -92,7 +104,8 @@ def read_state(os_: Platform) -> ServiceState:
                         _text(payload.get("farmer_phase")), _number(payload.get("last_heartbeat")),
                         outcome if isinstance(outcome, dict) else None,
                         quarantine if isinstance(quarantine, dict) else None,
-                        tuple(row for row in refusals if isinstance(row, dict)) if isinstance(refusals, list) else ())
+                        tuple(row for row in refusals if isinstance(row, dict)) if isinstance(refusals, list) else (),
+                        _text(payload.get("refusals_superseded_through")) or "")
 
 
 def _quarantine(record: dict[str, Any]) -> dict[str, Any]:
@@ -114,11 +127,12 @@ class StateReporter:
         self._error: str | None = None
         previous = read_state(os_)
         quarantine = _object(os_, self._path.parent / "quarantine.json") or previous.quarantine
-        self._state = ServiceState(StateKind.IDLE, "", refresh_interval=refresh_interval,
+        self._state = ServiceState(StateKind.IDLE, "", refresh_interval=_refresh_interval(refresh_interval),
                                    last_heartbeat=previous.last_heartbeat,
                                    last_outcome=previous.last_outcome,
                                    quarantine=_quarantine(quarantine) if quarantine is not None else None,
-                                   command_refusals=self._read_refusals())
+                                   command_refusals=self._read_refusals(previous.refusals_superseded_through),
+                                   refusals_superseded_through=previous.refusals_superseded_through)
         self._thread = threading.Thread(target=self._refresh, daemon=True)
 
     def __enter__(self) -> "StateReporter":
@@ -138,7 +152,10 @@ class StateReporter:
         if (quarantine := changes.get("quarantine")) is not None:
             changes["quarantine"] = _quarantine(quarantine)
         with self._lock:
+            prior_cutoff = self._state.refusals_superseded_through
             self._state = replace(self._state, kind=kind, reason=reason, **changes)
+            if (cutoff := self._state.refusals_superseded_through) != prior_cutoff:
+                self._state = replace(self._state, command_refusals=self._read_refusals(cutoff))
             self._publish()
 
     def observe_farmer(self, status: dict[str, Any]) -> None:
@@ -153,13 +170,14 @@ class StateReporter:
 
     def refusals_changed(self) -> None:
         with self._lock:
-            self._state = replace(self._state, command_refusals=self._read_refusals())
+            refusals = self._read_refusals(self._state.refusals_superseded_through)
+            self._state = replace(self._state, command_refusals=refusals)
             self._publish()
 
-    def _read_refusals(self) -> tuple[dict[str, Any], ...]:
+    def _read_refusals(self, cutoff: str) -> tuple[dict[str, Any], ...]:
         return tuple({**record, "request": path.name}
                      for path in sorted((self._path.parent / "command-rejections").glob("*.json"), reverse=True)[:20]
-                     if (record := _object(self._os, path)) is not None)
+                     if path.name > cutoff and (record := _object(self._os, path)) is not None)
 
     def _refresh(self) -> None:
         while not self._stop.wait(self._state.refresh_interval):

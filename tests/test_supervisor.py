@@ -19,7 +19,7 @@ import pytest
 
 from midgard_farm import platform
 from midgard_farm.core import commands, patch_info
-from midgard_farm.core.history import append_event, read_history
+from midgard_farm.core.history import append_event, history_path, read_history
 from midgard_farm.core.state import StateKind, read_state
 from midgard_farm.core.backup import known_good_snapshot, publish_known_good
 from midgard_farm.core.farmer_patch import farmer_hash
@@ -664,6 +664,9 @@ def test_duplicate_start_is_refused_but_start_after_queued_finish_runs(farm):
 
         outcomes = wait_for(read_outcomes, lambda values: len(values) == 2)
         assert not duplicate.exists() and not finish.exists() and not next_start.exists()
+        settled = wait_for(lambda: read_state(farm.os_),
+                           lambda state: state.last_outcome and state.last_outcome["reason"] == "goal")
+        assert settled.command_refusals == ()
     refusal = json.loads(commands.rejection_path(farm.os_, duplicate).read_bytes())
     assert refusal == {"command": "start", "reason": "AFK session already active"}
     assert not (farm.data / "command-rejections" / next_start.name).exists()
@@ -671,6 +674,9 @@ def test_duplicate_start_is_refused_but_start_after_queued_finish_runs(farm):
     assert by_reason["finish"]["session"] == current
     assert by_reason["goal"]["session"] != current
     assert all(outcome["kind"] == "finished" and len(outcome["attempts"]) == 1 for outcome in outcomes)
+    with farm.service():
+        idle = wait_for(lambda: read_state(farm.os_), lambda state: state.kind is StateKind.IDLE)
+        assert idle.command_refusals == ()
 
 
 def test_startup_quarantine_preserves_corrupt_session_and_accepts_start_in_same_service(farm):
@@ -757,3 +763,82 @@ def test_recovering_committed_outcome_adds_history_only_if_missing(farm, already
         row, = read_history(farm.os_)
         assert row["totals"] == {"runs": 2}
     assert not farm.plan.with_suffix(".count").exists()
+
+
+@pytest.mark.parametrize(("broken", "payload"), [
+    ("outcome.json", None),
+    ("outcome.json", b"{broken"),
+    ("outcome.json", b"{}"),
+    ("quarantine.json", None),
+    ("quarantine.json", b"{broken"),
+    ("quarantine.json", b"{}"),
+])
+def test_corrupt_terminal_records_are_startup_quarantined(farm, broken, payload):
+    plan_game(farm, "clean:goal")
+    session_id = "afk-" + uuid.uuid4().hex
+    request = farm.start()
+    marker = farm.data / "session.json"
+    marker.write_text(json.dumps({
+        "id": session_id, "start": json.loads(request.read_bytes()),
+        "request": request.name, "profile": str(farm.profile),
+    }))
+    directory = farm.data / "logs" / f"supervisor-{session_id}"
+    directory.mkdir(parents=True)
+    for name, record in {
+        "outcome.json": {"session": session_id, "kind": "quarantined", "reason": "preflight_failed", "attempts": []},
+        "quarantine.json": {"reason": "preflight_failed", "detail": "Missing game", "attempts": []},
+    }.items():
+        if name != broken:
+            (directory / name).write_text(json.dumps(record))
+        elif payload is not None:
+            (directory / name).write_bytes(payload)
+
+    with farm.service() as proc:
+        wait_for(lambda: not marker.exists() or proc.poll() is not None or farm.plan.with_suffix(".count").exists())
+        assert proc.poll() is None
+        report = read_state(farm.os_).quarantine
+        assert report is not None and report["reason"] == "invalid_saved_session"
+        assert str(directory / broken) in report["detail"]
+        assert (farm.data / report["diagnostics"] / "session.json").is_file()
+        assert read_history(farm.os_) == []
+        assert not farm.plan.with_suffix(".count").exists()
+
+        farm.start()
+        next_outcome = wait_for(lambda: read_state(farm.os_).last_outcome)
+        assert next_outcome["kind"] == "finished" and next_outcome["session"] != session_id
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+def test_unwritable_history_does_not_prevent_terminal_state_or_later_sessions(farm, recovering):
+    plan_game(farm, "clean:goal")
+    path = history_path(farm.os_)
+    path.mkdir()  # A directory at the history path fails reads and writes on both platforms.
+    if recovering:
+        session_id = "afk-" + uuid.uuid4().hex
+        request = farm.start()
+        (farm.data / "session.json").write_text(json.dumps({
+            "id": session_id, "start": json.loads(request.read_bytes()),
+            "request": request.name, "profile": str(farm.profile),
+        }))
+        directory = farm.data / "logs" / f"supervisor-{session_id}"
+        directory.mkdir(parents=True)
+        (directory / "outcome.json").write_text(json.dumps({
+            "session": session_id, "kind": "finished", "reason": "goal", "attempts": [], "totals": {},
+        }))
+
+    with farm.service() as proc:
+        if not recovering:
+            farm.start()
+        wait_for(lambda: read_state(farm.os_).last_outcome or proc.poll() is not None)
+        assert proc.poll() is None
+        terminal = read_state(farm.os_)
+        assert terminal.kind is StateKind.IDLE
+        assert terminal.session_id is None and terminal.last_outcome["kind"] == "finished"
+        assert farm.outcome()[0] == terminal.last_outcome
+        wait_for(farm.notifications, lambda events: "history_failed" in events)
+        wait_for(lambda: not (farm.data / "session.json").exists())
+
+        path.rmdir()
+        farm.start()
+        row, = wait_for(lambda: read_history(farm.os_))
+        assert row["outcome"] == "finished" and row["session_id"] != terminal.last_outcome["session"]
