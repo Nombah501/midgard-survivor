@@ -1,34 +1,70 @@
 """The service entry point, run as a process against a temporary user dir."""
 
+import json
 import os
 import subprocess
 import sys
+import time
+import uuid
+
+import pytest
 
 from midgard_farm import platform
 
 from test_profile import godot_root, make_profile
 
 
+SERVICE = [sys.executable, "-m", "midgard_farm.service", "--ntfy-url", ""]
+
+
+def service_env(home):
+    return dict(os.environ, XDG_DATA_HOME=str(home), APPDATA=str(home), LOCALAPPDATA=str(home))
+
+
 def run_service(home):
-    env = dict(os.environ, XDG_DATA_HOME=str(home), APPDATA=str(home), LOCALAPPDATA=str(home))
-    return subprocess.run(
-        [sys.executable, "-m", "midgard_farm.service"],
-        env=env, capture_output=True, encoding="utf-8", timeout=30,
-    )
+    return subprocess.run(SERVICE, env=service_env(home), capture_output=True, encoding="utf-8", timeout=5)
 
 
 def test_service_reports_the_profile_it_found(tmp_path):
     profile = make_profile(godot_root(tmp_path), "Мидгард Survivors")
 
-    result = run_service(tmp_path)
+    output = tmp_path / "service.log"
+    with output.open("wb") as log, subprocess.Popen(SERVICE, env=service_env(tmp_path), stdout=log) as service:
+        try:
+            deadline = time.monotonic() + 5
+            while str(profile) not in output.read_text(encoding="utf-8"):
+                assert service.poll() is None and time.monotonic() < deadline
+                time.sleep(0.01)
+            assert service.poll() is None  # The service remains available for Start.
+        finally:
+            service.terminate()
+            service.wait(timeout=5)
 
-    assert result.returncode == 0, result.stderr
-    assert str(profile) in result.stdout
+
+def test_service_waits_for_a_missing_profile_and_discovers_it(tmp_path):
+    output = tmp_path / "service.log"
+    with output.open("wb") as log, subprocess.Popen(SERVICE, env=service_env(tmp_path), stdout=log) as service:
+        def wait_for(message):
+            deadline = time.monotonic() + 5
+            while message not in output.read_text(encoding="utf-8"):
+                assert service.poll() is None and time.monotonic() < deadline
+                time.sleep(0.01)
+
+        try:
+            wait_for("profile not found")
+            assert service.poll() is None
+            profile = make_profile(godot_root(tmp_path), "Late Midgard Survivors")
+            wait_for(str(profile))
+            assert service.poll() is None
+        finally:
+            if service.poll() is None:
+                service.terminate()
+            service.wait(timeout=5)
 
 
-def test_service_without_profile_exits_unfixable(tmp_path):
-    result = run_service(tmp_path)
-
+def test_missing_profile_is_still_unfixable_for_standalone_launch(tmp_path):
+    result = subprocess.run([*SERVICE, "launch"], env=service_env(tmp_path),
+                            capture_output=True, encoding="utf-8", timeout=5)
     assert result.returncode == 78
     assert "launch the game once" in result.stderr
 
@@ -45,3 +81,68 @@ def test_second_service_instance_is_refused(tmp_path, monkeypatch):
 
     assert result.returncode == 75
     assert "already running" in result.stderr
+
+
+def test_unusable_app_data_quarantines_instead_of_crashing(tmp_path):
+    home = tmp_path / "not-a-directory"
+    home.touch()
+
+    result = run_service(home)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "notify quarantine: app data directory unusable" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_corrupt_or_foreign_saved_session_is_quarantined(tmp_path, monkeypatch, foreign):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    data = platform.current().app_data_dir()
+    profile = make_profile(godot_root(tmp_path), "Midgard Survivors")
+    data.mkdir(parents=True)
+    marker = data / "session.json"
+    saved = json.dumps({
+        "id": "afk-" + uuid.uuid4().hex,
+        "request": "consumed-request.json",
+        "profile": str(profile.with_name("Different profile")),
+        "start": {"command": "start", "character": {"class": "thief", "job_path": 0},
+                  "preset": str(tmp_path / "preset.json")},
+    }) if foreign else "{corrupt"
+    marker.write_text(saved)
+    output = tmp_path / "quarantine.log"
+    with output.open("wb") as log, subprocess.Popen(SERVICE, env=service_env(tmp_path), stdout=log) as service:
+        try:
+            deadline = time.monotonic() + 5
+            while marker.exists():
+                assert service.poll() is None and time.monotonic() < deadline
+                time.sleep(0.01)
+            assert service.poll() is None
+            record = json.loads((data / "quarantine.json").read_bytes())
+            assert record["reason"] == "invalid_saved_session"
+            assert record["detail"]
+            diagnostics = data / record["diagnostics"]
+            assert (diagnostics / "session.json").read_bytes() == saved.encode()
+            assert json.loads((diagnostics / "quarantine.json").read_bytes()) == record
+            assert "notify quarantine: saved AFK session unusable" in output.read_text(encoding="utf-8")
+            assert not (profile / "farmer_stop").exists()
+        finally:
+            if service.poll() is None:
+                service.terminate()
+            service.wait(timeout=5)
+
+
+def test_frozen_systemd_unit_executes_the_binary_directly(tmp_path):
+    script = (
+        "import sys\n"
+        "from midgard_farm.service import main\n"
+        "sys.frozen = True\n"
+        "sys.executable = '/opt/Midgard Farm %local/$current/service'\n"
+        "raise SystemExit(main())\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script, "--print-unit"], env=service_env(tmp_path),
+                            check=True, capture_output=True, encoding="utf-8", timeout=5)
+    exec_start, = (line for line in result.stdout.splitlines() if line.startswith("ExecStart="))
+    assert exec_start == 'ExecStart="/opt/Midgard Farm %%local/$$current/service"'
+    assert "KillMode=mixed\n" in result.stdout
+    assert "TimeoutStopSec=90\n" in result.stdout

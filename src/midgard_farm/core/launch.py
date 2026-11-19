@@ -8,11 +8,13 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..platform import LockHeld, NetworkIsolationError, Platform
 from .backup import backup_directory, publish_known_good, snapshot_profile
+from .commands import Character
 from .preflight import check_prerequisites, preflight
 
 SHUTDOWN_GRACE_SECONDS = 45  # Match the legacy supervisor's stop_grace.
@@ -24,7 +26,7 @@ class GameBusy(Exception):
 
 
 @contextmanager
-def _shutdown_request() -> Iterator[Callable[[], float | None]]:
+def shutdown_request() -> Iterator[Callable[[], float | None]]:
     requested_at: float | None = None
 
     def request_stop(_signum, _frame):
@@ -41,17 +43,67 @@ def _shutdown_request() -> Iterator[Callable[[], float | None]]:
             signal.signal(sig, handler)
 
 
-def _terminal_status(profile: Path) -> dict:
+def _read_status(profile: Path, session_id: str | None) -> dict | None:
     try:
-        status = json.loads((profile / "farmer_status.json").read_text(encoding="utf-8"))
+        status = json.loads((profile / "farmer_status.json").read_bytes())
     except (OSError, ValueError):
-        return {}
-    return status if isinstance(status, dict) else {}
+        return None
+    if isinstance(status, dict) and (session_id is None or status.get("session") == session_id):
+        if session_id is None:
+            # Standalone launch also accepts older phase-only status files.
+            status.setdefault("terminal", status.get("phase") in ("done", "failed"))
+        return status
+    return None
+
+
+def request_finish(profile: Path) -> None:
+    try:
+        (profile / "farmer_stop").touch()
+    except OSError as exc:
+        print(f"midgard-farm-service: could not write farmer_stop: {exc}", file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class AttemptExit:
+    code: int
+    status: dict | None
+    last_status: dict | None
+    forced_reason: str | None
+
+    @property
+    def normalized_code(self) -> int:
+        return self.code if self.code >= 0 else 128 - self.code
+
+    def clean(self, os_: Platform) -> bool:
+        status = self.status or {}
+        # A verified headless Linux finish SIGKILLs itself. Windows has no
+        # reliable hard-exit code, but both OSes require the farmer's status.
+        return (self.forced_reason is None and status.get("phase") == "done"
+                and status.get("terminal") is True and not status.get("failed")
+                and (not os_.game_exit_status_reliable or self.normalized_code in (0, 137)))
+
+
+def _select_character(config_bytes: bytes, character: Character) -> bytes:
+    config = json.loads(config_bytes)
+    cid, branch = character.class_id, character.job_path
+    config["class"] = cid
+    config["job_paths"] = {cid: branch}
+    # In Godot, builds.class and an explicit build job path take precedence.
+    builds = config.get("builds")
+    if isinstance(builds, dict):
+        builds.pop("class", None)
+        if isinstance(build := builds.get(cid), dict) and "job_path" in build:
+            build["job_path"] = branch
+    return json.dumps(config, indent=2).encode()
 
 
 def run_attempt(
-    os_: Platform, profile: Path, preset: Path | None, session_id: str | None, *, take_service_lock: bool = False,
-) -> int:
+    os_: Platform, profile: Path, preset: Path | None, session_id: str | None, *,
+    take_service_lock: bool = False, character: Character | None = None,
+    log_path: Path | None = None, watch: Callable[[dict | None], str | None] | None = None,
+    poll_interval: float = 0.05,
+) -> AttemptExit:
+    """Run one attempt; a watcher may return a reason to force-stop its tree."""
     game, info = check_prerequisites(os_, profile)
     with ExitStack() as locks:
         if take_service_lock:
@@ -75,81 +127,87 @@ def run_attempt(
                 print(f"midgard-farm-service: {warning}", file=sys.stderr)
         backups = backup_directory(os_)
         snapshot_profile(profile, backups)
-        if plan.config is not None:
-            os_.write_atomic(profile / "farmer.cfg", plan.config)
+        config = plan.config
+        if character is not None:
+            assert config is not None, "character selection requires a preset"
+            config = _select_character(config, character)
+        if config is not None:
+            os_.write_atomic(profile / "farmer.cfg", config)
         (profile / "farmer_stop").unlink(missing_ok=True)
         (profile / "farmer_status.json").unlink(missing_ok=True)
+        if watch is not None:
+            (profile / "farmer_command").unlink(missing_ok=True)
+            (profile / "farmer_command.claimed").unlink(missing_ok=True)
         farmer_log = profile / "farmer.log"
         if farmer_log.is_file():
             os_.replace_atomic(farmer_log, profile / "farmer.log.prev")
 
-        log_dir = os_.app_data_dir() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        if log_path is None:
+            log_dir = os_.app_data_dir() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=log_dir, prefix="run-", suffix=".log", delete=False) as temporary:
+                log_path = Path(temporary.name)
         env = {**os.environ, "FARMER_SESSION": "1"}
         if session_id:
             env["FARMER_SESSION_ID"] = session_id
         else:
             env.pop("FARMER_SESSION_ID", None)
+        # The CLI tees stdout; the background service keeps output in the attempt log.
+        shutdown = shutdown_request() if watch is None else nullcontext(lambda: None)
         with (
-            tempfile.NamedTemporaryFile(dir=log_dir, prefix="run-", suffix=".log", delete=False) as log,
-            open(log.name, "rb") as output,
+            log_path.open("wb") as log,
+            log_path.open("rb") if watch is None else nullcontext() as output,
+            shutdown as shutdown_requested_at,
         ):
             def tee() -> None:
-                while chunk := output.read(65536):
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
+                if output is not None:
+                    while chunk := output.read(65536):
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
 
-            forced = False
+            stop_sent = False
+            forced_reason = None
+            last_status = None
+            expected_session = session_id if watch is not None else None
             try:
-                with (
-                    _shutdown_request() as shutdown_requested_at,
-                    os_.spawn_tree(plan.argv, cwd=Path(plan.argv[0]).parent, env=env, stdout=log,
-                                   stderr=subprocess.STDOUT, isolate_network=bool(session_id)) as tree,
-                ):
-                    stop_sent = False
+                with os_.spawn_tree(plan.argv, cwd=Path(plan.argv[0]).parent, env=env, stdout=log,
+                                    stderr=subprocess.STDOUT, isolate_network=bool(session_id)) as tree:
                     while True:
                         tee()
-                        timeout = 0.05
+                        timeout = poll_interval
                         if (requested_at := shutdown_requested_at()) is not None:
                             if not stop_sent:
-                                try:
-                                    (profile / "farmer_stop").touch()
-                                except OSError as exc:
-                                    print(f"midgard-farm-service: could not write farmer_stop: {exc}", file=sys.stderr)
+                                request_finish(profile)
                                 stop_sent = True
                             timeout = min(timeout, max(0.0, requested_at + SHUTDOWN_GRACE_SECONDS - time.monotonic()))
                         try:
                             code = tree.wait(timeout=timeout)
                             break
                         except subprocess.TimeoutExpired:
-                            if timeout == 0:
-                                forced = True
+                            if watch is not None:
+                                status = _read_status(profile, expected_session)
+                                if status is not None:
+                                    last_status = status
+                                forced_reason = watch(status)
+                            elif timeout == 0:
+                                forced_reason = "operator_timeout"
+                            if forced_reason:
                                 tree.kill()
                                 code = tree.wait()
                                 break
             except NetworkIsolationError as exc:
                 tee()
-                raise NetworkIsolationError(f"{exc}; see {log.name}") from exc
+                raise NetworkIsolationError(f"{exc}; see {log_path}") from exc
             else:
                 tee()
 
-        code = code if code >= 0 else 128 - code
-        status = _terminal_status(profile)
-        phase, failed, reason = status.get("phase"), status.get("failed"), status.get("finish_reason")
-        # A Linux headless finish SIGKILLs itself only after the farmer verifies
-        # its flush. On Windows a hard exit does not report a reliable code.
-        if not forced and phase == "done" and not failed and (not os_.game_exit_status_reliable or code in (0, 137)):
-            print(f"farmer: finished cleanly (exit {code} reason={reason or ''})")
-            if session_id and isinstance(reason, str) and reason in _SETTLED_REASONS:
-                try:
-                    publish_known_good(os_, profile, backups)
-                except OSError as exc:
-                    print(f"midgard-farm-service: known-good copy verification failed or publication was unavailable: {exc}",
-                          file=sys.stderr)
-            return 0
-
-        print(f"midgard-farm-service: farmer did not finish cleanly (exit {code} phase={phase or ''} "
-              f"reason={reason or ''} failed={bool(failed)})", file=sys.stderr)
-        exit_code = status.get("exit_code")
-        result = exit_code if type(exit_code) is int and 0 < exit_code <= 255 else code
-        return result if result not in (0, 78) else 1
+        status = _read_status(profile, expected_session)
+        result = AttemptExit(code, status, status if status is not None else last_status, forced_reason)
+        reason = (status or {}).get("finish_reason")
+        if session_id and result.clean(os_) and isinstance(reason, str) and reason in _SETTLED_REASONS:
+            try:
+                publish_known_good(os_, profile, backups)
+            except OSError as exc:
+                print(f"midgard-farm-service: known-good copy verification failed or publication was unavailable: {exc}",
+                      file=sys.stderr)
+        return result
