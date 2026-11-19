@@ -459,15 +459,18 @@ def _alive(pid):
 
 def test_stale_heartbeat_kills_the_whole_group_and_restarts(farm):
     plan_game(farm, "hang", "clean:stop")
-    with farm.service() as proc:
+    # A long startup grace keeps "stale heartbeat" (3 x 0.5 s) clearly apart from
+    # "no heartbeat yet"; time the outcome itself, not the fixture's shutdown.
+    with farm.service(startup_grace=10.0) as proc:
         started = time.monotonic()
         farm.start()
         pid = int(wait_for(lambda: farm.plan.with_suffix(".grandchild").read_text()))
         grandchild = farm.host_pid(proc, pid)
         outcome, _ = farm.outcome()
+        elapsed = time.monotonic() - started
     assert outcome["attempts"][0]["reason"] == "heartbeat_stale"
     assert outcome["kind"] == "finished"
-    assert time.monotonic() - started < 3  # stale window, not the startup grace
+    assert elapsed < 6  # the stale window, not the 10 s startup grace
     wait_for(lambda: not _alive(grandchild))
     assert farm.notifications() == ["fail", "stop"]
 
