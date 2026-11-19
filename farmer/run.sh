@@ -99,11 +99,31 @@ code=${PIPESTATUS[0]}
 set -e
 
 phase=""
+failed=""
+finish_reason=""
+exit_code=""
 if [[ -f "$DATA/farmer_status.json" ]]; then
-	phase="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("phase",""))' "$DATA/farmer_status.json" 2>/dev/null || true)"
+	IFS=$'\t' read -r phase failed finish_reason exit_code < <(python3 - "$DATA/farmer_status.json" <<'PY'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    d={}
+print("%s\t%s\t%s\t%s" % (
+    d.get("phase", ""),
+    "true" if d.get("failed", False) else "false",
+    d.get("finish_reason", ""),
+    d.get("exit_code", 0),
+))
+PY
+) || true
 fi
-if [[ "$phase" == "done" ]]; then
-	echo "farmer: finished cleanly (exit $code)"
+clean=0
+if [[ "$phase" == "done" && "$failed" != "true" && ( "$code" == "0" || "$code" == "137" ) ]]; then
+	clean=1
+fi
+if [[ "$clean" == "1" ]]; then
+	echo "farmer: finished cleanly (exit $code${finish_reason:+ reason=$finish_reason})"
 	[[ -f "$DATA/farmer_status.json" ]] && python3 - "$DATA/farmer_status.json" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
@@ -113,5 +133,11 @@ print("  rates: " + json.dumps(d.get("rates",{}), ensure_ascii=False))
 PY
 	exit 0
 fi
-echo "run: farmer did not finish cleanly (exit $code phase=$phase)" >&2
+echo "run: farmer did not finish cleanly (exit $code phase=$phase reason=$finish_reason failed=$failed)" >&2
+if [[ "$exit_code" =~ ^[0-9]+$ && "$exit_code" != "0" ]]; then
+	exit "$exit_code"
+fi
+if [[ "$code" == "0" ]]; then
+	exit 1
+fi
 exit "$code"

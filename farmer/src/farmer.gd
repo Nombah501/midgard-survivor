@@ -38,6 +38,10 @@ var menus = null
 var phase := "boot"
 var failed := false
 var finish_reason := ""
+var last_error := ""
+var last_transition := ""
+var exit_code := 0
+var heartbeat_seq := 0
 var session_id := ""
 var boot_ms := 0
 var next_action_ms := 0
@@ -99,14 +103,13 @@ func _ready() -> void:
 	session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
+	_mark_transition("boot")
 	if not _load_cfg():
-		failed = true
-		_write_status()
+		_fail_session("cfg_invalid")
 		return
 	if not _acquire_lock():
-		failed = true
 		_log("LOCKED by pid %d: another farmer session is alive" % _lock_pid)
-		_write_status()
+		_fail_session("locked")
 		return
 	_log("BOOT api=%d session=%s cfg=%s" % [API_VERSION, session_id, JSON.stringify(cfg)])
 	_write_status()
@@ -234,7 +237,9 @@ func _prepare_run() -> void:
 		_finish("no_target")
 		return
 	_apply_build_settings(active_class)
+	var run_id := "%s-r%d" % [session_id, runs_started + 1]
 	run_state = _snapshot_run_state()
+	run_state["run_id"] = run_id
 	run_state["class"] = active_class
 	run_state["stage"] = active_stage
 	run_state["danger"] = active_danger
@@ -274,6 +279,7 @@ func _prepare_run() -> void:
 	Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
 	runs_started += 1
 	phase = "run"
+	_mark_transition("run_start")
 	_log("START #%d class=%s stage=%s danger=%d speed=%.1f" % [
 		runs_started, active_class, active_stage, active_danger, float(cfg.get("speed", 4.0))])
 	_write_status()
@@ -408,6 +414,7 @@ func _begin_settle(now: int) -> void:
 		_log("SETTLE victory=%s died=%s endless=%s t=%.1f" % [
 			str(victory), str(bool(run_state.get("died", false))), str(bool(world.endless)), float(world.time)])
 	phase = "settle"
+	_mark_transition("settle")
 	_check_settle()
 
 
@@ -914,6 +921,7 @@ func _retreat_point(hero) -> Vector3:
 # ---------------------------------------------------------------------------
 
 func _do_keep() -> void:
+	_mark_transition("keep")
 	if world == null or not is_instance_valid(world):
 		_finish("lost_world")
 		return
@@ -1108,6 +1116,7 @@ func _make_room(need_value: float) -> bool:
 # ---------------------------------------------------------------------------
 
 func _do_maintenance() -> void:
+	_mark_transition("maint")
 	last_maint = {}
 	if world == null or not is_instance_valid(world):
 		return
@@ -2080,6 +2089,7 @@ func _total_card_copies() -> int:
 
 
 func _complete_run(now: int) -> void:
+	_mark_transition("run_complete")
 	var r := _build_result()
 	last_run = r
 	runs_done += 1
@@ -2139,6 +2149,7 @@ func _build_result() -> Dictionary:
 	var game := float(world.time) if world != null and is_instance_valid(world) else 0.0
 	var result := {
 		"run": runs_done + 1,
+		"run_id": str(run_state.get("run_id", "")),
 		"session": session_id,
 		"class": active_class,
 		"stage": active_stage,
@@ -2339,6 +2350,7 @@ func _check_num(errors: Array, key: String, lo: float, hi: float) -> void:
 # ---------------------------------------------------------------------------
 
 func _write_status() -> void:
+	heartbeat_seq += 1
 	var p = null
 	if world != null and is_instance_valid(world):
 		p = world.player
@@ -2346,7 +2358,14 @@ func _write_status() -> void:
 		"session": session_id,
 		"pid": OS.get_process_id(),
 		"phase": phase,
+		"failed": failed,
+		"finish_reason": finish_reason,
+		"last_error": last_error,
+		"last_transition": last_transition,
+		"exit_code": exit_code,
+		"run_id": str(run_state.get("run_id", "")),
 		"heartbeat": int(Time.get_unix_time_from_system()),
+		"heartbeat_seq": heartbeat_seq,
 		"uptime_s": float(_now() - boot_ms) / 1000.0,
 		"api": API_VERSION,
 		"build": _build_info(),
@@ -2444,6 +2463,30 @@ func _log(text: String) -> void:
 	f.close()
 
 
+func _mark_transition(label: String) -> void:
+	last_transition = "%s@%d" % [label, int(Time.get_unix_time_from_system())]
+
+
+func _profile_stamp() -> String:
+	if not FileAccess.file_exists(Save.PATH):
+		return ""
+	var bytes := FileAccess.get_file_as_bytes(Save.PATH)
+	if bytes.is_empty():
+		return ""
+	return "%d:%d:%d" % [FileAccess.get_modified_time(Save.PATH), bytes.size(), hash(bytes)]
+
+
+func _flush_profile_verified() -> bool:
+	# Test-only seam used by verify.sh; never set in a real session.
+	if OS.get_environment("FARMER_TEST_FLUSH_FAIL") == "1":
+		return false
+	var before := _profile_stamp()
+	Save.mark_dirty()
+	Save.flush()
+	var after := _profile_stamp()
+	return after != "" and after != before
+
+
 func _now() -> int:
 	return Time.get_ticks_msec()
 
@@ -2491,15 +2534,19 @@ func _release_lock() -> void:
 		DirAccess.remove_absolute(ProjectSettings.globalize_path(LOCK_PATH))
 
 
-func _fail_session(reason: String) -> void:
+func _fail_session(reason: String, allow_hard_exit := true) -> void:
 	if failed:
 		return
 	failed = true
 	finish_reason = reason
+	last_error = reason
+	phase = "failed"
+	exit_code = 1
+	_mark_transition("fail:" + reason)
 	_log("FAIL " + reason)
 	_write_status()
 	_release_lock()
-	if bool(cfg.get("hard_exit", true)) and DisplayServer.get_name() == "headless":
+	if allow_hard_exit and bool(cfg.get("hard_exit", true)) and DisplayServer.get_name() == "headless":
 		OS.kill(OS.get_process_id())
 		return
 	get_tree().quit(1)
@@ -2509,9 +2556,13 @@ func _finish(reason: String) -> void:
 	if phase == "done" or _hard_finished:
 		return
 	finish_reason = reason
-	phase = "done"
+	exit_code = 0
+	_mark_transition("finish:" + reason)
 	_log("FINISH %s runs=%d wins=%d losses=%d zeny=%d" % [reason, runs_done, wins, losses, total_zeny])
-	Save.flush()
+	if not _flush_profile_verified():
+		_fail_session("flush_failed", false)
+		return
+	phase = "done"
 	_write_status()
 	_release_lock()
 	_hard_finished = true

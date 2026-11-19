@@ -5,7 +5,7 @@
 # profile. The real profile is only read. Each scenario has its own timeout;
 # a timeout, a non-zero exit, a missing status, or a failed assertion is FAIL.
 #
-# Usage: ./tools/verify.sh [--one-run] [--stop] [--endless] [--all] [--keep]
+# Usage: ./tools/verify.sh [--one-run] [--stop] [--endless] [--flush-fail] [--all] [--keep]
 # Default: --all.
 #
 # Artifacts: farmer/logs/verify-<stamp>/{summary.json,*.log,*.status.json}
@@ -41,14 +41,15 @@ for arg in "$@"; do
 		--one-run) SCENARIOS+=(one-run) ;;
 		--stop) SCENARIOS+=(stop) ;;
 		--endless) SCENARIOS+=(endless) ;;
-		--all) SCENARIOS=(one-run stop endless) ;;
+		--flush-fail) SCENARIOS+=(flush-fail) ;;
+		--all) SCENARIOS=(one-run stop endless flush-fail) ;;
 		--keep) KEEP=1 ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown argument: $arg" ;;
 	esac
 done
 if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
-	SCENARIOS=(one-run stop endless)
+	SCENARIOS=(one-run stop endless flush-fail)
 fi
 
 [[ -x "$GAME_DIR/MidgardSurvivors.x86_64" ]] || die "game not found at $GAME_DIR"
@@ -159,6 +160,11 @@ def need(cond, msg):
 
 
 need(d.get("phase") == "done", "phase != done")
+need(not bool(d.get("failed", False)), "failed true")
+need(str(d.get("finish_reason") or "") != "", "finish_reason empty")
+need(str(d.get("last_transition") or "") != "", "last_transition empty")
+need(int(d.get("heartbeat_seq") or 0) > 0, "heartbeat_seq == 0")
+need(str(d.get("run_id") or "") != "", "run_id empty")
 need(int(tot.get("runs") or 0) >= 1, "runs == 0")
 if name == "one-run":
     need(int(tot.get("wins") or 0) >= 1, "wins == 0")
@@ -174,6 +180,33 @@ elif name == "endless":
     need(bool(last.get("endless")), "last.endless false")
     need(int(last.get("endless_mvps") or 0) >= 1, "endless_mvps == 0")
     need(int(last.get("kills") or 0) > 0, "kills == 0")
+
+print("; ".join(err))
+sys.exit(1 if err else 0)
+PY
+}
+
+assert_failed_status() {
+	local status="$1"
+	python3 - "$status" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    d = json.load(fh)
+err = []
+
+
+def need(cond, msg):
+    if not cond:
+        err.append(msg)
+
+
+need(d.get("phase") == "failed", "phase != failed")
+need(bool(d.get("failed")), "failed false")
+need(str(d.get("finish_reason") or "") == "flush_failed", "finish_reason != flush_failed")
+need(int(d.get("exit_code") or 0) != 0, "exit_code == 0")
+need(str(d.get("last_transition") or "") != "", "last_transition empty")
 
 print("; ".join(err))
 sys.exit(1 if err else 0)
@@ -200,6 +233,11 @@ row = {
     "exit": int(rc),
     "reason": reason,
     "phase": d.get("phase"),
+    "failed": d.get("failed"),
+    "finish_reason": d.get("finish_reason"),
+    "exit_code": d.get("exit_code"),
+    "run_id": d.get("run_id"),
+    "heartbeat_seq": d.get("heartbeat_seq"),
     "runs": tot.get("runs"),
     "wins": tot.get("wins"),
     "losses": tot.get("losses"),
@@ -218,7 +256,7 @@ PY
 }
 
 run_scenario() {
-	local name="$1" cfg="$2" timeout_s="$3" marker="$4"
+	local name="$1" cfg="$2" timeout_s="$3" marker="$4" expect_fail="${5:-0}"
 	local run_log="$OUT_DIR/$name.run.log"
 	local status="$OUT_DIR/$name.status.json"
 	local farmer_log="$OUT_DIR/$name.farmer.log"
@@ -227,7 +265,11 @@ run_scenario() {
 	reset_profile
 	echo "=== $name (timeout ${timeout_s}s) ==="
 	set +e
-	XDG_DATA_HOME="$SB" GAME_DIR="$GAME_DIR" timeout --foreground -k 15 "$timeout_s" \
+	local env_args=("XDG_DATA_HOME=$SB" "GAME_DIR=$GAME_DIR")
+	if [[ "$name" == "flush-fail" ]]; then
+		env_args+=("FARMER_TEST_FLUSH_FAIL=1")
+	fi
+	env "${env_args[@]}" timeout --foreground -k 15 "$timeout_s" \
 		"$FARMER_DIR/run.sh" "$cfg" >"$run_log" 2>&1
 	rc=$?
 	set -e
@@ -239,7 +281,11 @@ run_scenario() {
 		cp "$SB_DATA/farmer.log" "$farmer_log"
 	fi
 
-	if [[ "$rc" -ne 0 ]]; then
+	if [[ "$expect_fail" == "1" ]]; then
+		if [[ "$rc" -ne 1 ]]; then
+			reason="run.sh exit $rc (expected 1)"
+		fi
+	elif [[ "$rc" -ne 0 ]]; then
 		reason="run.sh exit $rc"
 	fi
 	if [[ -z "$reason" && ! -f "$status" ]]; then
@@ -247,7 +293,11 @@ run_scenario() {
 	fi
 	if [[ -z "$reason" ]]; then
 		local err
-		if ! err="$(assert_status "$status" "$name")"; then
+		if [[ "$expect_fail" == "1" ]]; then
+			if ! err="$(assert_failed_status "$status")"; then
+				reason="status: $err"
+			fi
+		elif ! err="$(assert_status "$status" "$name")"; then
 			reason="status: $err"
 		fi
 	fi
@@ -282,12 +332,14 @@ run_scenario() {
 write_cfg one-run '{"speed":10.0,"max_runs":1,"hard_exit":true,"endless":false,"display":false}'
 write_cfg stop '{"class":"thief","max_minutes":1.0,"stall_seconds":10.0,"max_runs":0,"speed":10.0,"hard_exit":true,"endless":false,"display":false}'
 write_cfg endless '{"speed":10.0,"max_runs":1,"endless":true,"endless_minutes":1.0,"endless_mvps":2,"hard_exit":true,"display":false}'
+write_cfg flush-fail '{"speed":10.0,"max_runs":1,"run_minutes":0.2,"max_minutes":0.5,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
 
 for scenario in "${SCENARIOS[@]}"; do
 	case "$scenario" in
 		one-run) run_scenario one-run "$OUT_DIR/one-run.json" 300 FINISH || break ;;
 		stop) run_scenario stop "$OUT_DIR/stop.json" 180 'STOP max_minutes' || break ;;
 		endless) run_scenario endless "$OUT_DIR/endless.json" 360 ENDLESS_DONE || break ;;
+		flush-fail) run_scenario flush-fail "$OUT_DIR/flush-fail.json" 180 'FAIL flush_failed' 1 || break ;;
 	esac
 done
 
