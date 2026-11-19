@@ -276,3 +276,51 @@ def test_windows_v1_warns_that_afk_network_isolation_is_unavailable():
     assert warning is not None
     assert "no network isolation" in warning
     assert "updater" in warning and "CloudSave" in warning
+
+
+def test_app_sandbox_environment_redirects_profile_and_app_storage(tmp_path):
+    with python(
+        """
+        from midgard_farm import platform
+        os_ = platform.current()
+        print(os_.godot_user_data_root())
+        print(os_.app_data_dir())
+        """,
+        env=OS.app_sandbox_environment(tmp_path),
+    ) as child:
+        stdout, _ = child.communicate(timeout=30)
+    assert child.returncode == 0
+    godot, data = map(Path, stdout.splitlines())
+    assert godot == godot_root(tmp_path)
+    assert data.is_relative_to(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux allocated disk usage and RSS")
+def test_soak_platform_metrics_use_allocated_blocks_and_resident_memory(tmp_path):
+    sparse = tmp_path / "sparse.log"
+    with sparse.open("wb") as file:
+        file.seek(1024 * 1024)
+        file.write(b"a")
+    assert OS.allocated_bytes(sparse) == sparse.stat().st_blocks * 512
+    assert OS.process_rss_kib(os.getpid()) > 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfd sandbox fault")
+def test_sandbox_kill_pins_a_child_and_checks_its_home_and_session(tmp_path):
+    class TestPlatform(type(OS)):
+        game_exe_name = "midgard-verify-process-fixture"
+
+    os_ = TestPlatform()
+    exe = tmp_path / os_.game_exe_name
+    exe.symlink_to(Path(sys.executable).resolve())
+    env = os_.app_sandbox_environment(tmp_path)
+    session = "verify-example"
+    env["FARMER_SESSION_ID"] = session
+    with os_.spawn_tree([str(exe), "-c", "import time; time.sleep(60)"], env=env) as tree:
+        pid = tree.popen.pid
+        assert not os_.kill_owned_sandbox_game(os.getpid(), tmp_path, session)
+        assert not os_.kill_owned_sandbox_game(pid, tmp_path / "wrong-home", session)
+        assert not os_.kill_owned_sandbox_game(pid, tmp_path, "verify-other")
+        assert tree.popen.poll() is None
+        assert os_.kill_owned_sandbox_game(pid, tmp_path, session)
+        assert tree.wait(timeout=5) == -9

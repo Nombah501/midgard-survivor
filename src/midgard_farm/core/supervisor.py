@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 
 from ..platform import NetworkIsolationError, Platform
 from . import commands, game_update
@@ -100,13 +101,14 @@ class Supervisor:
 
     def __init__(self, os_: Platform, profile: Path, policy: Policy,
                  stop_requested_at: Callable[[], float | None], notify: Callable[[str, str], None],
-                 *, state: StateReporter):
+                 *, state: StateReporter, session_prefix: Literal["afk", "verify"] = "afk"):
         self.os = os_
         self.profile = profile
         self.policy = policy
         self.stop_requested_at = stop_requested_at
         self.notify = notify
         self.state = state
+        self.session_prefix = session_prefix
         self._last_totals: dict = {}
         self.session_path = os_.app_data_dir() / "session.json"
         self.queue = commands.directory(os_)
@@ -134,9 +136,10 @@ class Supervisor:
             raise InvalidSavedSession(f"{self.session_path}: saved session belongs to a different profile")
         try:
             session_id = saved.get("id")
-            if not isinstance(session_id, str) or not session_id.startswith("afk-"):
+            prefix = f"{self.session_prefix}-"
+            if not isinstance(session_id, str) or not session_id.startswith(prefix):
                 raise ValueError("invalid saved AFK session id")
-            if session_id != f"afk-{uuid.UUID(hex=session_id[4:]).hex}":
+            if session_id != f"{prefix}{uuid.UUID(hex=session_id.removeprefix(prefix)).hex}":
                 raise ValueError("invalid saved AFK session id")
             start = commands.decode(saved.get("start"))
             if not isinstance(start, Start):
@@ -183,7 +186,7 @@ class Supervisor:
                 if isinstance(gate, game_update.Wait) and self._update_quarantine is not None:
                     refuse_command(self.os, self.state, path, "start", self._update_quarantine["reason"])
                     continue
-                session_id = f"afk-{uuid.uuid4().hex}"
+                session_id = f"{self.session_prefix}-{uuid.uuid4().hex}"
                 self._write(self.session_path, {"id": session_id, "start": command.payload(),
                                                 "profile": str(self.profile.absolute()), "request": path.name})
                 path.unlink()

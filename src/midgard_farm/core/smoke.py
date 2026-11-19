@@ -39,6 +39,10 @@ _STALE = {
 }
 
 
+def one_run_config() -> dict[str, object]:
+    return _ONE_RUN.copy()
+
+
 class SmokeOutcome(Enum):
     PASSED = "passed"
     FAILED = "failed"
@@ -94,8 +98,12 @@ def _has_marker(path: Path, marker: re.Pattern[bytes]) -> bool:
         return False
 
 
-def _judge(os_: Platform, profile: Path, log_path: Path) -> str:
-    if _has_marker(log_path, _SCRIPT_ERROR):
+def has_script_error(log_path: Path) -> bool:
+    return _has_marker(log_path, _SCRIPT_ERROR)
+
+
+def judge_one_run(os_: Platform, profile: Path, log_path: Path) -> str:
+    if has_script_error(log_path):
         return "script error in game output"
     try:
         status = json.loads(os_.read_shared(profile / "farmer_status.json", retry_missing=True))
@@ -128,19 +136,27 @@ class _SmokeStopped(Exception):
     pass
 
 
+def prepare_sandbox(
+    os_: Platform, profile: Path, data_home: Path, *, stop_requested: Callable[[], bool] = lambda: False,
+) -> tuple[Path, dict[str, str]]:
+    """Copy the profile and mount the built farmer patch only in the redirected user data."""
+    godot_root, env = os_.godot_sandbox(data_home)
+    sandbox = godot_root / profile.name
+    if stop_requested():
+        raise _SmokeStopped
+    _copy_profile(os_, profile, sandbox)
+    if stop_requested():
+        raise _SmokeStopped
+    farmer_patch.install(os_, sandbox, backup_dir=data_home / "install-backups")
+    return sandbox, env
+
+
 def _attempt(
     os_: Platform, profile: Path, app_dir: Path, game: Path, log_path: Path, stop_requested: Callable[[], bool],
 ) -> str:
     data_home = Path(tempfile.mkdtemp(dir=app_dir, prefix="smoke-"))
     try:
-        godot_root, env = os_.godot_sandbox(data_home)
-        sandbox = godot_root / profile.name
-        if stop_requested():
-            raise _SmokeStopped
-        _copy_profile(os_, profile, sandbox)
-        if stop_requested():
-            raise _SmokeStopped
-        farmer_patch.install(os_, sandbox, backup_dir=data_home / "install-backups")
+        sandbox, env = prepare_sandbox(os_, profile, data_home, stop_requested=stop_requested)
         os_.write_atomic(sandbox / "farmer.cfg", json.dumps(_ONE_RUN).encode())
         env["FARMER_SESSION"] = "1"
         env.pop("FARMER_SESSION_ID", None)
@@ -172,7 +188,7 @@ def _attempt(
         # A verified headless finish can SIGKILL itself; on Windows the exit code is not meaningful.
         if os_.game_exit_status_reliable and code not in (0, -9):
             return f"game exited with code {code}"
-        return _judge(os_, sandbox, log_path)
+        return judge_one_run(os_, sandbox, log_path)
     finally:
         # TemporaryDirectory can chmod files on cleanup; a linked pack must never be chmodded.
         shutil.rmtree(data_home)

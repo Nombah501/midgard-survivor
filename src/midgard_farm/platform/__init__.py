@@ -79,6 +79,10 @@ class Platform(abc.ABC):
     def godot_sandbox(self, data_home: Path) -> tuple[Path, dict[str, str]]:
         """Return the Godot user-data root and child environment for an isolated data home."""
 
+    def app_sandbox_environment(self, data_home: Path) -> dict[str, str]:
+        """Child environment redirecting both Godot user data and this app's storage."""
+        return self.godot_sandbox(data_home)[1]
+
     def link_sandbox_pack(self, source: Path, target: Path) -> None:
         """Hard-link an immutable pack, or copy it where hard links are unavailable."""
         source = source.resolve(strict=True)
@@ -106,6 +110,18 @@ class Platform(abc.ABC):
 
     def game_running(self) -> bool:
         return bool(self.game_pids())
+
+    def kill_owned_sandbox_game(self, pid: int, data_home: Path, session: str) -> bool:
+        """Kill only a matching game child launched in the given verification sandbox."""
+        raise NotImplementedError("external sandbox game kill is unsupported on this OS")
+
+    def process_rss_kib(self, pid: int) -> int | None:
+        """Resident size in KiB; None if the process has exited or has no reading."""
+        raise NotImplementedError("RSS sampling is unsupported on this OS")
+
+    def allocated_bytes(self, path: Path) -> int:
+        """Disk blocks allocated to a file; its logical size on Windows."""
+        return path.stat().st_size
 
     @abc.abstractmethod
     def start_service(self) -> None:

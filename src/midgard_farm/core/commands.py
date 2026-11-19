@@ -20,13 +20,14 @@ class Character:
 
 @dataclass(frozen=True)
 class Start:
-    character: Character
+    character: Character | None  # None leaves the preset's own selection intact.
     preset: Path
 
     def payload(self) -> dict:
-        return {"command": "start", "character": {"class": self.character.class_id,
-                                                   "job_path": self.character.job_path},
-                "preset": str(self.preset.absolute())}
+        character = self.character
+        return {"command": "start", "character": None if character is None else {
+            "class": character.class_id, "job_path": character.job_path,
+        }, "preset": str(self.preset.absolute())}
 
 
 type Command = Start | Control | Literal["check_again"]
@@ -39,16 +40,18 @@ def decode(payload: object) -> Command:
         case "pause" | "resume" | "finish" | "abort" | "check_again" as action:
             return action
         case "start":
-            character = payload.get("character")
             preset = payload.get("preset")
+            if not isinstance(preset, str) or "\0" in preset or not Path(preset).is_absolute():
+                raise ValueError("start needs an absolute preset path")
+            character = payload.get("character")
+            if "character" in payload and character is None:
+                return Start(None, Path(preset))
             if not isinstance(character, dict):
-                raise ValueError("start needs a character with class and job_path")
+                raise ValueError("start needs a character with class and job_path, or null to use the preset")
             class_id, job_path = character.get("class"), character.get("job_path")
             if (not isinstance(class_id, str) or not class_id.strip()
                     or type(job_path) is not int or job_path < 0):
                 raise ValueError("character needs a class and a nonnegative integer job_path")
-            if not isinstance(preset, str) or "\0" in preset or not Path(preset).is_absolute():
-                raise ValueError("start needs an absolute preset path")
             return Start(Character(class_id, job_path), Path(preset))
         case _:
             raise ValueError("unknown service command")

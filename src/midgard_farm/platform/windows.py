@@ -144,6 +144,9 @@ class WindowsPlatform(Platform):
     def godot_sandbox(self, data_home: Path) -> tuple[Path, dict[str, str]]:
         return data_home / _GODOT_USER_DATA, {**os.environ, _GODOT_DATA_HOME: str(data_home)}
 
+    def app_sandbox_environment(self, data_home: Path) -> dict[str, str]:
+        return self.godot_sandbox(data_home)[1] | {"LOCALAPPDATA": str(data_home)}
+
     def app_data_dir(self) -> Path:
         return _env_dir("LOCALAPPDATA") / "MidgardFarm"
 

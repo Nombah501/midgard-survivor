@@ -1,0 +1,268 @@
+"""Drive the verification runner with real sandboxes/supervision and a fake game."""
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from threading import Event, Thread
+
+import pytest
+
+from midgard_farm import platform
+from midgard_farm.core import commands, farmer_patch, patch_info, supervisor
+from midgard_farm.core.state import StateReporter
+from midgard_farm.verify import scenarios
+from test_profile import make_profile
+
+ALL = (
+    "one-run", "stop", "endless", "flush-fail", "crash-run", "crash-settled", "crash-journaled",
+    "cmd-finish", "cmd-abort", "cmd-abort-settled", "cmd-pause-resume", "cmd-legacy", "checkpoint-corrupt",
+    "supervised-kill-run", "supervised-crash-settled",
+)
+
+
+class VerifyGamePlatform(type(platform.current())):
+    game_exe_name = "verify-fixture.exe" if sys.platform == "win32" else "verify-fixture"
+    tree = None
+
+    def check_network_isolation(self):
+        return None
+
+    def notify_desktop(self, *_):
+        pytest.fail("verification must not send notifications")
+
+    def game_pids(self):
+        return {self.tree.popen.pid} if self.tree is not None and self.tree.popen.poll() is None else set()
+
+    def spawn_tree(self, argv, *, isolate_network=False, **kwargs):
+        assert isolate_network and argv[1:] == ["--headless"]
+        fake = Path(__file__).with_name("fake_verify_game.py")
+        self.tree = super().spawn_tree([sys.executable, str(fake)], **kwargs)
+        return self.tree
+
+
+@pytest.fixture
+def verification(tmp_path, monkeypatch):
+    os_ = VerifyGamePlatform()
+    work = tmp_path / "suite" / "sandbox" / "attempt"
+    work.mkdir(parents=True)
+    out = work.parents[1]
+    root, _ = os_.godot_sandbox(work)
+    for key, value in os_.app_sandbox_environment(work).items():
+        if os.environ.get(key) != value:
+            monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GAME_DIR", str(tmp_path))
+    monkeypatch.setenv("FARMER_DISPLAY", "1")  # Not part of verification config.
+    monkeypatch.setenv("FARMER_TEST_FLUSH_FAIL", "1")  # Must not leak to unrelated scenarios.
+    monkeypatch.setenv("FARMER_BACKUP_DIR", str(tmp_path / "real backups"))
+    exe = os_.game_executable()
+    exe.touch()
+    exe.chmod(0o755)
+    source = make_profile(tmp_path / "real", "Renamed Profile")
+    monkeypatch.setenv("FAKE_VERIFY_SOURCE", str(source))
+    (source / "profile.json").write_text("100", encoding="utf-8")
+    (source / "farmer_command").write_text("real command must survive", encoding="utf-8")
+    patches = source / "patches"
+    (patches / "state.json").write_text('{"file":"official.pck", "version":"1"}', encoding="utf-8")
+    official = b"official patch bytes"
+    (patches / "official.pck").write_bytes(official)
+    candidate = tmp_path / "candidate"
+    pack = b"built farmer pack"
+    info = patch_info.PatchInfo("official.pck", "1", hashlib.sha256(official).hexdigest(), "", "", "ebc36a7", 3,
+                               farmer_patch.farmer_hash(), hashlib.sha256(pack).hexdigest(), "fixture")
+    patch_info.save(os_, candidate / "patch_farmer.json", info)
+    (candidate / patch_info.INSTALLED_PACK).write_bytes(pack)
+    return os_, source, candidate, work, out, root
+
+
+def execute(verification, name, **kwargs):
+    os_, source, candidate, work, out, _ = verification
+    return scenarios.run_scenario(os_, source, candidate, work, out, name,
+                                  policy=supervisor.Policy(backoff_base=0.05), **kwargs)
+
+
+def test_registry_contains_every_legacy_scenario():
+    assert scenarios.BOUNDED_SCENARIOS == ALL
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_verifies_every_scenario_against_a_fake_game(verification, name):
+    os_, source, _, _, out, root = verification
+    if name == "supervised-kill-run" and os_.release_os != "linux":
+        with pytest.raises(ValueError, match="unsupported on this OS"):
+            execute(verification, name)
+        return
+
+    row = execute(verification, name)
+
+    assert row["verdict"] == "PASS", row
+    assert json.loads((out / f"{name}.result.json").read_text()) == row
+    assert (out / f"{name}.run.log").exists()
+    assert (root / source.name / "patches" / "official.pck").samefile(source / "patches/official.pck")
+    assert (source / "profile.json").read_text() == "100"
+    assert (source / "farmer_command").read_text() == "real command must survive"
+    assert not (source.parents[1] / "real backups").exists()
+    assert not os_.game_running()
+    if name.startswith("supervised-"):
+        logdir, = (out / f"{name}.supervisor").glob("supervisor-verify-*")
+        outcome = json.loads((logdir / "outcome.json").read_text())
+        assert [(a["number"], a["outcome"]) for a in outcome["attempts"]] == [(1, "failed"), (2, "finished")]
+        assert len(list(logdir.glob("attempt-*.log"))) == 2
+
+
+@pytest.mark.parametrize(("name", "fault", "reason"), [
+    ("one-run", "no-transition", "last_transition empty"),
+    ("one-run", "no-victory", "last run was not a victory"),
+    ("stop", "script-error", "script error"),
+    ("endless", "no-mvp", "endless_mvps == 0"),
+    ("crash-settled", "unbanked-zeny", "profile zeny moved"),
+    ("supervised-crash-settled", "duplicate-journal", "duplicate journal run_id"),
+    ("cmd-pause-resume", "pause-starts-run", "paused farmer started another run"),
+    ("cmd-abort-settled", "kept-on-abort", "abort kept an item"),
+    ("checkpoint-corrupt", "profile-mutated", "profile changed"),
+])
+def test_judges_reject_wrong_evidence(verification, monkeypatch, name, fault, reason):
+    monkeypatch.setenv("FAKE_VERIFY_FAULT", fault)
+    result = execute(verification, name)
+    assert result["verdict"] == "FAIL"
+    assert reason in result["reason"]
+
+
+def test_cli_requires_explicit_live_selection(tmp_path):
+    invocation = [sys.executable, "-m", "midgard_farm.verify"]
+    help_ = subprocess.run([*invocation, "--help"], cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert help_.returncode == 0 and all(flag in help_.stdout for flag in ("--scenario", "--all", "--soak", "--keep"))
+    no_selection = subprocess.run(invocation, cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert no_selection.returncode == 2
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(("keep", "fault"), [(False, ""), (True, ""), (False, "no-victory")])
+def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(verification, tmp_path, keep, fault):
+    os_, source, candidate, _, _, _ = verification
+    real = tmp_path / "source-home"
+    root, _ = os_.godot_sandbox(real)
+    root.mkdir(parents=True)
+    profile = root / source.name
+    shutil.move(source, profile)
+    env = os_.app_sandbox_environment(real)
+    # Both the CLI and its worker use the fixture game instead of the real executable.
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    (harness / "sitecustomize.py").write_text(
+        "from test_verify import VerifyGamePlatform\n"
+        "from midgard_farm import platform\nplatform.current = VerifyGamePlatform\n", encoding="utf-8",
+    )
+    env.update(PYTHONPATH=os.pathsep.join((str(harness), str(Path(__file__).resolve().parent))),
+               HOME=str(tmp_path), USERPROFILE=str(tmp_path), FAKE_VERIFY_SOURCE=str(profile), FAKE_VERIFY_FAULT=fault)
+    invocation = [sys.executable, "-B", "-m", "midgard_farm.verify", "--scenario", "one-run",
+                  "--candidate-dir", str(candidate)]
+    if keep:
+        invocation.append("--keep")
+    result = subprocess.run(invocation, env=env, cwd=tmp_path, capture_output=True, text=True, timeout=20)
+    assert result.returncode == bool(fault), result.stdout + result.stderr
+    out, = (tmp_path / ".sandbox").glob("verify-*")
+    summary = json.loads((out / "summary.json").read_bytes())
+    assert summary["rows"][0]["verdict"] == ("FAIL" if fault else "PASS")
+    assert (out / "one-run.run.log").is_file()
+    assert (out / "sandbox").exists() == bool(keep or fault)
+    assert (profile / "profile.json").read_text() == "100"
+    assert not (real / os_.app_data_dir().name).exists()
+
+
+def test_lock_queues_and_can_time_out(tmp_path, capsys):
+    from midgard_farm.verify.__main__ import wait_for_lock
+
+    os_ = platform.current()
+    lock = tmp_path / "verify.lock"
+    ready, release = Event(), Event()
+
+    def hold():
+        with os_.acquire_lock(lock):
+            ready.set()
+            release.wait(10)
+
+    thread = Thread(target=hold)
+    thread.start()
+    try:
+        assert ready.wait(3)
+        with pytest.raises(TimeoutError, match="verify.lock"):
+            wait_for_lock(os_, lock, time.monotonic(), lambda: None)
+        assert "waiting" in capsys.readouterr().out
+    finally:
+        release.set()
+        thread.join()
+    with wait_for_lock(os_, lock, time.monotonic() + 1, lambda: None):
+        with pytest.raises(platform.LockHeld):
+            os_.acquire_lock(lock)
+
+
+def test_direct_deadline_kills_only_the_sandbox_game(verification, monkeypatch):
+    from dataclasses import replace
+
+    monkeypatch.setenv("FAKE_VERIFY_FAULT", "hang")
+    monkeypatch.setitem(scenarios.SCENARIOS, "one-run", replace(scenarios.SCENARIOS["one-run"], timeout=0.3))
+    result = execute(verification, "one-run")
+    assert result["verdict"] == "FAIL" and result["exit"] == 124
+    assert not verification[0].game_running()
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, custom):
+    os_, _, _, _, out, root = verification
+    if os_.release_os != "linux":
+        with pytest.raises(ValueError, match="Linux only"):
+            execute(verification, "soak", hours=0.00001)
+        return
+    preset = None
+    if custom:
+        preset = tmp_path / "custom.json"
+        preset.write_text(json.dumps({"class": "", "builds": {"class": "archer", "archer": {"job_path": 1}},
+                                      "job_paths": {"swordsman": 2}, "display": True}))
+    row = execute(verification, "soak", hours=0.00001, soak_preset=preset)
+    assert row["verdict"] == "FAIL" and row["exit"] == 0  # No post-warmup RSS in this intentionally short run.
+    verdict = (out / "soak.verdict.log").read_text()
+    assert "no game RSS sample after the first hour" in verdict
+    summary = json.loads(verdict.splitlines()[0])
+    assert summary["runs"] == 1 and summary["hours"] >= 0.00001
+    config = json.loads(next(root.glob("*/farmer.cfg")).read_text())
+    assert config["class"] == "" and config["max_minutes"] == 0.00001 * 60
+    if custom:
+        assert config["builds"] == {"class": "archer", "archer": {"job_path": 1}}
+        assert config["job_paths"] == {"swordsman": 2} and not config["display"]
+    samples = [json.loads(line) for line in (out / "soak.samples.jsonl").read_text().splitlines()]
+    assert samples[0]["heartbeat_seq"] is None and samples[-1]["phase"] == "done"
+    assert len(samples) >= 2 and all(isinstance(sample["disk_kb"], int) for sample in samples)
+
+
+@pytest.mark.parametrize(("mode", "saved", "accept"), [
+    ("verify", "verify", True), ("afk", "afk", True), ("verify", "afk", False), ("afk", "verify", False),
+])
+def test_supervisor_recovers_only_its_configured_session_prefix(verification, mode, saved, accept):
+    os_, _, _, _, out, root = verification
+    profile = make_profile(root, "Sandbox Profile")
+    session = f"{saved}-{'1' * 32}"
+    request = commands.submit(os_, commands.Start(commands.Character("swordsman", 0), out / "preset.json"))
+    session_path = os_.app_data_dir() / "session.json"
+    session_path.write_text(json.dumps({"id": session, "profile": str(profile),
+                                        "start": json.loads(request.read_text()), "request": request.name}))
+    # Recover a terminal record without playing a game; rebuilding/history are real core operations.
+    log_dir = os_.app_data_dir() / "logs" / f"supervisor-{session}"
+    log_dir.mkdir(parents=True)
+    (log_dir / "outcome.json").write_text(json.dumps({"session": session, "kind": "finished", "reason": "finish",
+                                                    "attempts": [], "totals": {}}))
+    with StateReporter(os_) as reporter:
+        driver = supervisor.Supervisor(os_, profile, supervisor.Policy(), lambda: 1.0, lambda *_: None,
+                                       state=reporter, session_prefix=mode)
+        if accept:
+            driver.run()
+            assert not request.exists() and not session_path.exists()
+            assert session in (os_.app_data_dir() / "history.jsonl").read_text()
+        else:
+            with pytest.raises(supervisor.InvalidSavedSession, match="invalid saved AFK session id"):
+                driver.run()
+            assert request.exists() and session_path.exists()

@@ -95,6 +95,43 @@ class LinuxPlatform(Platform):
                 pids.add(int(cmdline.parent.name))
         return pids
 
+    def kill_owned_sandbox_game(self, pid: int, data_home: Path, session: str) -> bool:
+        if pid <= 1 or not session.startswith("verify-"):
+            return False
+        # Pin the PID against reuse; status files alone do not establish ownership.
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return False
+        try:
+            proc = Path(f"/proc/{pid}")
+            ppid = next(line for line in (proc / "status").read_bytes().splitlines() if line.startswith(b"PPid:"))
+            if int(ppid.split()[1]) != os.getpid() or pid not in self.game_pids():
+                return False
+            child_env = (proc / "environ").read_bytes().split(b"\0")
+            if (os.fsencode(_GODOT_DATA_HOME + "=") + os.fsencode(data_home) not in child_env
+                    or b"FARMER_SESSION_ID=" + session.encode() not in child_env):
+                return False
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+            return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            return False
+        finally:
+            os.close(fd)
+
+    def process_rss_kib(self, pid: int) -> int | None:
+        try:
+            with Path(f"/proc/{pid}/status").open() as status:
+                for line in status:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1])
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def allocated_bytes(self, path: Path) -> int:
+        return path.stat().st_blocks * 512
+
     def acquire_lock(self, path) -> InstanceLock:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
         try:
