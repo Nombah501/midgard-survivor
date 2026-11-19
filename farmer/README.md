@@ -39,7 +39,41 @@ tail -f "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer.log"
 
 Игра должна быть закрыта перед `install.sh`/`run.sh`. `run.sh` сам проверяет
 SHA официального патча и установленного фермерского патча; при обновлении игры
-нужно пересобрать (`./build.sh && ./install.sh`).
+нужно пересобрать (`./build.sh && ./install.sh`). Exit `run.sh`: 0 — чистый
+финиш, 78 — ошибка, которую рестарт не исправит (нет игры/патча, устаревшая
+сборка, плохой пресет), прочее — сбой.
+
+## AFK-сессия (supervisor)
+
+```bash
+./tools/supervisor.py presets/night.json   # на переднем плане
+./tools/supervisor.py --print-unit presets/night.json \
+  > ~/.config/systemd/user/midgard-farmer.service
+systemctl --user daemon-reload && systemctl --user start midgard-farmer
+journalctl --user -fu midgard-farmer
+```
+
+Supervisor запускает `run.sh` в отдельной группе процессов и следит за
+`heartbeat_seq` в `farmer_status.json`:
+
+| Исход | Действие |
+| --- | --- |
+| exit 0 и `phase=done` | конец сессии, уведомление `stop`/`goal` |
+| crash, выход без терминального статуса, heartbeat не менялся 3×5 с | kill всей группы, уведомление `fail`, рестарт через 15 с × 2ⁿ (до 10 мин) |
+| 4 сбоя за час, exit 78, `cfg_invalid` | quarantine: без рестарта, уведомление, exit 2 |
+| SIGTERM/SIGINT | SIGTERM группе, через 20 с SIGKILL, уведомление `stop`, exit 0 |
+
+До первого heartbeat даётся 180 с на загрузку игры. Логи и диагностика —
+`farmer/logs/supervisor-<stamp>/`: `attempt-NN.log` (вывод `run.sh`),
+`attempt-NN.status.json` (статус упавшей попытки), `quarantine.json`.
+Уведомления: `notify-send` и, если задан `FARMER_NTFY_URL` (в
+`~/.config/midgard-farmer.env` для unit'а или `--ntfy-url`), ntfy; они идут в
+фоне и не задерживают рестарт.
+
+systemd держит только сам supervisor: `Restart=on-failure`,
+`RestartPreventExitStatus=2` (quarantine не перезапускается), не больше 3
+рестартов в час. `systemctl --user enable` включает автозапуск при входе.
+Тесты на фейковом child, без игры: `python3 -m pytest farmer/tests`.
 
 ## Проверка
 
@@ -237,6 +271,8 @@ tools/inject_hook.py идемпотентная вставка хука
 tools/patch_player.py next_job: путь профессии из Save meta
 tools/check.sh       статические проверки
 tools/verify.sh      bounded one-run/stop/endless в sandbox
+tools/supervisor.py  AFK supervisor: heartbeat, рестарт, quarantine, уведомления
+tests/               pytest supervisor'а на фейковом farmer
 tools/install_hooks.sh  git core.hooksPath=.githooks
 presets/*.json       конфиги
 patch_farmer.pck     собранный патч

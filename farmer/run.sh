@@ -16,7 +16,11 @@ LOG_DIR="$FARMER_DIR/logs"
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"
 LOG="$LOG_DIR/run-$STAMP.log"
 
-die() { echo "run: $*" >&2; exit 1; }
+# Exit 78 (EX_CONFIG): a restart cannot fix this (missing game/patch, stale
+# build, bad preset); the supervisor quarantines without retrying.
+die() { echo "run: $*" >&2; exit 78; }
+# Exit 1: transient, another launcher or game instance is still alive.
+busy() { echo "run: $*" >&2; exit 1; }
 
 [[ -x "$GAME" ]] || die "game not found at $GAME"
 [[ -f "$STATE" ]] || die "no state.json at $STATE (launch the game once)"
@@ -25,11 +29,11 @@ die() { echo "run: $*" >&2; exit 1; }
 # One launcher at a time. The game also checks its own process below.
 exec 9>"$DATA/farmer.run.lock"
 if ! flock -n 9; then
-	die "another farmer launcher holds the lock"
+	busy "another farmer launcher holds the lock"
 fi
 
 if pgrep -f 'MidgardSurvivors\.x86_64' >/dev/null 2>&1; then
-	die "the game is already running; close it first"
+	busy "the game is already running; close it first"
 fi
 
 info_get() { sed -n "s/^$1=//p" "$INFO"; }

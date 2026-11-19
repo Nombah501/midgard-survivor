@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] Терминальный статус содержит `failed`, `finish_reason`, `last_error`, `last_transition`, `run_id` и heartbeat sequence.
 - [x] Сбой ставит `phase=failed` и терминальную причину.
