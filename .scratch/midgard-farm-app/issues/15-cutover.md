@@ -13,3 +13,4 @@
 ## Comments
 
 - 2026-11-19 (from ticket 03): the Python app keeps the official state snapshot per profile at `patches/official-state.json`. A profile still mounted on the legacy `patch_farmer.pck` has none, and the app does not guess the official file name or read the old `farmer/backups/official-state.json`. Before the first Python service start, restore the official patch with the old path (`uninstall.sh`), or seed a validated `patches/official-state.json`.
+- 2026-11-20: windows-latest showed three intermittent timing failures in `tests/test_supervisor.py`: a missed final notification, paused heartbeats and the idle-after-finish state. The first two were fixed in the test helpers. The third did not reproduce on rerun; `wait_for` now prints the last value read. If it recurs, check for a stale state on a loaded machine: no refresh for 3× `refresh_interval` would also show "service not running" in the window.
