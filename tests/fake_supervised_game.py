@@ -28,6 +28,10 @@ def status(phase="run", reason=""):
     data = {"phase": phase, "terminal": phase in {"done", "failed"},
             "failed": phase == "failed", "finish_reason": reason,
             "heartbeat_seq": seq, "pid": os.getpid(), "session": os.environ["FARMER_SESSION_ID"]}
+    data["heartbeat"] = time.time()
+    if kind == "commands" and arg == "summary":
+        data["totals"] = {"started": 2, "runs": 1, "wins": 1, "losses": 0, "lost": 1,
+                          "zeny": 7200, "xp": 50, "kills": 40, "coins": 3, "ymir": 2}
     if phase == "done" and kind == "missing-terminal":
         del data["terminal"]
     if phase == "done" and kind == "foreign-session":
@@ -97,6 +101,12 @@ if kind == "commands":
                 for _ in range(5):
                     status("settle")
                     time.sleep(0.05)
+            if arg == "summary":
+                session = os.environ["FARMER_SESSION_ID"]
+                with (profile / "farmer_runs.jsonl").open("a", encoding="utf-8") as journal:
+                    for owner, wall_s in [("unrelated", 900), (session, 1800)]:
+                        print(json.dumps({"session": owner, "run_id": owner + "-1", "wall_s": wall_s,
+                                          "cards_gain": 2, "materials": {"ore": 4}, "victory": True}), file=journal)
             status("done", command)
             if arg == "no-exit":
                 forever()

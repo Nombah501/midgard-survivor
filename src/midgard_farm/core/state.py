@@ -1,0 +1,177 @@
+"""Atomic, periodically refreshed service state for the window's file poller."""
+
+import json
+import math
+import threading
+import time
+from dataclasses import asdict, dataclass, replace
+from enum import StrEnum
+from pathlib import Path
+from types import TracebackType
+from typing import Any, TypedDict, Unpack
+
+from ..platform import Platform
+
+REFRESH_INTERVAL = 1.0
+STALE_INTERVALS = 3
+
+
+class StateKind(StrEnum):
+    IDLE = "idle"
+    ACTIVE = "active"
+    WAITING_FOR_GAME = "waiting_for_game"
+    REBUILDING = "rebuilding"
+    UPDATING = "updating"
+    FARMER_UNAVAILABLE = "farmer_unavailable"
+    STALE = "stale"  # Reader-only: the service is not publishing.
+
+
+@dataclass(frozen=True)
+class ServiceState:
+    kind: StateKind
+    reason: str
+    updated_at: float | None = None  # Service publication time (Unix seconds).
+    refresh_interval: float = REFRESH_INTERVAL
+    session_id: str | None = None
+    farmer_phase: str | None = None
+    last_heartbeat: float | None = None  # Farmer heartbeat, not service liveness.
+    last_outcome: dict[str, Any] | None = None
+    quarantine: dict[str, Any] | None = None
+    command_refusals: tuple[dict[str, Any], ...] = ()
+
+
+class _StateChanges(TypedDict, total=False):
+    session_id: str | None
+    farmer_phase: str | None
+    last_heartbeat: float | None
+    last_outcome: dict[str, Any] | None
+    quarantine: dict[str, Any] | None
+
+
+def state_path(os_: Platform) -> Path:
+    return os_.app_data_dir() / "state.json"
+
+
+def _object(os_: Platform, path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(os_.read_shared(path))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return float(value) if math.isfinite(value) else None
+        except OverflowError:
+            pass
+    return None
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def read_state(os_: Platform) -> ServiceState:
+    """Classify missing, unreadable or expired state as stale, keeping readable diagnostics."""
+    payload = _object(os_, state_path(os_)) or {}
+    updated_at = _number(payload.get("updated_at"))
+    interval = _number(payload.get("refresh_interval")) or REFRESH_INTERVAL
+    reason = _text(payload.get("reason")) or ""
+    try:
+        kind = StateKind(_text(payload.get("kind")) or "")
+    except ValueError:
+        kind = StateKind.STALE
+    if (kind is StateKind.STALE or updated_at is None
+            or not 0 <= time.time() - updated_at <= STALE_INTERVALS * interval):
+        kind, reason = StateKind.STALE, "Service is not running"
+    outcome, quarantine = payload.get("last_outcome"), payload.get("quarantine")
+    refusals = payload.get("command_refusals")
+    return ServiceState(kind, reason, updated_at, interval, _text(payload.get("session_id")),
+                        _text(payload.get("farmer_phase")), _number(payload.get("last_heartbeat")),
+                        outcome if isinstance(outcome, dict) else None,
+                        quarantine if isinstance(quarantine, dict) else None,
+                        tuple(row for row in refusals if isinstance(row, dict)) if isinstance(refusals, list) else ())
+
+
+def _quarantine(record: dict[str, Any]) -> dict[str, Any]:
+    reason = record.get("reason")
+    action = ("Check again" if reason in ("build_failed", "anchors_broken", "smoke_failed")
+              else "Start a new session")
+    return {**record, "detail": record.get("detail") or record.get("last_failure") or reason,
+            "next_action": record.get("next_action") or action}
+
+
+class StateReporter:
+    """One publisher under the service lock; refreshes even during blocking work."""
+
+    def __init__(self, os_: Platform, *, refresh_interval: float = REFRESH_INTERVAL):
+        self._os = os_
+        self._path = state_path(os_)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._error: str | None = None
+        previous = read_state(os_)
+        quarantine = _object(os_, self._path.parent / "quarantine.json") or previous.quarantine
+        self._state = ServiceState(StateKind.IDLE, "", refresh_interval=refresh_interval,
+                                   last_heartbeat=previous.last_heartbeat,
+                                   last_outcome=previous.last_outcome,
+                                   quarantine=_quarantine(quarantine) if quarantine is not None else None,
+                                   command_refusals=self._read_refusals())
+        self._thread = threading.Thread(target=self._refresh, daemon=True)
+
+    def __enter__(self) -> "StateReporter":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._publish()
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
+                 traceback: TracebackType | None) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def set(self, kind: StateKind, reason: str = "", **changes: Unpack[_StateChanges]) -> None:
+        """Publish a transition immediately; fields not supplied remain unchanged."""
+        if (quarantine := changes.get("quarantine")) is not None:
+            changes["quarantine"] = _quarantine(quarantine)
+        with self._lock:
+            self._state = replace(self._state, kind=kind, reason=reason, **changes)
+            self._publish()
+
+    def observe_farmer(self, status: dict[str, Any]) -> None:
+        phase = _text(status.get("phase"))
+        heartbeat = _number(status.get("heartbeat"))
+        with self._lock:
+            phase_changed = phase != self._state.farmer_phase
+            self._state = replace(self._state, farmer_phase=phase,
+                                  last_heartbeat=heartbeat if heartbeat is not None else self._state.last_heartbeat)
+            if phase_changed:
+                self._publish()
+
+    def refusals_changed(self) -> None:
+        with self._lock:
+            self._state = replace(self._state, command_refusals=self._read_refusals())
+            self._publish()
+
+    def _read_refusals(self) -> tuple[dict[str, Any], ...]:
+        return tuple({**record, "request": path.name}
+                     for path in sorted((self._path.parent / "command-rejections").glob("*.json"), reverse=True)[:20]
+                     if (record := _object(self._os, path)) is not None)
+
+    def _refresh(self) -> None:
+        while not self._stop.wait(self._state.refresh_interval):
+            with self._lock:
+                self._publish()
+
+    def _publish(self) -> None:
+        try:
+            self._os.write_atomic(self._path, json.dumps({"v": 1, **asdict(self._state),
+                                                          "updated_at": time.time()}).encode())
+            self._error = None
+        except OSError as exc:
+            if str(exc) != self._error:
+                self._error = str(exc)
+                print(f"supervisor: could not publish service state: {exc}", flush=True)

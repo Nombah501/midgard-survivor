@@ -1,0 +1,27 @@
+import json
+
+from midgard_farm import platform
+from midgard_farm.core.history import append_event, history_path, read_history
+
+
+def test_history_interleaves_updates_and_ignores_unreadable_or_unknown_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    os_ = platform.current()
+    assert read_history(os_) == []
+
+    append_event(os_, "game_update", old_version="1", new_version="2", result="handled")
+    path = history_path(os_)
+    first = path.read_bytes()
+    with path.open("ab") as file:
+        file.write(json.dumps({"v": 2, "kind": "app_update", "future": True}).encode() + b"\n")
+        file.write(b'{"v":1,"kind":"app_update","timestamp":42,"future":"additive"}\n')
+        file.write(b'{"v":1,"kind":"app_update","timestamp":43,"detail":')
+    append_event(os_, "app_update", version="v0.2", result="rolled_back")
+
+    assert path.read_bytes().startswith(first)
+    rows = read_history(os_)
+    assert [row["kind"] for row in rows] == ["game_update", "app_update", "app_update"]
+    assert rows[0]["v"] == 1 and rows[0]["new_version"] == "2"
+    assert rows[1]["timestamp"] == 42
+    assert rows[2]["result"] == "rolled_back"

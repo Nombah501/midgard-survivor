@@ -182,6 +182,64 @@ def test_readers_see_old_or_new_content_never_a_mix(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == [target.name]
 
 
+def test_shared_reads_while_writer_replaces_the_file(tmp_path):
+    target = tmp_path / "service state.json"
+    old, new = b"idle\n", b"active\n"
+    OS.write_atomic(target, old)
+    writer = python(
+        """
+        import sys, time
+        from midgard_farm import platform
+        os_ = platform.current()
+        for i in range(200):
+            os_.write_atomic(sys.argv[1], b"active\\n" if i % 2 == 0 else b"idle\\n")
+            if i < 2:
+                time.sleep(0.05)
+        """,
+        str(target),
+    )
+    seen = set()
+    try:
+        while writer.poll() is None:
+            seen.add(OS.read_shared(target))
+            time.sleep(0.001)
+        assert writer.wait() == 0
+        assert seen == {old, new}
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+            writer.wait()
+        writer.stdout.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sharing violation")
+def test_shared_read_retries_an_exclusive_windows_open(tmp_path):
+    import ctypes
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from ctypes import wintypes
+
+    target = tmp_path / "quarantine.json"
+    target.write_bytes(b"quarantine")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_file = kernel.CreateFileW
+    open_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                          wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    open_file.restype = wintypes.HANDLE
+    close_file = kernel.CloseHandle
+    close_file.argtypes = [wintypes.HANDLE]
+    close_file.restype = wintypes.BOOL
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        handle = open_file(str(target), 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, OPEN_EXISTING
+        assert handle and handle != ctypes.c_void_p(-1).value
+        try:
+            reading = pool.submit(OS.read_shared, target)
+            with pytest.raises(TimeoutError):
+                reading.result(timeout=0.1)
+        finally:
+            assert close_file(handle)
+        assert reading.result(timeout=1) == b"quarantine"
+
+
 def fake_game(tmp_path: Path) -> list[str]:
     """A long-running command whose executable has the game's file name."""
     exe = tmp_path / "game dir" / OS.game_exe_name

@@ -11,6 +11,9 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
+
+type NotificationPriority = Literal["low", "normal", "high"]
 
 
 class LockHeld(Exception):
@@ -105,6 +108,10 @@ class Platform(abc.ABC):
         return bool(self.game_pids())
 
     @abc.abstractmethod
+    def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
+        """Deliver a desktop notification for the signed-in operator."""
+
+    @abc.abstractmethod
     def acquire_lock(self, path: str | os.PathLike) -> InstanceLock:
         """Take the exclusive lock on `path` without waiting; raise LockHeld if taken."""
 
@@ -119,6 +126,10 @@ class Platform(abc.ABC):
     @abc.abstractmethod
     def replace_atomic(self, src: str | os.PathLike, dst: str | os.PathLike) -> None:
         """Replace `dst` with `src` in a single OS operation, durably."""
+
+    def read_shared(self, path: Path, *, retry_missing: bool = False) -> bytes:
+        """Read a file that another process may be replacing."""
+        return path.read_bytes()
 
     def write_atomic(self, path: str | os.PathLike, data: bytes) -> None:
         """Write `data` to `path` so readers see the old or the new content, never a mix."""

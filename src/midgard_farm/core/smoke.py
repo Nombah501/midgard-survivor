@@ -90,11 +90,11 @@ def _has_marker(path: Path, marker: re.Pattern[bytes]) -> bool:
         return False
 
 
-def _judge(profile: Path, log_path: Path) -> str:
+def _judge(os_: Platform, profile: Path, log_path: Path) -> str:
     if _has_marker(log_path, _SCRIPT_ERROR):
         return "script error in game output"
     try:
-        status = json.loads((profile / "farmer_status.json").read_bytes())
+        status = json.loads(os_.read_shared(profile / "farmer_status.json", retry_missing=True))
     except FileNotFoundError:
         return "no farmer_status.json"
     except ValueError:
@@ -145,7 +145,7 @@ def _attempt(os_: Platform, profile: Path, app_dir: Path, game: Path, log_path: 
         # A verified headless finish can SIGKILL itself; on Windows the exit code is not meaningful.
         if os_.game_exit_status_reliable and code not in (0, -9):
             return f"game exited with code {code}"
-        return _judge(sandbox, log_path)
+        return _judge(os_, sandbox, log_path)
     finally:
         # TemporaryDirectory can chmod files on cleanup; a linked pack must never be chmodded.
         shutil.rmtree(data_home)

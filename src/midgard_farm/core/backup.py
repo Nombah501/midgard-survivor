@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ..platform import Platform
+from ..platform import Platform, current
 from .preflight import sha256
 
 PROFILE_FILES = ("profile.json", "profile.bak.json", "profile.run", "profile.run.farmer_bak")
@@ -38,7 +38,7 @@ def known_good_snapshot(backups: Path) -> Path | None:
     """Resolve the published generation; hold the service lock while using it."""
     directory = backups / "known-good"
     try:
-        generation = (directory / "current").read_text(encoding="ascii")
+        generation = current().read_shared(directory / "current").decode("ascii")
     except FileNotFoundError:
         return None
     if not _GENERATION_NAME.fullmatch(generation) or not (directory / generation).is_dir():

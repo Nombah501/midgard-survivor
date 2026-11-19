@@ -19,12 +19,14 @@ import pytest
 
 from midgard_farm import platform
 from midgard_farm.core import commands, patch_info
+from midgard_farm.core.history import append_event, read_history
+from midgard_farm.core.state import StateKind, read_state
 from midgard_farm.core.backup import known_good_snapshot, publish_known_good
 
 from test_profile import godot_root, make_profile
 
 
-SERVICE = [sys.executable, "-m", "midgard_farm.service"]
+SERVICE = [sys.executable, str(Path(__file__).with_name("fake_notification_service.py"))]
 FAKE = Path(__file__).with_name("fake_supervised_game.py")
 POSIX = pytest.mark.skipif(sys.platform != "linux", reason="Linux process signals and permissions")
 
@@ -59,7 +61,7 @@ class Farm:
         return self.profile / "farmer_status.json"
 
     def status(self, phase):
-        return wait_for(lambda: json.loads(self.status_path.read_bytes()), lambda d: d["phase"] == phase)
+        return wait_for(lambda: json.loads(self.os_.read_shared(self.status_path)), lambda d: d["phase"] == phase)
 
     def send(self, command, **fields):
         queue = self.data / "commands"
@@ -76,21 +78,19 @@ class Farm:
             paths = list(self.data.glob("logs/supervisor-*/outcome.json"))
             if paths:
                 path = paths[0]
-                return json.loads(path.read_bytes()), path.parent
+                return json.loads(self.os_.read_shared(path)), path.parent
         return wait_for(read)
 
     @contextmanager
-    def service(self, *, ntfy_url="", **policy):
+    def service(self, **policy):
         timing = dict(heartbeat_interval=0.15, startup_grace=3.0, backoff_base=0.05,
                       backoff_max=0.2, max_failures=3, failure_window=60.0,
                       kill_grace=0.5, stop_grace=0.85) | policy
-        command = [*self.prefix, sys.executable, "-c",
-                   "from midgard_farm import service\n"
-                   f"raise SystemExit(service.main(policy=service.Policy(**{timing!r})))\n",
-                   "--ntfy-url", ntfy_url]
+        command = [*self.prefix, *SERVICE]
+        env = {**os.environ, "FAKE_SERVICE_POLICY": json.dumps(timing)}
         output = self.plan.with_suffix(".output")
         with output.open("wb") as log:
-            proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+            proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
             try:
                 yield proc
             finally:
@@ -253,7 +253,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm):
         running = farm.status("run")
         farm.send("pause")
         paused = farm.status("paused")
-        wait_for(lambda: json.loads(farm.status_path.read_bytes()), lambda d: (
+        wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
             d["phase"] == "paused" and d["heartbeat_seq"] >= paused["heartbeat_seq"] + 12
         ))
         farm.send("resume")
@@ -421,7 +421,7 @@ def test_second_supervisor_leaves_the_running_session_alone(farm, legacy_lock):
     session.write_text("afk-first")
     lock_path = farm.profile / "farmer_supervisor.lock" if legacy_lock else farm.data / "service.lock"
     with farm.os_.acquire_lock(lock_path):
-        second = subprocess.run([*farm.prefix, *SERVICE, "--ntfy-url", ""], capture_output=True,
+        second = subprocess.run([*farm.prefix, *SERVICE], capture_output=True,
                                 encoding="utf-8", timeout=5)
     assert second.returncode == 75, second.stdout + second.stderr
     assert "another supervisor" in second.stderr
@@ -436,7 +436,7 @@ def test_unwritable_profile_quarantines_the_supervisor_itself(farm):
         pytest.skip("root can write a read-only directory")
     farm.profile.chmod(0o555)
     try:
-        result = subprocess.run([*farm.prefix, *SERVICE, "--ntfy-url", ""], capture_output=True,
+        result = subprocess.run([*farm.prefix, *SERVICE], capture_output=True,
                                 encoding="utf-8", timeout=5)
     finally:
         farm.profile.chmod(0o755)
@@ -450,11 +450,19 @@ def test_preflight_quarantine_names_the_actual_launcher_cause(farm):
     with farm.service() as proc:
         farm.start()
         outcome, directory = farm.outcome()
+        state = wait_for(lambda: read_state(farm.os_), lambda state: state.kind is StateKind.IDLE and state.quarantine)
+        history = read_history(farm.os_)
         assert proc.poll() is None  # Still available to the window after quarantine.
     cause = "run: official patch changed (game updated); rebuild the farmer patch"
     report = json.loads((directory / "quarantine.json").read_bytes())
     assert (outcome["kind"], outcome["reason"], len(outcome["attempts"])) == ("quarantined", "preflight_failed", 1)
     assert report["detail"] == cause
+    assert state.quarantine["reason"] == "preflight_failed"
+    assert state.quarantine["detail"] == cause
+    assert state.quarantine["next_action"] == "Start a new session"
+    assert state.last_outcome == outcome
+    assert len(history) == 1 and history[0]["outcome"] == "quarantined"
+    assert history[0]["totals"]["runs"] == 0
     assert cause in (directory / "attempt-01.log").read_text()
     assert not farm.plan.with_suffix(".count").exists()
     assert farm.notifications() == ["quarantine"]
@@ -568,7 +576,8 @@ def test_unresponsive_ntfy_does_not_block_the_service(farm, monkeypatch):
         server.listen()
         server.settimeout(5)
         url = f"http://127.0.0.1:{server.getsockname()[1]}/topic"
-        with farm.service(ntfy_url=url):
+        (farm.data / "config.json").write_text(json.dumps({"ntfy_url": url}))
+        with farm.service():
             farm.start()
             try:
                 conn, _ = server.accept()
@@ -580,6 +589,7 @@ def test_unresponsive_ntfy_does_not_block_the_service(farm, monkeypatch):
                         assert line
                         headers.append(line.lower())
                     assert b"title: midgard farmer: fail\r\n" in headers
+                    assert b"priority: 3\r\n" in headers
                     # Don't answer before the game retry and outcome are complete.
                     outcome, _ = farm.outcome()
                     assert (outcome["kind"], len(outcome["attempts"])) == ("finished", 2)
@@ -588,7 +598,7 @@ def test_unresponsive_ntfy_does_not_block_the_service(farm, monkeypatch):
 
 
 @POSIX
-def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm):
+def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm, tmp_path):
     result = subprocess.run([*SERVICE, "--print-unit"], check=True, capture_output=True,
                             encoding="utf-8", timeout=5)
     unit = result.stdout
@@ -598,7 +608,13 @@ def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm):
     command = shlex.split(next(line.removeprefix("ExecStart=") for line in unit.splitlines()
                                if line.startswith("ExecStart=")))
     (farm.profile / "patches/patch_farmer.pck").unlink()
-    with subprocess.Popen([*farm.prefix, *command, "--ntfy-url", ""], stdout=subprocess.DEVNULL) as proc:
+    fake_bin = tmp_path / "notification-bin"
+    fake_bin.mkdir()
+    fake_notify = fake_bin / "notify-send"
+    fake_notify.write_text("#!/bin/sh\nexit 0\n")
+    fake_notify.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}
+    with subprocess.Popen([*farm.prefix, *command], stdout=subprocess.DEVNULL, env=env) as proc:
         try:
             farm.start()
             outcome, _ = farm.outcome()
@@ -636,7 +652,7 @@ def test_duplicate_start_is_refused_but_start_after_queued_finish_runs(farm):
         next_start = commands.submit(farm.os_, command)
 
         def read_outcomes():
-            return [json.loads(path.read_bytes()) for path in farm.data.glob("logs/supervisor-*/outcome.json")]
+            return [json.loads(farm.os_.read_shared(path)) for path in farm.data.glob("logs/supervisor-*/outcome.json")]
 
         outcomes = wait_for(read_outcomes, lambda values: len(values) == 2)
         assert not duplicate.exists() and not finish.exists() and not next_start.exists()
@@ -661,8 +677,11 @@ def test_startup_quarantine_preserves_corrupt_session_and_accepts_start_in_same_
         assert proc.poll() is None
         assert not farm.plan.with_suffix(".count").exists()
         assert farm.notifications() == ["quarantine"]
-        record = json.loads(current.read_bytes())
+        record = json.loads(farm.os_.read_shared(current))
         assert record["reason"] == "invalid_saved_session"
+        state = read_state(farm.os_)
+        assert state.kind is StateKind.IDLE
+        assert state.quarantine == {**record, "next_action": "Start a new session"}
         assert not marker.exists()
         diagnostics = farm.data / record["diagnostics"]
         assert (diagnostics / "session.json").read_bytes() == corrupt
@@ -683,5 +702,50 @@ def test_duplicate_start_rejections_keep_only_the_newest_twenty(farm):
         duplicates = [commands.submit(farm.os_, command) for _ in range(23)]
         farm.send("finish")
         farm.outcome()
+        state = read_state(farm.os_)
     rejections = [commands.rejection_path(farm.os_, request) for request in duplicates]
     assert set(rejections[-20:]) == set(rejections[0].parent.glob("*.json"))
+    assert {row["request"] for row in state.command_refusals} == {path.name for path in rejections[-20:]}
+
+
+def test_service_publishes_live_farmer_and_one_history_row_with_session_totals(farm):
+    plan_game(farm, "commands:summary")
+    with farm.service():
+        farm.start()
+        active = wait_for(lambda: read_state(farm.os_), lambda state: state.farmer_phase == "run")
+        assert active.kind is StateKind.ACTIVE
+        assert active.session_id == farm.status("run")["session"]
+        assert active.last_heartbeat > 0
+        farm.send("finish")
+        idle = wait_for(lambda: read_state(farm.os_), lambda state: state.kind is StateKind.IDLE and state.last_outcome)
+        assert idle.session_id is None
+        assert idle.last_outcome["session"] == active.session_id
+        row, = read_history(farm.os_)
+        assert row["session_id"] == active.session_id and row["outcome"] == "finished"
+        assert row["totals"] == {"started": 2, "runs": 1, "wins": 1, "losses": 0, "lost": 1,
+                                 "zeny": 7200, "xp": 50, "kills": 40, "coins": 3, "ymir": 2,
+                                 "wall_s": 1800, "cards_gain": 2, "materials": {"ore": 4}}
+
+
+@pytest.mark.parametrize("already_appended", [False, True])
+def test_recovering_committed_outcome_adds_history_only_if_missing(farm, already_appended):
+    session_id = "afk-" + uuid.uuid4().hex
+    request = farm.start()
+    (farm.data / "session.json").write_text(json.dumps({
+        "id": session_id, "start": json.loads(request.read_bytes()),
+        "request": request.name, "profile": str(farm.profile),
+    }))
+    directory = farm.data / "logs" / f"supervisor-{session_id}"
+    directory.mkdir(parents=True)
+    (directory / "outcome.json").write_text(json.dumps({
+        "session": session_id, "kind": "stopped", "reason": "operator", "attempts": [], "totals": {"runs": 2},
+    }))
+    if already_appended:
+        append_event(farm.os_, "session", session_id=session_id, outcome="stopped", totals={"runs": 2})
+
+    with farm.service():
+        state = wait_for(lambda: read_state(farm.os_), lambda state: state.last_outcome)
+        assert state.last_outcome["session"] == session_id
+        row, = read_history(farm.os_)
+        assert row["totals"] == {"runs": 2}
+    assert not farm.plan.with_suffix(".count").exists()

@@ -43,9 +43,10 @@ def shutdown_request() -> Iterator[Callable[[], float | None]]:
             signal.signal(sig, handler)
 
 
-def _read_status(profile: Path, session_id: str | None) -> dict | None:
+def _read_status(os_: Platform, profile: Path, session_id: str | None, *,
+                 retry_missing: bool = False) -> dict | None:
     try:
-        status = json.loads((profile / "farmer_status.json").read_bytes())
+        status = json.loads(os_.read_shared(profile / "farmer_status.json", retry_missing=retry_missing))
     except (OSError, ValueError):
         return None
     if isinstance(status, dict) and (session_id is None or status.get("session") == session_id):
@@ -185,7 +186,7 @@ def run_attempt(
                             break
                         except subprocess.TimeoutExpired:
                             if watch is not None:
-                                status = _read_status(profile, expected_session)
+                                status = _read_status(os_, profile, expected_session)
                                 if status is not None:
                                     last_status = status
                                 forced_reason = watch(status)
@@ -201,7 +202,7 @@ def run_attempt(
             else:
                 tee()
 
-        status = _read_status(profile, expected_session)
+        status = _read_status(os_, profile, expected_session, retry_missing=True)
         result = AttemptExit(code, status, status if status is not None else last_status, forced_reason)
         reason = (status or {}).get("finish_reason")
         if session_id and result.clean(os_) and isinstance(reason, str) and reason in _SETTLED_REASONS:

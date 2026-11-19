@@ -1,3 +1,4 @@
+import base64
 import csv
 import ctypes
 import msvcrt
@@ -7,8 +8,9 @@ import time
 from collections.abc import Sequence
 from ctypes import wintypes
 from pathlib import Path
+from xml.sax.saxutils import escape
 
-from . import InstanceLock, LockHeld, Platform, ProcessTree, check_argv
+from . import InstanceLock, LockHeld, NotificationPriority, Platform, ProcessTree, check_argv
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _ntdll = ctypes.WinDLL("ntdll")
@@ -27,6 +29,25 @@ CREATE_NO_WINDOW = 0x08000000
 MOVEFILE_WRITE_THROUGH = 0x8
 # A reader (the window polling a status file) may briefly hold the target open.
 REPLACE_RETRY_SECONDS = 2.0
+
+_TOAST_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$appId = 'Midgard.Farm'
+# A per-user identity needs no desktop window, shortcut target or administrator.
+$key = "HKCU:\Software\Classes\AppUserModelId\$appId"
+if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+New-ItemProperty -Path $key -Name DisplayName -Value 'Midgard Farm' -Force | Out-Null
+
+[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null
+[Windows.UI.Notifications.ToastNotification,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime] | Out-Null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($env:MIDGARD_FARM_TOAST_XML)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+if ($env:MIDGARD_FARM_TOAST_PRIORITY -eq 'high') { $toast.Priority = 1 }
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
+"""
+_TOAST_COMMAND = base64.b64encode(_TOAST_SCRIPT.encode("utf-16-le")).decode("ascii")
 
 
 class _OVERLAPPED(ctypes.Structure):
@@ -128,6 +149,16 @@ class WindowsPlatform(Platform):
         # The game ships as a ZIP unpacked anywhere; no install location to assume.
         raise RuntimeError("the game folder is unknown on Windows; set GAME_DIR")
 
+    def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
+        audio = '<audio silent="true"/>' if priority == "low" else ""
+        xml = ('<toast><visual><binding template="ToastGeneric">'
+               f"<text>{escape(title)}</text><text>{escape(message)}</text>"
+               f"</binding></visual>{audio}</toast>")
+        powershell = Path(_env_dir("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", _TOAST_COMMAND],
+                       env={**os.environ, "MIDGARD_FARM_TOAST_XML": xml, "MIDGARD_FARM_TOAST_PRIORITY": priority},
+                       creationflags=CREATE_NO_WINDOW, check=True, capture_output=True, timeout=10)
+
     def game_pids(self) -> set[int]:
         out = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {self.game_exe_name}", "/FO", "CSV", "/NH"],
@@ -188,3 +219,13 @@ class WindowsPlatform(Platform):
             if err not in (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION) or time.monotonic() > deadline:
                 raise ctypes.WinError(err)
             time.sleep(0.01)
+
+    def read_shared(self, path: Path, *, retry_missing: bool = False) -> bytes:
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                return path.read_bytes()
+            except (PermissionError, FileNotFoundError) as exc:
+                if (isinstance(exc, FileNotFoundError) and not retry_missing) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)

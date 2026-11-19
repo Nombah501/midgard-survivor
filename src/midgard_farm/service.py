@@ -4,17 +4,19 @@ import argparse
 import json
 import os
 import sys
-import threading
 import time
-import urllib.request
 import uuid
 from pathlib import Path
 
 from . import platform
+from .core.commands import Start
+from .core.config import read_config
 from .core.launch import GameBusy, run_attempt, shutdown_request
+from .core.notify import Notifier
 from .core.preflight import PreflightError
 from .core.profile import ProfileNotFound, find_profile
-from .core.supervisor import InvalidSavedSession, Policy, Supervisor, log
+from .core.state import StateKind, StateReporter
+from .core.supervisor import InvalidSavedSession, Policy, Supervisor, log, pending_commands, refuse_start
 
 # sysexits: the same "unfixable" code run.sh's preflight uses.
 EX_TEMPFAIL = 75
@@ -48,35 +50,9 @@ def _systemd_quote(arg: str) -> str:
     return '"' + arg.replace("%", "%%").replace("$", "$$") + '"'
 
 
-class _Notifier:
-    def __init__(self, ntfy_url: str):
-        self.url = ntfy_url
-        self.pending: list[threading.Thread] = []
-
-    def _send(self, title: str, message: str) -> None:
-        try:
-            request = urllib.request.Request(self.url, data=message.encode(), headers={"Title": title})
-            urllib.request.urlopen(request, timeout=10).close()
-        except (OSError, ValueError) as exc:
-            log(f"ntfy failed: {exc}")
-
-    def notify(self, event: str, message: str) -> None:
-        log(f"notify {event}: {message}")
-        if self.url:
-            self.pending = [thread for thread in self.pending if thread.is_alive()]
-            thread = threading.Thread(target=self._send, args=(f"Midgard farmer: {event}", message), daemon=True)
-            thread.start()
-            self.pending.append(thread)
-
-    def drain(self) -> None:
-        deadline = time.monotonic() + 25
-        for thread in self.pending:
-            thread.join(max(0.0, deadline - time.monotonic()))
-
-
-def _startup_quarantine(os_: platform.Platform, data: Path, notifier: _Notifier,
+def _startup_quarantine(os_: platform.Platform, data: Path, notifier: Notifier,
                         reason: str, description: str, error: Exception,
-                        *, saved_session: Path | None = None) -> int:
+                        *, state: StateReporter | None = None, saved_session: Path | None = None) -> int:
     detail = f"{description}: {error}"
     notifier.notify("quarantine", detail)
     record: dict[str, object] = {"reason": reason, "detail": detail, "attempts": []}
@@ -88,6 +64,9 @@ def _startup_quarantine(os_: platform.Platform, data: Path, notifier: _Notifier,
             record["diagnostics"] = diagnostics.as_posix()
             os_.write_atomic(directory / "quarantine.json", json.dumps(record, indent=2).encode())
         os_.write_atomic(data / "quarantine.json", json.dumps(record, indent=2).encode())
+        if state is not None:
+            kind = StateKind.IDLE if saved_session is not None else StateKind.FARMER_UNAVAILABLE
+            state.set(kind, detail, quarantine=record)
         if saved_session is not None:
             os_.replace_atomic(saved_session, directory / saved_session.name)
             return 0
@@ -96,7 +75,7 @@ def _startup_quarantine(os_: platform.Platform, data: Path, notifier: _Notifier,
     return EXIT_QUARANTINE
 
 
-def _serve(os_: platform.Platform, policy: Policy, notifier: _Notifier) -> int:
+def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
     data = os_.app_data_dir()
     lock_path = data / "service.lock"
     try:
@@ -107,18 +86,26 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: _Notifier) -> int:
         return EX_TEMPFAIL
     except OSError as exc:
         return _startup_quarantine(os_, data, notifier, "app_data_unusable", "app data directory unusable", exc)
-    with lock, shutdown_request() as requested_at:
+    with lock, shutdown_request() as requested_at, StateReporter(os_) as state:
         last_missing = ""
         while requested_at() is None:
             try:
                 profile = find_profile(os_.godot_user_data_root())
             except ProfileNotFound as exc:
-                if str(exc) != last_missing:
-                    last_missing = str(exc)
-                    log(f"profile not found: {exc}")
+                reason = str(exc)
+                if reason != last_missing:
+                    last_missing = reason
+                    state.set(StateKind.FARMER_UNAVAILABLE, reason)
+                    log(f"profile not found: {reason}")
+                for path, command in pending_commands(os_):
+                    if isinstance(command, Start):
+                        refuse_start(os_, state, path, reason)
+                    else:
+                        path.unlink()
                 time.sleep(1)
             except OSError as exc:
-                return _startup_quarantine(os_, data, notifier, "profile_unusable", "profile directory unusable", exc)
+                return _startup_quarantine(os_, data, notifier, "profile_unusable", "profile directory unusable", exc,
+                                           state=state)
             else:
                 break
         else:
@@ -130,15 +117,19 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: _Notifier) -> int:
             print(f"supervisor: another supervisor is already running for {profile}", file=sys.stderr)
             return EX_TEMPFAIL
         except OSError as exc:
-            return _startup_quarantine(os_, data, notifier, "profile_unusable", "profile directory unusable", exc)
+            return _startup_quarantine(os_, data, notifier, "profile_unusable", "profile directory unusable", exc,
+                                       state=state)
         with profile_lock:
+            if last_missing:
+                state.set(StateKind.IDLE)
             log(f"profile: {profile}")
-            supervisor = Supervisor(os_, profile, policy, requested_at, notifier.notify)
+            supervisor = Supervisor(os_, profile, policy, requested_at, notifier.notify, state=state)
             try:
                 supervisor.run()
             except InvalidSavedSession as exc:
                 result = _startup_quarantine(os_, data, notifier, "invalid_saved_session",
-                                             "saved AFK session unusable", exc, saved_session=supervisor.session_path)
+                                             "saved AFK session unusable", exc, state=state,
+                                             saved_session=supervisor.session_path)
                 if result != 0:
                     return result
                 supervisor.run()
@@ -153,7 +144,6 @@ def main(*, policy: Policy = Policy()) -> int:
         stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--print-unit", action="store_true", help="print the systemd user unit without installing it")
-    parser.add_argument("--ntfy-url", default=os.environ.get("FARMER_NTFY_URL", ""))
     subcommands = parser.add_subparsers(dest="command")
     launch = subcommands.add_parser("launch", help="launch one attempt with the installed farmer patch")
     launch.add_argument("preset", nargs="?", type=Path, help="JSON preset; defaults to the profile's farmer.cfg")
@@ -195,7 +185,7 @@ def main(*, policy: Policy = Policy()) -> int:
             print(f"midgard-farm-service: {exc}", file=sys.stderr)
             return 1
 
-    notifier = _Notifier(args.ntfy_url)
+    notifier = Notifier(os_, read_config(os_).ntfy_url)
     try:
         return _serve(os_, policy, notifier)
     finally:

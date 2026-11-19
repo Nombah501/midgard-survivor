@@ -6,15 +6,18 @@ import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 
 from midgard_farm import platform
+from midgard_farm.core.commands import Character, Start, submit
+from midgard_farm.core.state import StateKind, read_state
 
 from test_profile import godot_root, make_profile
 
 
-SERVICE = [sys.executable, "-m", "midgard_farm.service", "--ntfy-url", ""]
+SERVICE = [sys.executable, str(Path(__file__).with_name("fake_notification_service.py"))]
 
 
 def service_env(home):
@@ -41,7 +44,10 @@ def test_service_reports_the_profile_it_found(tmp_path):
             service.wait(timeout=5)
 
 
-def test_service_waits_for_a_missing_profile_and_discovers_it(tmp_path):
+def test_service_waits_for_a_missing_profile_and_discovers_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    os_ = platform.current()
     output = tmp_path / "service.log"
     with output.open("wb") as log, subprocess.Popen(SERVICE, env=service_env(tmp_path), stdout=log) as service:
         def wait_for(message):
@@ -52,9 +58,19 @@ def test_service_waits_for_a_missing_profile_and_discovers_it(tmp_path):
 
         try:
             wait_for("profile not found")
+            unavailable = read_state(os_)
+            assert unavailable.kind is StateKind.FARMER_UNAVAILABLE
+            assert "launch the game once" in unavailable.reason
+            request = submit(os_, Start(Character("archer", 1), tmp_path / "preset.json"))
+            wait_for("refused start")
+            assert read_state(os_).command_refusals[0]["request"] == request.name
             assert service.poll() is None
             profile = make_profile(godot_root(tmp_path), "Late Midgard Survivors")
             wait_for(str(profile))
+            deadline = time.monotonic() + 5
+            while read_state(os_).kind is not StateKind.IDLE:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
             assert service.poll() is None
         finally:
             if service.poll() is None:
@@ -118,7 +134,7 @@ def test_corrupt_or_foreign_saved_session_is_quarantined(tmp_path, monkeypatch, 
                 assert service.poll() is None and time.monotonic() < deadline
                 time.sleep(0.01)
             assert service.poll() is None
-            record = json.loads((data / "quarantine.json").read_bytes())
+            record = json.loads(platform.current().read_shared(data / "quarantine.json"))
             assert record["reason"] == "invalid_saved_session"
             assert record["detail"]
             diagnostics = data / record["diagnostics"]

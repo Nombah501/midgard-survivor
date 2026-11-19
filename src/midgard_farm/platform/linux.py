@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Never
 
-from . import InstanceLock, LockHeld, NetworkIsolationError, Platform, ProcessTree, check_argv
+from . import InstanceLock, LockHeld, NetworkIsolationError, NotificationPriority, Platform, ProcessTree, check_argv
 
 _GODOT_DATA_HOME = "XDG_DATA_HOME"
 _GODOT_USER_DATA = Path("godot", "app_userdata")
@@ -72,6 +72,11 @@ class LinuxPlatform(Platform):
 
     def default_game_dir(self) -> Path:
         return Path.home() / "games" / "midgard-survivors"
+
+    def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
+        urgency = "critical" if priority == "high" else priority
+        subprocess.run(["notify-send", "--app-name=Midgard Farm", f"--urgency={urgency}", "--", title, message],
+                       check=True, capture_output=True, timeout=10)
 
     def game_pids(self) -> set[int]:
         # The argv[0] name, as `pgrep -f` matched in run.sh: `unshare` execs
