@@ -6,12 +6,12 @@
 # Docs-only commits are skipped. Bypass in an emergency: git push --no-verify.
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
-PY="$ROOT/.venv/bin/python"
 ZERO=0000000000000000000000000000000000000000
 CODE='^(src|tests|packaging|farmer)/|^pyproject\.toml$'
+# Work next to uv's cache so the per-commit venv is hardlinked, not copied into /tmp.
+WORK_PARENT="${XDG_CACHE_HOME:-$HOME/.cache}/midgard-pre-push"
 
-[ -x "$PY" ] || { echo "pre-push: $PY missing; create the venv (see README) or push with --no-verify" >&2; exit 1; }
+command -v uv >/dev/null || { echo "pre-push: uv missing; install it or push with --no-verify" >&2; exit 1; }
 
 declare -A seen=()
 commits=()
@@ -47,8 +47,14 @@ for commit in "${commits[@]}"; do
   grep -qE "$CODE" <<<"$changed" || continue
   short="$(git log -1 --format=%h "$commit")"
   echo "pre-push: checking $(git log -1 --format='%h %s' "$commit")"
-  work="$(mktemp -d)"
+  mkdir -p "$WORK_PARENT"
+  work="$(mktemp -d "$WORK_PARENT/check.XXXXXX")"
   git archive "$commit" | tar -x -C "$work"
+  # A venv per commit: the checkout's editable install would make subprocess tests import
+  # the worktree (including other people's uncommitted farmer/ edits) instead of this commit.
+  uv venv -q --python 3.13 "$work/.venv"
+  run_in "$work" uv pip install -q --python "$work/.venv/bin/python" -e ".[test]" mypy
+  PY="$work/.venv/bin/python"
   for target in linux win32; do
     other=$([ "$target" = linux ] && echo windows || echo linux)
     run_in "$work" "$PY" -m mypy --python-version 3.13 --platform "$target" --follow-imports=silent \
@@ -56,7 +62,7 @@ for commit in "${commits[@]}"; do
   done
   # Pytest temp lives in $work so the trap removes it; the default /tmp/pytest-of-$USER
   # keeps ~600 MB per run and filled the /tmp quota on 2026-11-20.
-  run_in "$work" env QT_QPA_PLATFORM=offscreen PYTHONPATH="$work/src" "$PY" -m pytest -q -p no:cacheprovider --basetemp="$work/.pytest-tmp" tests
+  run_in "$work" env QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q -p no:cacheprovider --basetemp="$work/.pytest-tmp" tests
   if grep -q '^farmer/' <<<"$changed"; then
     run_in "$work/farmer" "$PY" -m pytest -q -p no:cacheprovider --basetemp="$work/.pytest-tmp-farmer" tests
   fi
