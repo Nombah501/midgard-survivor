@@ -12,6 +12,38 @@ _Avoid_: farm job, bot session
 One game run from its start to the end screen, including settlement.
 _Avoid_: game, match, attempt
 
+**Location**:
+The game world a run is played in, chosen before the run; each has its own difficulty range.
+_Avoid_: stage, map, level
+
+**Difficulty**:
+The danger level of a run, from 1 to 30, limited by the location and the profile's progress.
+_Avoid_: danger, hardness, tier
+
+**Oath**:
+An optional run handicap with ranks that the game applies only at the maximum difficulty, in exchange for more rewards.
+_Avoid_: vow, pledge, modifier
+
+**Loadout**:
+The equipment a character wears into runs, prepared by the operator.
+_Avoid_: gear, kit, build
+
+**Character preparation**:
+Everything the operator sets up on a character before AFK: loadout, pet, card album, distributed stats, rebirth, skill pick order and the potential of worn items.
+_Avoid_: build, setup, gear
+
+**Run choice**:
+The operator's selection of character, location, difficulty and oaths for an AFK session.
+_Avoid_: target, arm, preset
+
+**Preset**:
+A named strategy for an AFK session: objective, speeds, limits and the ceiling for automatic difficulty; never a run choice.
+_Avoid_: profile, config, mode
+
+**Wishlist**:
+The operator's list of legendary items to keep at the end screen when offered and not already owned.
+_Avoid_: whitelist, keep list, filter
+
 **Settlement**:
 The game's banking of a run's rewards, which happens before keep and maintenance.
 _Avoid_: payout, reward phase
@@ -21,7 +53,7 @@ The end-screen choice of which offered items to retain; distinct from settlement
 _Avoid_: loot, drop
 
 **Maintenance**:
-Between-run town actions such as upgrades, card fusion, loadout and pet selection.
+Between-run town actions that spend resources, such as upgrades and card fusion; never a change to character preparation.
 _Avoid_: town phase, chores
 
 **Finish**:
