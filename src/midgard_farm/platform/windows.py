@@ -237,8 +237,10 @@ def _env_dir(name: str) -> Path:
 
 def _system_tool(tool: str, *args: str) -> str:
     command = _env_dir("SystemRoot") / "System32" / tool
+    # Console tools write in the OEM code page (cp866 on Russian Windows), not the ANSI one
+    # that text=True assumes; misdecoding garbled errors and broke _scheduler_error matching.
     return subprocess.run([str(command), *args], creationflags=CREATE_NO_WINDOW,
-                          check=True, capture_output=True, text=True, errors="replace", timeout=15).stdout
+                          check=True, capture_output=True, encoding="oem", errors="replace", timeout=15).stdout
 
 
 def _scheduler_error(exc: subprocess.CalledProcessError, code: int) -> bool:
@@ -421,7 +423,12 @@ class WindowsPlatform(Platform):
                 raise
 
     def start_service(self) -> None:
-        _system_tool("schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME)
+        try:
+            _system_tool("schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME)
+        except subprocess.CalledProcessError as exc:
+            if _scheduler_error(exc, ERROR_FILE_NOT_FOUND):
+                raise FileNotFoundError(f"the '{SERVICE_TASK_NAME}' task is not installed; run midgard-farm-setup first") from exc
+            raise
 
     def queue_update_watchdog(self, argv: Sequence[str]) -> None:
         self._register_task(_UPDATE_TASK_NAME, self._render_task(argv, watchdog=True))

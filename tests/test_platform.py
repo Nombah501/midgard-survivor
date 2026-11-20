@@ -524,6 +524,20 @@ def test_windows_unregister_ignores_only_missing_tasks(monkeypatch, winerror):
             OS.unregister_service()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Task Scheduler")
+def test_windows_start_names_a_missing_task_and_decodes_the_oem_page(monkeypatch):
+    import ctypes
+
+    def run(argv, **kwargs):
+        assert argv[1:] == ["/Run", "/TN", "Midgard Farm"]
+        assert kwargs["encoding"] == "oem"
+        raise subprocess.CalledProcessError(1, argv, stderr=f"ERROR: {ctypes.FormatError(2)}\r\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(FileNotFoundError, match="run midgard-farm-setup"):
+        OS.start_service()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows setup checks")
 @pytest.mark.parametrize(
     "auto_logon, local_hours, policy_hours, expected",
