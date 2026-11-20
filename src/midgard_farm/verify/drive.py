@@ -14,10 +14,10 @@ from threading import Event
 from typing import TextIO
 
 from ..platform import NetworkIsolationError, Platform
-from ..core.commands import Start
+from ..core.commands import MAINTENANCE_CONFIG_KEYS, Character, Resume, SessionSettings, Start, submit
 from ..core.launch import AttemptExit, GameBusy, run_attempt
 from ..core.preflight import PreflightError
-from ..core.state import StateReporter
+from ..core.state import StateKind, StateReporter, read_state
 from ..core.supervisor import Policy, Supervisor, session_log_dir
 
 
@@ -102,8 +102,9 @@ def direct(run: Run, timeout: float, *, output: str = "run.log", command: bool =
         return driver.observe(status or {}) if driver else None
 
     try:
+        run.os.write_atomic(run.profile / "farmer.cfg", run.artifact("json").read_bytes())
         with _sandbox_launch_environment(**hooks):
-            result = run_attempt(run.os, run.profile, run.artifact("json"), run.session, log_path=log,
+            result = run_attempt(run.os, run.profile, None, run.session, log_path=log,
                                  watch=watch, poll_interval=0.01 if driver else 0.05)
     except (PreflightError, NetworkIsolationError) as exc:
         return Driven(78, (log,), str(exc))
@@ -238,7 +239,8 @@ def _sample_during(run: Run) -> Iterator[None]:
             _sample(run, samples)
 
 
-def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: str = "", sample: bool = False) -> Driven:
+def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: str = "",
+               sample: bool = False, resume: SessionSettings | None = None, **hooks: str) -> Driven:
     app_data = run.os.app_data_dir()
     log_dir = session_log_dir(run.os, run.session)
     outcome_path = log_dir / "outcome.json"
@@ -246,8 +248,26 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
     main_log = run.artifact("run.log")
     deadline = time.monotonic() + timeout
     killed, stop_at, forced = False, None, 0
-    hooks = {"FARMER_TEST_CRASH_AT": crash_at} if crash_at else {}
-    start = Start(None, run.artifact("json"))
+    if crash_at:
+        hooks["FARMER_TEST_CRASH_AT"] = crash_at
+    if sample:
+        start = Start(None, run.artifact("json"))  # A soak takes a strategy preset.
+    else:
+        config = json.loads(run.artifact("json").read_bytes())
+        cid = config.pop("class")
+        danger = config.pop("danger")
+        switches = {}
+        for name, keys in MAINTENANCE_CONFIG_KEYS.items():
+            enabled, *paired = (config.pop(key) for key in keys)
+            if any(value != enabled for value in paired):
+                raise ValueError(f"verify config disagrees on the {name} switch")
+            switches[name] = enabled
+        settings = SessionSettings(config.pop("stage") or None, None if danger == "auto" else danger,
+                                   config.pop("oaths", {}), config.pop("wishlist", []), **switches)
+        strategy = run.artifact("strategy.json")
+        strategy.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        start = Start(Character(cid, config.get("job_paths", {}).get(cid, 0)), strategy, settings)
+    pause_sent = resume_sent = False
 
     with (run.os.acquire_lock(app_data / "service.lock"),
           run.os.acquire_lock(run.profile / "farmer_supervisor.lock"),
@@ -259,7 +279,7 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
                                                       "profile": str(run.profile), "request": "verify.json"}).encode())
 
         def stop_requested_at() -> float | None:
-            nonlocal killed, stop_at, forced
+            nonlocal killed, stop_at, forced, pause_sent, resume_sent
             if stop_at is not None:
                 return stop_at
             now = time.monotonic()
@@ -277,6 +297,15 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
                         and run.os.kill_owned_sandbox_game(pid, run.work, run.session)):
                     killed = True
                     print(f"drive: SIGKILL game pid {pid} in run {status['run_id']}", flush=True)
+            elif resume is not None and not resume_sent:
+                state = read_state(run.os)
+                if state.kind is StateKind.ACTIVE and state.session_id == run.session:
+                    if state.farmer_phase == "run" and not pause_sent:
+                        submit(run.os, "pause")
+                        pause_sent = True
+                    elif state.farmer_phase == "paused" and pause_sent:
+                        submit(run.os, Resume(resume))
+                        resume_sent = True
             return stop_at
 
         policy = replace(run.policy, stop_grace=120 if sample else 30)

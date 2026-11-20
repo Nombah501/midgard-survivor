@@ -86,7 +86,7 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 
 ### Contract between window, service and farmer
 - The Start command carries, besides the preset path and character, the run choice (location id or Automatic, difficulty level or Automatic, oath ranks), the wishlist (item ids) and the four maintenance switches. The service validates the payload's shape like it validates the character today and rejects malformed requests through the existing rejection path.
-- Resume carries the same fields, so a choice changed while paused applies from the next run. Pause and Finish keep ADR 0004 semantics.
+- Resume carries location, difficulty, oaths, wishlist and switches, so a choice changed while paused applies from the next run. Character and preset are fixed for the whole AFK session and change only at Start. Pause and Finish keep ADR 0004 semantics.
 - The service builds `farmer.cfg` from the preset's strategy fields plus the request's fields; the preset never supplies location, difficulty, class or oaths (ADR 0009). The existing character selection path is extended, not duplicated.
 - The farmer reads location, difficulty, oaths, wishlist and switches only from `farmer.cfg`. Automatic location keeps today's selection by objective; Automatic difficulty keeps today's adaptive selection under the preset's ceiling.
 - The window persists the last run choice, wishlist and switches in its per-machine state next to the remembered character and preset.
@@ -100,7 +100,7 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 ### Farmer behaviour
 - Maintenance no longer contains loadout, pet, album, stat, rebirth or pick-order writes; that code and its config keys are removed, not disabled. Remaining maintenance: achievements, Kafra and Sage upgrades, fusion of spare card copies, Star Smith restricted to stored items not worn by any character, storage cleanup. Each of the four switchable actions follows its switch.
 - Profile pick order and job path: the farmer reads the profile's pick order and never writes it. The job path still comes from the chosen character because the game's job change reads it per run.
-- Oaths are handed to the game per run through the game's one-run oath override; the profile's own oath set is never written. Oaths are only passed when the difficulty is 30.
+- The farmer sets the game's one-run oath override before every run and never writes the profile's own oath set. It passes selected ranks only for a fixed difficulty 30; for every other run choice (including Automatic reaching 30), it passes an empty dictionary to prevent inheriting saved oaths.
 - Keep: the value-based keep and its switch are removed. An offered item is kept if and only if it is on the wishlist, is not owned (no stored item with the same id), passes the game's keep rules (not permanent, not lent, unique not already held), and either the keep is free (victory or Ymir) or the paid cost fits the zeny limit. Full storage uses the existing room-making rule. Skips are logged with a reason and recorded in the run journal. Everything not kept is settled as today.
 - Status and run journal record, per run, the location, difficulty, oath points and kept items, so the window can display them.
 
@@ -139,5 +139,6 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 ## Further Notes
 
 - This reverses the app spec's decision that the preset carries location and difficulty and the window never edits presets (`../midgard-farm-app/spec.md`, AFK session screen); ADR 0009 records why.
-- The oath facts (oaths apply only at difficulty 30, the per-run override, the oath list, point costs and the star crumb bonus) come from the decompiled snapshot under `analysis/`. The snapshot may predate the current official patch; the first ticket that touches oaths verifies them against the current patch before building on them.
+- Verified against the official `patch_0.2.5.pck` with GDRE 2.7.4 (`game_data.gdc`, `main.gdc`, `save.gdc`). Compared with the 0.2.3 snapshot, `DANGER_MAX` is still 30, the nine oath IDs, rank counts and point costs are unchanged, and the Hell star-crumb bonus is still `0.000015` per oath point. Curse was strengthened: rank 1 is now −3% max HP per hit, capped at −40% (was −2%, capped at −30%); rank 2 is now −4%, capped at −60% (was −3%, capped at −45%). Names, descriptions and ranks come from the live catalog.
+- A normal run without an override uses the profile's oaths only at `DANGER_MAX`. `World.start_run` checks for a Dictionary in `oaths_next` first, even `{}` and even below 30, copies it into the run, then resets `oaths_next` to `null`. This does not call `Save.set_oath` or change the saved oath set.
 - Before changing the farmer, supervisor or verify, read `docs/agents/farmer-map.md`. After any farmer change, rebuild the farmer patch before running verify scenarios. The real profile and real install belong to the operator.

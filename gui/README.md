@@ -31,8 +31,10 @@ Install it into the launcher:
   Bard, Knight, …).
 - Starting runs `python3 tools/farm.py --char … --stage … --danger …`; the
   farmer reads the selected class's profile `pick_order`/`pick_limits`.
-- A locked class or stage is reported as `CLASS_LOCKED`/`STAGE_LOCKED`; the
-  app does not silently choose another one.
+- The farmer checks the choice against the live game. An unavailable location,
+  out-of-range difficulty or invalid oath fails the session with
+  `invalid_location`, `invalid_difficulty` or `invalid_oath`, respectively.
+  A locked character is not replaced with another one.
 - Status cards show zeny, kills, oridecon/elunium, Star Crumb, XP and runs;
   the log has separate **Фермер** and **Запуск** tabs.
 - AFK: a run ends by death or the 42 game-minute cap, banks its loot and the

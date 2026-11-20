@@ -221,9 +221,12 @@ ApplicationWindow {
                             font.weight: Font.DemiBold
                         }
 
-                        RowLayout {
+                        GridLayout {
                             Layout.fillWidth: true
-                            spacing: 12
+                            columns: width >= 700 ? 4 : 2
+                            uniformCellWidths: true
+                            columnSpacing: 12
+                            rowSpacing: 10
                             ColumnLayout {
                                 Layout.fillWidth: true
                                 Layout.preferredWidth: 1
@@ -256,6 +259,77 @@ ApplicationWindow {
                                     onActivated: index => shell.backend.selectPreset(index)
                                 }
                             }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 1
+                                spacing: 4
+                                Caption { id: locationLabel; text: qsTr("Location") }
+                                ComboBox {
+                                    id: locationPicker
+                                    objectName: "locationPicker"
+                                    Accessible.name: locationLabel.text
+                                    Layout.fillWidth: true
+                                    Layout.minimumHeight: 44
+                                    model: shell.session.locations
+                                    textRole: "label"
+                                    currentIndex: shell.session.location_index
+                                    displayText: currentIndex < 0 ? qsTr("Saved location unavailable") : currentText
+                                    enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
+
+                                    delegate: ItemDelegate {
+                                        required property int index
+                                        required property var modelData
+                                        objectName: "locationOption" + index
+                                        width: locationPicker.width
+                                        text: enabled ? modelData.label : qsTr("%1 (locked)").arg(modelData.label)
+                                        enabled: modelData.enabled
+                                        highlighted: locationPicker.highlightedIndex === index
+                                    }
+
+                                    function stepLocation(step) {
+                                        for (let i = currentIndex + step; i >= 0 && i < count; i += step) {
+                                            if (model[i].enabled) {
+                                                shell.backend.selectLocation(model[i].id ?? "")
+                                                break
+                                            }
+                                        }
+                                    }
+
+                                    Keys.onUpPressed: event => {
+                                        event.accepted = !popup.visible
+                                        if (event.accepted)
+                                            stepLocation(-1)
+                                    }
+                                    Keys.onDownPressed: event => {
+                                        event.accepted = !popup.visible
+                                        if (event.accepted)
+                                            stepLocation(1)
+                                    }
+                                    onActivated: index => {
+                                        if (model[index].enabled)
+                                            shell.backend.selectLocation(model[index].id ?? "")
+                                        else
+                                            currentIndex = Qt.binding(() => shell.session.location_index)
+                                    }
+                                }
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 1
+                                spacing: 4
+                                Caption { id: difficultyLabel; text: qsTr("Difficulty") }
+                                ComboBox {
+                                    objectName: "difficultyPicker"
+                                    Accessible.name: difficultyLabel.text
+                                    Layout.fillWidth: true
+                                    Layout.minimumHeight: 44
+                                    model: shell.session.difficulties
+                                    currentIndex: shell.session.difficulty_index
+                                    displayText: currentIndex < 0 ? qsTr("Saved difficulty unavailable") : currentText
+                                    enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
+                                    onActivated: index => shell.backend.selectDifficulty(textAt(index))
+                                }
+                            }
                         }
 
                         Caption {
@@ -263,6 +337,201 @@ ApplicationWindow {
                             visible: text.length > 0
                             text: shell.session.preset_description
                             wrapMode: Text.Wrap
+                        }
+
+                        Caption {
+                            objectName: "catalogRefresh"
+                            Layout.fillWidth: true
+                            text: shell.session.catalog_refresh
+                                  ? qsTr("Catalog refreshed: %1").arg(shell.session.catalog_refresh)
+                                  : qsTr("No catalog yet")
+                            wrapMode: Text.Wrap
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            visible: !shell.session.active || shell.session.paused
+                            ActionButton {
+                                id: oathPanel
+                                objectName: "oathPanel"
+                                visible: shell.session.oaths.length > 0
+                                text: checked && enabled ? qsTr("Hide oaths") : qsTr("Show oaths")
+                                checkable: true
+                                enabled: shell.session.can_pick_oaths
+                            }
+                            Caption {
+                                objectName: "oathPoints"
+                                Layout.fillWidth: true
+                                visible: oathPanel.visible
+                                text: shell.session.difficulties[shell.session.difficulty_index] === "30"
+                                      ? qsTr("Oath points: %1").arg(shell.session.oath_points)
+                                      : qsTr("Oaths require fixed difficulty 30.")
+                                wrapMode: Text.Wrap
+                            }
+                            Item { Layout.fillWidth: true; visible: !oathPanel.visible }
+                            ActionButton {
+                                id: wishlistPanel
+                                objectName: "wishlistPanel"
+                                enabled: shell.session.can_edit_wishlist
+                                checkable: true
+                                text: checked && enabled ? qsTr("Hide wishlist (%1)").arg(shell.session.wishlist_count)
+                                      : qsTr("Wishlist (%1)").arg(shell.session.wishlist_count)
+                            }
+                            ActionButton {
+                                id: maintenancePanel
+                                objectName: "maintenancePanel"
+                                enabled: shell.session.can_edit_maintenance
+                                checkable: true
+                                text: checked && enabled ? qsTr("Hide maintenance") : qsTr("Maintenance")
+                            }
+                        }
+
+                        GridLayout {
+                            Layout.fillWidth: true
+                            visible: oathPanel.checked && oathPanel.enabled
+                            columns: width >= 700 ? 3 : 2
+                            uniformCellWidths: true
+                            columnSpacing: 12
+                            rowSpacing: 10
+                            Repeater {
+                                model: shell.session.oaths.length
+                                delegate: ColumnLayout {
+                                    id: oathRow
+                                    required property int index
+                                    readonly property var oath: shell.session.oaths[index]
+                                    Layout.fillWidth: true
+                                    Layout.alignment: Qt.AlignTop
+                                    Layout.preferredWidth: 1
+                                    spacing: 4
+                                    Caption {
+                                        id: oathName
+                                        objectName: "oathLabel" + oathRow.index
+                                        Layout.fillWidth: true
+                                        text: oathRow.oath.label
+                                        wrapMode: Text.Wrap
+                                    }
+                                    ComboBox {
+                                        id: rankPicker
+                                        objectName: "oathPicker" + oathRow.index
+                                        Accessible.name: oathName.text
+                                        Layout.fillWidth: true
+                                        Layout.minimumHeight: 44
+                                        model: oathRow.oath.ranks.length
+                                        currentIndex: oathRow.oath.selected_index
+                                        displayText: currentIndex < 0 ? qsTr("Saved rank unavailable") : rankText(currentIndex)
+                                        onActivated: index => shell.backend.selectOath(oathRow.oath.id, oathRow.oath.ranks[index].rank)
+                                        function rankText(index) {
+                                            const rank = oathRow.oath.ranks[index]
+                                            return rank.rank === 0 ? qsTr("Off") : qsTr("Rank %1 (%2 pts)").arg(rank.rank).arg(rank.points)
+                                        }
+                                        delegate: ItemDelegate {
+                                            required property int index
+                                            width: rankPicker.width
+                                            text: rankPicker.rankText(index)
+                                            highlighted: rankPicker.highlightedIndex === index
+                                        }
+                                    }
+                                    Caption {
+                                        objectName: "oathRankDetail" + oathRow.index
+                                        Layout.fillWidth: true
+                                        text: rankPicker.currentIndex < 0 ? qsTr("Choose another rank or turn this oath off.")
+                                              : oathRow.oath.ranks[rankPicker.currentIndex].description
+                                        visible: text.length > 0
+                                        wrapMode: Text.Wrap
+                                    }
+                                }
+                            }
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            visible: wishlistPanel.visible && wishlistPanel.checked && wishlistPanel.enabled
+                            spacing: 4
+
+                            Caption { id: wishlistSearchLabel; text: qsTr("Search legendary items by name") }
+                            TextField {
+                                id: wishlistSearch
+                                objectName: "wishlistSearch"
+                                Accessible.name: wishlistSearchLabel.text
+                                Layout.fillWidth: true
+                                Layout.minimumHeight: 44
+                            }
+                            CheckBox {
+                                id: wishlistOnly
+                                text: qsTr("Show wishlist only")
+                                Layout.minimumHeight: 44
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                ComboBox {
+                                    id: wishlistPicker
+                                    objectName: "wishlistPicker"
+                                    Accessible.name: qsTr("Matching legendary items")
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    Layout.minimumHeight: 44
+                                    property string itemId: ""
+                                    readonly property var option: model[currentIndex] ?? null
+                                    model: {
+                                        const query = wishlistSearch.text.trim().toLocaleLowerCase()
+                                        return shell.session.wishlist_items.filter(row =>
+                                            (!wishlistOnly.checked || row.selected) &&
+                                            row.label.toLocaleLowerCase().includes(query))
+                                    }
+                                    textRole: "label"
+                                    currentIndex: count ? Math.max(0, model.findIndex(row => row.id === itemId)) : -1
+                                    onActivated: index => itemId = model[index].id
+                                    displayText: option ? optionText(option) : qsTr("No matching items")
+                                    enabled: count > 0
+
+                                    function optionText(row) {
+                                        return row.owned ? qsTr("%1 (owned)").arg(row.label) : row.label
+                                    }
+                                    delegate: ItemDelegate {
+                                        required property int index
+                                        required property var modelData
+                                        width: wishlistPicker.width
+                                        text: wishlistPicker.optionText(modelData)
+                                        highlighted: wishlistPicker.highlightedIndex === index
+                                    }
+                                }
+                                ActionButton {
+                                    objectName: "wishlistAction"
+                                    enabled: wishlistPicker.option !== null
+                                    text: wishlistPicker.option?.selected ? qsTr("Remove") : qsTr("Add")
+                                    onClicked: {
+                                        const item = wishlistPicker.option
+                                        wishlistPicker.itemId = item.id
+                                        shell.backend.setWishlisted(item.id, !item.selected)
+                                    }
+                                }
+                            }
+                        }
+
+                        GridLayout {
+                            Layout.fillWidth: true
+                            visible: maintenancePanel.visible && maintenancePanel.checked && maintenancePanel.enabled
+                            columns: width >= 880 ? 4 : 2
+                            uniformCellWidths: true
+                            columnSpacing: 12
+                            enabled: shell.session.can_edit_maintenance
+                            Repeater {
+                                model: [
+                                    { key: "upgrades", label: qsTr("Kafra/Sage upgrades") },
+                                    { key: "card_fusion", label: qsTr("Card fusion") },
+                                    { key: "star_smith", label: qsTr("Star Smith") },
+                                    { key: "storage_cleanup", label: qsTr("Storage cleanup") }
+                                ]
+                                delegate: Switch {
+                                    required property var modelData
+                                    objectName: "maintenance-" + modelData.key
+                                    Layout.fillWidth: true
+                                    Layout.minimumHeight: 44
+                                    text: modelData.label
+                                    checked: shell.session.maintenance[modelData.key]
+                                    onToggled: shell.backend.setMaintenance(modelData.key, checked)
+                                }
+                            }
                         }
 
                         Label {
@@ -274,11 +543,21 @@ ApplicationWindow {
                             wrapMode: Text.Wrap
                             color: shell.danger
                         }
+                        Label {
+                            objectName: "resumeRefusal"
+                            Layout.fillWidth: true
+                            visible: shell.session.resume_refusal.length > 0
+                            text: visible ? qsTr("Resume refused: %1").arg(shell.session.resume_refusal) : ""
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                            color: shell.danger
+                        }
                         Caption {
                             Layout.fillWidth: true
                             visible: !shell.session.active && !shell.session.service_missing
                                      && text.length > 0 && text !== shell.session.start_refusal
                             text: shell.session.start_reason
+                            textFormat: Text.PlainText
                             wrapMode: Text.Wrap
                             color: shell.warning
                         }
@@ -313,7 +592,7 @@ ApplicationWindow {
                                 objectName: "pauseButton"
                                 text: shell.session.paused ? qsTr("Resume") : qsTr("Pause after run")
                                 visible: shell.session.active
-                                enabled: shell.session.can_pause
+                                enabled: shell.session.paused ? shell.session.can_resume : shell.session.can_pause
                                 onClicked: shell.backend.control(shell.session.paused ? "resume" : "pause",
                                                                  shell.session.session_id)
                             }
@@ -364,7 +643,8 @@ ApplicationWindow {
                                 required property int index
                                 readonly property bool lastNight: modelData.session_id !== ""
                                     && modelData.session_id === shell.history.latest_session_id
-                                readonly property bool expanded: lastNight
+                                readonly property bool expandable: lastNight || modelData.run_choices.length > 0
+                                readonly property bool expanded: expandable
                                     && historyPanel.expandedSession === modelData.session_id
                                 Layout.fillWidth: true
                                 spacing: 10
@@ -379,9 +659,11 @@ ApplicationWindow {
                                     }
                                     ActionButton {
                                         objectName: entry.lastNight ? "lastNightDisclosure" : ""
-                                        visible: entry.lastNight
-                                        text: entry.expanded ? qsTr("Hide details") : qsTr("Last night")
-                                        Accessible.name: entry.expanded ? text : qsTr("Show details for the last night")
+                                        visible: entry.expandable
+                                        text: entry.expanded ? qsTr("Hide details")
+                                              : entry.lastNight ? qsTr("Last night") : qsTr("Run choices")
+                                        Accessible.name: !entry.expanded && entry.lastNight
+                                                         ? qsTr("Show details for the last night") : text
                                         onClicked: historyPanel.expandedSession = entry.expanded ? "" : entry.modelData.session_id
                                     }
                                 }
@@ -393,14 +675,26 @@ ApplicationWindow {
                                     Layout.bottomMargin: 8
                                     spacing: 12
                                     Caption { text: qsTr("Session %1").arg(entry.modelData.session_id) }
+                                    Repeater {
+                                        model: entry.expanded ? entry.modelData.run_choices : []
+                                        delegate: Caption {
+                                            required property int index
+                                            required property string modelData
+                                            objectName: "historyRunChoice" + entry.index + "-" + index
+                                            Layout.fillWidth: true
+                                            text: modelData
+                                            wrapMode: Text.Wrap
+                                        }
+                                    }
                                     GridLayout {
+                                        visible: entry.lastNight
                                         Layout.fillWidth: true
                                         columns: 5
                                         uniformCellWidths: true
                                         columnSpacing: 12
                                         rowSpacing: 12
                                         Repeater {
-                                            model: entry.expanded ? shell.history.totals : []
+                                            model: entry.expanded && entry.lastNight ? shell.history.totals : []
                                             delegate: Metric {
                                                 required property var modelData
                                                 title: modelData.label
@@ -409,11 +703,13 @@ ApplicationWindow {
                                         }
                                     }
                                     Metric {
+                                        visible: entry.lastNight
                                         title: qsTr("Rewards per hour in runs")
                                         value: shell.history.rewards
                                         valueObjectName: "lastNightRewards"
                                     }
                                     Metric {
+                                        visible: entry.lastNight
                                         title: qsTr("Materials")
                                         value: shell.history.materials
                                         valueObjectName: "lastNightMaterials"

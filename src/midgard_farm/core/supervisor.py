@@ -5,14 +5,14 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 from ..platform import NetworkIsolationError, Platform
 from . import commands, farmer_patch, game_update
 from .commands import Start
-from .history import append_event, read_history, session_totals
+from .history import append_event, read_history, session_summary
 from .launch import SHUTDOWN_GRACE_SECONDS, GameBusy, request_finish, run_attempt
 from .preflight import PreflightError
 from .run_progress import (
@@ -27,7 +27,8 @@ from .run_progress import (
 )
 from .state import StateKind, StateReporter, read_state
 
-FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt"}
+_INVALID_RUN_CHOICES = {"invalid_location", "invalid_difficulty", "invalid_oath"}
+FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt"} | _INVALID_RUN_CHOICES
 POLL = 0.2
 UPDATE_POLL = 1.0
 UPDATE_FAILURES = tuple(game_update.FailureReason)
@@ -50,15 +51,17 @@ def log(message: str) -> None:
     print(f"supervisor: {message}", flush=True)
 
 
-def pending_commands(os_: Platform) -> Iterator[tuple[Path, commands.Command]]:
+def pending_commands(os_: Platform, state: StateReporter) -> Iterator[tuple[Path, commands.Command]]:
     for path in sorted(commands.directory(os_).glob("*.json")):
+        payload = None
         try:
-            command = commands.decode(json.loads(os_.read_shared(path)))
+            payload = json.loads(os_.read_shared(path))
+            command = commands.decode(payload)
         except FileNotFoundError:
             continue
-        except ValueError as exc:
-            log(f"ignoring invalid command {path.name}: {exc}")
-            path.unlink(missing_ok=True)
+        except (ValueError, RecursionError) as exc:
+            action = payload.get("command") if isinstance(payload, dict) else None
+            refuse_command(os_, state, path, action if isinstance(action, str) else "unknown", str(exc))
         else:
             yield path, command
 
@@ -217,6 +220,9 @@ class Supervisor:
                 if command == "check_again":
                     path.unlink()
                     continue
+                if isinstance(command, commands.Resume):
+                    refuse_command(self.os, self.state, path, "resume", "Resume requires a paused AFK session.")
+                    continue
                 if not isinstance(command, Start):
                     log(f"ignoring {command}: no active AFK session")
                     path.unlink()
@@ -230,8 +236,7 @@ class Supervisor:
                 if self._before_start():
                     return
                 session_id = f"{self.session_prefix}-{uuid.uuid4().hex}"
-                self._write(self.session_path, {"id": session_id, "start": command.payload(),
-                                                "profile": str(self.profile.absolute()), "request": path.name})
+                self._save_session(session_id, command, path.name)
                 path.unlink()
                 self._run_session(session_id, command, path.name)
                 break
@@ -243,6 +248,10 @@ class Supervisor:
 
     def _write(self, path: Path, data: dict) -> None:
         self.os.write_atomic(path, json.dumps(data, indent=2).encode())
+
+    def _save_session(self, session_id: str, start: Start, request: str) -> None:
+        self._write(self.session_path, {"id": session_id, "start": start.payload(),
+                                        "profile": str(self.profile.absolute()), "request": request})
 
     def _restore_official(self, path: Path) -> None:
         try:
@@ -322,7 +331,8 @@ class Supervisor:
                 "log_path": str(result.log_path) if result.log_path else None}
 
     def _pending(self) -> Iterator[tuple[Path, commands.Command]]:
-        return ((path, command) for path, command in pending_commands(self.os) if command != "rollback_app")
+        return ((path, command) for path, command in pending_commands(self.os, self.state)
+                if command != "rollback_app")
 
     def _refuse_start(self, path: Path) -> None:
         refuse_command(self.os, self.state, path, "start", "AFK session already active")
@@ -378,6 +388,19 @@ class Supervisor:
         else:
             if isinstance(status, dict) and status.get("session") == session_id:
                 self._remember_totals(status)
+
+        def apply_resume(settings: commands.SessionSettings) -> None:
+            nonlocal start
+            path = self.profile / "farmer.cfg"
+            config = json.loads(self.os.read_shared(path))
+            if not isinstance(config, dict):
+                raise ValueError("farmer.cfg must be a JSON object")
+            updated = replace(start, settings=settings)
+            # Persist the selection before waking the child, so a restart uses it too.
+            self._save_session(session_id, updated, request)
+            start = updated
+            self._write(path, config | settings.config())
+
         attempts: list[Attempt] = []
         failures: deque[float] = deque()
         number = max((int(p.stem.removeprefix("attempt-")) for p in log_dir.glob("attempt-*.log")), default=0)
@@ -420,7 +443,8 @@ class Supervisor:
             if reason != "operator" or self.stop_requested_at() is not None:
                 break
             number += 1
-            attempt = self._attempt(session_id, start, log_dir, number, delay, preflight_error=preflight_error)
+            attempt = self._attempt(session_id, start, log_dir, number, delay, apply_resume,
+                                    preflight_error=preflight_error)
             attempts.append(attempt)
             if attempt.outcome == "finished":
                 kind, reason = "finished", attempt.reason
@@ -458,7 +482,7 @@ class Supervisor:
                               "attempts": diagnostics}
             self._write(log_dir / "quarantine.json", quarantine)
         outcome = {"session": session_id, "kind": kind, "reason": reason, "attempts": diagnostics,
-                   "totals": session_totals(self.os, self.profile, session_id, self._last_totals),
+                   **session_summary(self.os, self.profile, session_id, self._last_totals),
                    "ended_at": time.time()}
         self._write(outcome_path, outcome)
         self._append_outcome(outcome, log_dir)
@@ -477,14 +501,16 @@ class Supervisor:
             if recovering and any(row["kind"] == "session" and row.get("session_id") == outcome["session"]
                                   for row in read_history(self.os)):
                 return
-            if "totals" not in outcome:  # An outcome written before history was introduced.
-                outcome["totals"] = session_totals(self.os, self.profile, outcome["session"], {})
+            if "run_choices" not in outcome:  # Recover terminal records from older versions.
+                summary = session_summary(self.os, self.profile, outcome["session"], outcome.get("totals", {}))
+                outcome.setdefault("totals", summary["totals"])
+                outcome["run_choices"] = summary["run_choices"]
             timing = {"timestamp": outcome["ended_at"]} if "ended_at" in outcome else {}
             failures = dict.fromkeys(attempt["reason"] for attempt in outcome["attempts"]
                                      if isinstance(attempt, dict) and attempt.get("outcome") == "failed"
                                      and isinstance(attempt.get("reason"), str))
             append_event(self.os, "session", session_id=outcome["session"], outcome=outcome["kind"],
-                         reason=outcome["reason"], totals=outcome["totals"],
+                         reason=outcome["reason"], totals=outcome["totals"], run_choices=outcome["run_choices"],
                          attempt_failures=list(failures),
                          diagnostics=log_dir.relative_to(self.session_path.parent).as_posix(), **timing)
         except (OSError, ValueError) as exc:
@@ -523,6 +549,9 @@ class Supervisor:
             if isinstance(command, Start):
                 self._refuse_start(path)
                 continue
+            if isinstance(command, commands.Resume):
+                refuse_command(self.os, self.state, path, "resume", "Resume requires a paused AFK session.")
+                continue
             if command == "restore_official":
                 refuse_command(self.os, self.state, path, command, _SESSION_ACTIVE)
                 continue
@@ -536,6 +565,7 @@ class Supervisor:
         return None
 
     def _attempt(self, session_id: str, start: Start, log_dir: Path, number: int, delay: float,
+                 apply_resume: Callable[[commands.SessionSettings], None],
                  *, preflight_error: PreflightError | None) -> Attempt:
         log_path = log_dir / f"attempt-{number:02d}.log"
         log(f"attempt {number}: {start.preset}")
@@ -544,7 +574,7 @@ class Supervisor:
             if preflight_error is not None:
                 raise preflight_error
             result = run_attempt(self.os, self.profile, start.preset, session_id, character=start.character,
-                                 log_path=log_path, watch=self._watcher(),
+                                 settings=start.settings, log_path=log_path, watch=self._watcher(apply_resume),
                                  poll_interval=max(0.05, min(POLL, self.policy.heartbeat_interval / 5)))
         except (PreflightError, NetworkIsolationError) as exc:
             launcher_detail = f"run: {exc}"
@@ -577,6 +607,8 @@ class Supervisor:
                             detail = line.rstrip()
             elif status.get("terminal") is True and status.get("failed") and reason:
                 kind = "fatal" if reason in FATAL_REASONS else "failed"
+                if reason in _INVALID_RUN_CHOICES:
+                    detail = str(status.get("last_error") or reason)
             else:
                 suffix = f"phase_{status.get('phase', '')}" if status else "no_status"
                 kind, reason = "failed", f"exit_{result.code}_{suffix}"
@@ -589,7 +621,8 @@ class Supervisor:
         log(f"attempt {number}: {attempt.outcome} ({attempt.reason}, exit {attempt.exit_code}) {attempt.detail}".rstrip())
         return attempt
 
-    def _watcher(self) -> Callable[[dict | None], str | None]:
+    def _watcher(self, apply_resume: Callable[[commands.SessionSettings], None] | None = None
+                 ) -> Callable[[dict | None], str | None]:
         last_seq = last_change = terminal_at = None
         finish_sent = finish_before_boot = False
         closing = False
@@ -630,8 +663,20 @@ class Supervisor:
                     if command in ("check_again", "restore_official"):
                         refuse_command(self.os, self.state, path, command, _SESSION_ACTIVE)
                         continue
-                    self.os.write_atomic(self.mailbox, (command + "\n").encode())
-                    closing = closing or command in ("finish", "abort")
+                    if isinstance(command, commands.Resume):
+                        if closing or not status or status.get("phase") != "paused" or apply_resume is None:
+                            refuse_command(self.os, self.state, path, "resume", "Resume requires a paused AFK session.")
+                            continue
+                        try:
+                            apply_resume(command.settings)
+                        except (ValueError, RecursionError) as exc:
+                            refuse_command(self.os, self.state, path, "resume", f"Cannot update farmer.cfg: {exc}")
+                            continue
+                        action = "resume_settings"
+                    else:
+                        action = command
+                    self.os.write_atomic(self.mailbox, (action + "\n").encode())
+                    closing = closing or action in ("finish", "abort")
                     path.unlink()
                     break
 

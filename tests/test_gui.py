@@ -8,6 +8,7 @@ from threading import Event
 
 import pytest
 
+from fake_smoke_game import CATALOG
 from midgard_farm.core import commands
 from midgard_farm.core.history import append_event, history_path
 from midgard_farm.core.supervisor import session_log_dir
@@ -100,7 +101,7 @@ def test_poll_displays_only_matching_run_and_uses_farmer_rates(farm, monkeypatch
     view = model.poll()
     assert view.zeny == "1,175,745"
     assert view.materials == "42.1 / 3.8"
-    assert view.current_run == "Run 13 · Payon Forest · Difficulty 18"
+    assert view.current_run == "Run 13 · Payon Forest · Difficulty 18 · Oath points: 0"
     assert view.run_detail == "Level 116 · 08:42 · HP 78%"
     assert not view.can_start
     assert view.can_control
@@ -110,7 +111,7 @@ def active_status(farm):
     farm.status(session="afk-fixture", run_id="run-13", phase="run", terminal=False,
                 totals={"started": 13, "runs": 12, "wins": 11, "lost": 0},
                 rates={"zeny_h": 1175744.7, "ore_h": 42.1, "crumbs_h": 3.8, "kills_min": 220.4},
-                target={"stage": "payon", "danger": 18},
+                target={"stage": "payon", "danger": 18, "oath_points": 0},
                 game={"running": True, "stage": "payon", "danger": 18, "level": 116,
                       "time": 522, "hp": 780, "max_hp": 1000})
 
@@ -195,26 +196,94 @@ def test_idle_rebuild_quarantine_does_not_reuse_an_older_sessions_record(farm):
     assert view.quarantine.paths == [log]
 
 
-def test_fixed_preset_uses_its_character_without_losing_normal_pick(farm):
+def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     from midgard_farm.gui.model import SessionModel
 
     farm.state()
     model = SessionModel(farm.platform)
     view = model.poll()
-    model.select_character(view.characters.index("Bard"))
-    model.select_preset(view.presets.index("sniper-hell.json"))
+    assert view.presets == ["crumbs.json", "night.json", "progress.json", "steady.json", "zeny.json"]
+    assert "Balanced" in view.preset_description
+    assert "ceiling: 20" in view.preset_description
+    assert "480 min" in view.preset_description
+    assert [row["label"] for row in view.locations] == ["Automatic"]
+    assert view.difficulties == ["Automatic"]
+
+    locations = [
+        {"id": "prontera", "name": "Prontera", "unlocked": True, "min_difficulty": 1, "max_difficulty": 4},
+        {"id": "payon", "name": "Bosque de Payon", "unlocked": False, "min_difficulty": 3, "max_difficulty": 5},
+        {"id": "orc", "name": "Orc Village", "unlocked": True, "min_difficulty": 4, "max_difficulty": 6},
+    ]
+    farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {"locations": locations}).encode())
     view = model.poll()
-    assert view.characters[view.character_index] == "Sniper"
-    assert not view.can_pick_character
-    assert "Rachel Sanctuary" in view.preset_description
+    assert [row["enabled"] for row in view.locations] == [True, True, False, True]
+    model.select_location("payon")
+    assert model.poll().location_index == 0
+    model.select_location("prontera")
+    assert model.poll().difficulties == ["Automatic", "1", "2", "3", "4"]
+    model.select_difficulty("2")
     request = model.start()
     assert request
-    command = commands.decode(json.loads(request.read_bytes()))
-    assert isinstance(command, commands.Start)
-    assert command.character == commands.Character("archer", 0)
-    model.select_preset(view.presets.index("night.json"))
+    assert json.loads(request.read_bytes())["settings"] == {
+        "location": "prontera", "difficulty": 2, "oaths": {}, "wishlist": [],
+        "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
+    }
+    model = SessionModel(farm.platform)
     view = model.poll()
-    assert view.characters[view.character_index] == "Bard"
+    assert view.location_index == 1 and view.difficulty_index == 2
+
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    assert not model.poll().can_pick_run_choice
+    farm.state("active", session_id="afk-fixture", farmer_phase="paused")
+    assert model.poll().can_pick_run_choice
+    assert not model.poll().can_pick_preset and not model.poll().can_pick_character
+    model.select_location("orc")
+    view = model.poll()
+    assert view.difficulties == ["Automatic", "4", "5", "6"]
+    assert view.difficulty_index == 0
+    model.select_difficulty("6")
+    request = model.control("resume", session_id="afk-fixture")
+    assert request
+    assert json.loads(request.read_bytes()) == {
+        "command": "resume", "settings": {
+            "location": "orc", "difficulty": 6, "oaths": {}, "wishlist": [],
+            "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
+        },
+    }
+    view = SessionModel(farm.platform).poll()
+    assert (view.location_index, view.difficulty_index) == (3, 3)
+
+
+@pytest.mark.parametrize("change", ["missing catalog", "missing location", "locked location", "reduced range"])
+def test_resume_preserves_the_remembered_run_choice_after_catalog_changes(farm, change):
+    from midgard_farm.gui.model import SessionModel
+
+    catalog_file = farm.profile / "farmer_catalog.json"
+    catalog_file.write_text(json.dumps(CATALOG))
+    farm.state()
+    model = SessionModel(farm.platform)
+    model.select_location("prontera")
+    model.select_difficulty("5")
+
+    session = "afk-fixture"
+    farm.state("active", session_id=session, farmer_phase="paused")
+    if change == "missing catalog":
+        catalog_file.unlink()
+    else:
+        prontera, payon = CATALOG["locations"]
+        locations = {
+            "missing location": [payon],
+            "locked location": [prontera | {"unlocked": False}, payon],
+            "reduced range": [prontera | {"max_difficulty": 4}, payon],
+        }[change]
+        catalog_file.write_text(json.dumps(CATALOG | {"locations": locations}))
+
+    view = model.poll()
+    assert view.difficulty_index == -1
+    assert view.location_index == (1 if change == "reduced range" else -1)
+    request = model.control("resume", session_id=session)
+    assert request
+    assert commands.decode(json.loads(request.read_bytes())) == commands.Resume(commands.SessionSettings("prontera", 5))
 
 
 def test_service_start_uses_only_the_platform_service_tool(farm, monkeypatch):
@@ -244,21 +313,26 @@ def test_service_start_uses_only_the_platform_service_tool(farm, monkeypatch):
     assert not commands.directory(farm.platform).exists()
 
 
-def test_preset_decides_is_sent_as_null_and_remembered(farm):
+def test_retired_preset_and_implicit_character_fall_back_to_window_choices(farm):
     from midgard_farm.gui.model import SessionModel
 
     farm.state()
+    (farm.data / "window-settings.json").write_text(json.dumps({"class": None, "preset": "one-run.json"}))
     model = SessionModel(farm.platform)
-    model.select_character(model.poll().characters.index("Preset decides"))
     request = model.start()
     assert request
     result = commands.decode(json.loads(request.read_bytes()))
-    assert isinstance(result, commands.Start) and result.character is None
+    assert isinstance(result, commands.Start)
+    assert result.character is not None and result.preset.name == "night.json"
     view = SessionModel(farm.platform).poll()
-    assert view.characters[view.character_index] == "Preset decides"
+    assert view.characters[view.character_index] == view.characters[0]
 
 
 def history_fixture(farm):
+    farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {
+        "legendaries": [{"id": "sacred_excalibur", "name": "Sacred Excalibur"},
+                        {"id": "gungnir", "name": "Gungnir"}],
+    }).encode())
     append_event(farm.platform, "session", timestamp=1_704_067_500, session_id="previous-night",
                  outcome="stopped", reason="abort", totals={"runs": 3, "wins": 2, "zeny": 6000})
     append_event(farm.platform, "app_update", timestamp=1_704_067_620, outcome="rolled_back", future={"foo": 1})
@@ -266,6 +340,10 @@ def history_fixture(farm):
                  classification="game_update", outcome="ready")
     append_event(farm.platform, "session", timestamp=1_704_067_680, session_id="last-night",
                  outcome="finished", reason="max_minutes",
+                 run_choices=[{"run_id": "last-night-r1", "stage": "prontera", "danger": 2},
+                              {"run_id": "last-night-r2", "stage": "payon", "danger": 30, "oath_points": 4,
+                               "kept": ["sacred_excalibur"],
+                               "keep_skipped": [{"id": "gungnir", "reason": "already_owned"}]}],
                  totals={"runs": 12, "wins": 10, "lost": 1, "wall_s": 1800, "zeny": 7200, "xp": 560,
                          "kills": 40, "coins": 3, "ymir": 2, "cards_gain": 4, "materials": {"ore": 4, "star_crumb": 2},
                          "future": ["skip"]})
@@ -287,6 +365,11 @@ def test_history_is_interleaved_in_timestamp_order_with_last_night_detailed(farm
     assert "12 runs · 10 wins · 7,200 zeny" in last_night.summary
     assert "3 runs · 2 wins · 6,000 zeny" in previous.summary
     assert last_night.session_id == "last-night"
+    assert last_night.run_choices == [
+        "Run 1 · Prontera · Difficulty 2",
+        "Run 2 · Payon Forest · Difficulty 30 · Oath points: 4 · Kept: Sacred Excalibur"
+        " · Wishlist skipped: Gungnir (already owned)",
+    ]
     assert dict((metric.label, metric.value) for metric in history.totals) == {
         "Runs": "12", "Wins": "10", "Lost": "1", "Time in runs": "0.5 h",
         "Zeny": "7,200", "XP": "560", "Kills": "40", "Cards": "4", "Coins": "3", "Ymir": "2",
@@ -496,6 +579,325 @@ def open_dashboard(qt_app, qt_warnings, farm):
     assert not qt_warnings
 
 
+def test_afk_screen_shows_latest_catalog_refresh(open_dashboard, farm):
+    from datetime import datetime
+
+    farm.state()
+    window = open_dashboard("afkTab")
+    label = qml_item(window, "catalogRefresh")
+    wait_until(lambda: label.property("text") == "No catalog yet")
+
+    stamp = CATALOG["written_at"]
+    for directory, written_at, newest in (
+        (farm.data, stamp, stamp),
+        (farm.profile, stamp + 60, stamp + 60),
+        (farm.data, stamp + 120, stamp + 120),
+    ):
+        farm.platform.write_atomic(directory / "farmer_catalog.json",
+                                   json.dumps(CATALOG | {"written_at": written_at}).encode())
+        refreshed = datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M:%S")
+        wait_until(lambda: label.property("text") == f"Catalog refreshed: {refreshed}")
+    assert label.property("visible")
+
+
+def test_afk_location_picker_skips_locked_locations_on_keyboard(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    locations = CATALOG["locations"] + [
+        {"id": "orc", "name": "Orc Village", "unlocked": True, "min_difficulty": 4, "max_difficulty": 6},
+    ]
+    farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {"locations": locations}).encode())
+    farm.state()
+    window = open_dashboard("afkTab")
+    location = qml_item(window, "locationPicker")
+    difficulty = qml_item(window, "difficultyPicker")
+    wait_until(lambda: location.property("count") == 4)
+    assert location.property("currentText") == "Automatic"
+    assert not difficulty.property("enabled")
+    click(window, "locationPicker")
+    locked = qml_item(window, "locationOption2")
+    assert not locked.property("enabled")
+    assert "locked" in locked.property("text")
+    QTest.keyClick(window, Qt.Key.Key_Escape)
+
+    location.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    wait_until(lambda: location.property("currentIndex") == 1)
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    wait_until(lambda: location.property("currentText") == "Orc Village")
+    assert difficulty.property("count") == 4 and difficulty.property("enabled")
+    difficulty.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    wait_until(lambda: difficulty.property("currentText") == "4")
+    click(window, "startButton")
+    wait_until(lambda: bool(requested_commands(farm)))
+    [start] = requested_commands(farm)
+    assert isinstance(start, commands.Start) and start.settings == commands.SessionSettings("orc", 4)
+
+
+def oath_catalog(farm):
+    location = {"id": "prontera", "name": "Prontera", "unlocked": True, "min_difficulty": 29, "max_difficulty": 30}
+    tough = {
+        **CATALOG["oaths"][0],
+        "ranks": CATALOG["oaths"][0]["ranks"] + [
+            {"rank": 2, "description": "+60% HP", "points": 2},
+            {"rank": 3, "description": "+100% HP", "points": 4},
+        ],
+    }
+    hunt = {"id": "hunt", "name": "Cacería salvaje", "ranks": [{"rank": 1, "description": "More mobs", "points": 1}]}
+    farm.platform.write_atomic(farm.profile / "farmer_catalog.json",
+                               json.dumps(CATALOG | {"locations": [location], "oaths": [tough, hunt]}).encode())
+
+
+def test_oath_panel_enables_only_at_fixed_30_and_shows_catalog_ranks(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    oath_catalog(farm)
+    farm.state()
+    window = open_dashboard("afkTab")
+    panel = qml_item(window, "oathPanel")
+    assert not panel.property("enabled")
+    location = qml_item(window, "locationPicker")
+    location.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    difficulty = qml_item(window, "difficultyPicker")
+    wait_until(lambda: difficulty.property("count") == 3)
+    assert not panel.property("enabled")
+    difficulty.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    wait_until(lambda: difficulty.property("currentText") == "29")
+    assert not panel.property("enabled")
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    wait_until(lambda: panel.property("enabled"))
+    click(window, "oathPanel")
+    pick = qml_item(window, "oathPicker0")
+    assert pick.property("count") == 4 and pick.property("currentIndex") == 0
+    assert qml_item(window, "oathLabel1").property("text") == "Cacería salvaje"
+    assert qml_item(window, "oathPicker1").property("count") == 2
+    pick.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_End)
+    wait_until(lambda: qml_item(window, "oathPoints").property("text") == "Oath points: 4")
+    assert qml_item(window, "oathRankDetail0").property("text") == "+100% HP"
+    difficulty.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Up)
+    wait_until(lambda: not panel.property("enabled"))
+
+
+def test_oaths_are_remembered_and_sent_only_at_fixed_30(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    oath_catalog(farm)
+    farm.state()
+    model = SessionModel(farm.platform)
+    model.select_location("prontera")
+    model.select_difficulty("30")
+    model.select_oath("tough", 3)
+    model.select_oath("hunt", 1)
+    model = SessionModel(farm.platform)
+    assert model.poll().oath_points == 5
+    assert model.start()
+    session = "afk-fixture"
+    farm.state("active", session_id=session, farmer_phase="paused")
+    model.select_oath("hunt", 0)
+    assert model.poll().oath_points == 4
+    assert model.control("resume", session_id=session)
+    farm.state()
+    model = SessionModel(farm.platform)
+    model.select_difficulty("Automatic")
+    assert model.poll().oath_points == 0
+    assert model.start()
+    start, resume, automatic = requested_commands(farm)
+    assert isinstance(start, commands.Start) and start.settings.oaths == {"tough": 3, "hunt": 1}
+    assert isinstance(resume, commands.Resume) and resume.settings.oaths == {"tough": 3}
+    assert isinstance(automatic, commands.Start) and automatic.settings == commands.SessionSettings("prontera", None)
+    model = SessionModel(farm.platform)
+    model.select_difficulty("30")
+    assert model.poll().oath_points == 4
+
+
+@pytest.mark.parametrize("action", ["start", "resume"])
+@pytest.mark.parametrize("difficulty", ["29", "30"])
+def test_removed_saved_oath_blocks_launch_until_turned_off(farm, action, difficulty):
+    from midgard_farm.gui.model import SessionModel
+
+    oath_catalog(farm)
+    farm.state()
+    model = SessionModel(farm.platform)
+    model.select_location("prontera")
+    model.select_difficulty("30")
+    model.select_oath("hunt", 1)
+    model.select_difficulty(difficulty)
+    catalog_file = farm.profile / "farmer_catalog.json"
+    latest = json.loads(catalog_file.read_bytes())
+    catalog_file.write_text(json.dumps(latest | {"oaths": [latest["oaths"][0]]}))
+    session = "afk-fixture"
+    if action == "resume":
+        farm.state("active", session_id=session, farmer_phase="paused")
+
+    view = model.poll()
+    assert not (view.can_start if action == "start" else view.can_resume)
+    reason = view.start_reason if action == "start" else view.resume_refusal
+    assert "hunt" in reason and "Off" in reason
+    assert (model.start() if action == "start" else model.control("resume", session_id=session)) is None
+    assert not commands.directory(farm.platform).exists()
+    assert view.can_pick_oaths
+    assert next(oath for oath in view.oaths if oath["id"] == "hunt")["selected_index"] == -1
+
+    model.select_oath("hunt", 0)
+    request = model.start() if action == "start" else model.control("resume", session_id=session)
+    assert request and json.loads(request.read_bytes())["settings"]["oaths"] == {}
+
+
+def test_paused_window_explains_the_oath_blocker_and_can_clear_it(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from midgard_farm.gui.model import SessionModel
+
+    oath_catalog(farm)
+    farm.state()
+    model = SessionModel(farm.platform)
+    model.select_location("prontera")
+    model.select_difficulty("30")
+    model.select_oath("hunt", 1)
+
+    catalog_file = farm.profile / "farmer_catalog.json"
+    latest = json.loads(catalog_file.read_bytes())
+    catalog_file.write_text(json.dumps(latest | {"locations": [], "oaths": latest["oaths"][:1]}))
+    farm.state("active", session_id="afk-fixture", farmer_phase="paused")
+    window = open_dashboard("afkTab")
+    reason = qml_item(window, "resumeRefusal")
+    resume = qml_item(window, "pauseButton")
+    wait_until(lambda: reason.property("visible"))
+    assert "hunt" in reason.property("text") and "Off" in reason.property("text")
+    assert not resume.property("enabled")
+    assert qml_item(window, "locationPicker").property("displayText") == "Saved location unavailable"
+    assert qml_item(window, "difficultyPicker").property("displayText") == "Saved difficulty unavailable"
+
+    click(window, "oathPanel")
+    rank = qml_item(window, "oathPicker0")
+    assert rank.property("currentIndex") == -1
+    rank.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    wait_until(lambda: resume.property("enabled") and not reason.property("visible"))
+    click(window, "pauseButton")
+    wait_until(lambda: requested_commands(farm) == [commands.Resume(commands.SessionSettings("prontera", 30))])
+
+
+def test_wishlist_is_remembered_and_only_editable_before_start_or_resume(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state()
+    model = SessionModel(farm.platform)
+    assert not model.poll().can_edit_wishlist
+    model.set_wishlisted("sacred_excalibur", True)
+    farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {
+        "legendaries": [{"id": "sacred_excalibur", "name": "Sacred Excalibur"},
+                        {"id": "gungnir", "name": "Gungnir"}],
+        "owned_item_ids": ["gungnir"],
+    }).encode())
+    view = model.poll()
+    assert view.can_edit_wishlist
+    assert [(r["id"], r["owned"], r["selected"]) for r in view.wishlist_items] == [
+        ("gungnir", True, False), ("sacred_excalibur", False, False),
+    ]
+    model.set_wishlisted("sacred_excalibur", True)
+    model.set_wishlisted("not_in_catalog", True)
+    model = SessionModel(farm.platform)
+    assert model.start()
+    session = "afk-fixture"
+    farm.state("active", session_id=session, farmer_phase="run")
+    assert not model.poll().can_edit_wishlist
+    model.set_wishlisted("sacred_excalibur", False)
+    farm.state("active", session_id=session, farmer_phase="paused")
+    view = model.poll()
+    assert view.can_edit_wishlist and view.wishlist_count == 1
+    model.set_wishlisted("sacred_excalibur", False)
+    model.set_wishlisted("gungnir", True)
+    assert model.control("resume", session_id=session)
+    assert not model.poll().can_edit_wishlist
+    start, resume = requested_commands(farm)
+    assert isinstance(start, commands.Start) and start.settings.wishlist == ["sacred_excalibur"]
+    assert isinstance(resume, commands.Resume) and resume.settings.wishlist == ["gungnir"]
+    assert SessionModel(farm.platform).poll().wishlist_count == 1
+
+
+def test_wishlist_editor_searches_names_and_marks_owned_items(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    farm.state()
+    window = open_dashboard("afkTab")
+    panel = qml_item(window, "wishlistPanel")
+    assert not panel.property("enabled")
+    farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {
+        "legendaries": [{"id": "sacred_excalibur", "name": "Espada Sagrada"},
+                        {"id": "gungnir", "name": "Gungnir"}],
+        "owned_item_ids": ["sacred_excalibur"],
+    }).encode())
+    wait_until(lambda: panel.property("enabled"))
+    panel.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    search = qml_item(window, "wishlistSearch")
+    picker = qml_item(window, "wishlistPicker")
+    action = qml_item(window, "wishlistAction")
+    search.forceActiveFocus()
+    for letter in "SAGRADA":
+        QTest.keyClick(window, Qt.Key(ord(letter)), Qt.KeyboardModifier.ShiftModifier)
+    assert picker.property("count") == 1
+    assert picker.property("displayText") == "Espada Sagrada (owned)"
+    action.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: action.property("text") == "Remove")
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: action.property("text") == "Add")
+
+
+def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from midgard_farm.gui.model import SessionModel
+
+    # Window state from before maintenance switches, with no catalog.
+    (farm.data / "window-settings.json").write_text('{"settings":{"location":null,"difficulty":null}}')
+    farm.state()
+    window = open_dashboard("afkTab")
+    defaults = {"upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False}
+    click(window, "maintenancePanel")
+    switches = {name: qml_item(window, "maintenance-" + name) for name in defaults}
+    assert all(item.property("visible") and item.property("enabled") for item in switches.values())
+    assert {name: item.property("checked") for name, item in switches.items()} == defaults
+    for name, item in switches.items():
+        item.forceActiveFocus()
+        QTest.keyClick(window, Qt.Key.Key_Space)
+        wait_until(lambda: SessionModel(farm.platform).poll().maintenance[name] is not defaults[name])
+    changed = {name: not value for name, value in defaults.items()}
+    assert SessionModel(farm.platform).poll().maintenance == changed
+
+    qml_item(window, "startButton").forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: all(not item.property("enabled") for item in switches.values()))
+    session = "afk-fixture"
+    farm.state("active", session_id=session, farmer_phase="run")
+    wait_until(lambda: qml_item(window, "phaseValue").property("text") == "Run in progress")
+    assert all(not item.property("enabled") for item in switches.values())
+
+    farm.state("active", session_id=session, farmer_phase="paused")
+    wait_until(lambda: all(item.property("enabled") for item in switches.values()))
+    switches["star_smith"].forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    qml_item(window, "pauseButton").forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: all(not item.property("enabled") for item in switches.values()))
+    start, resume = requested_commands(farm)
+    assert isinstance(start, commands.Start) and start.settings.maintenance() == changed
+    assert isinstance(resume, commands.Resume) and resume.settings.maintenance() == changed | {"star_smith": False}
+    assert SessionModel(farm.platform).poll().maintenance == resume.settings.maintenance()
+
+
 @pytest.mark.parametrize(("screen", "phase", "extra"), [
     ("idle", "Ready to start", ("startButton", "enabled", True)),
     ("active-with-income", "Run in progress", ("zenyValue", "text", "1,175,745")),
@@ -672,6 +1074,9 @@ def test_history_screen_renders_interleaved_rows_and_expands_last_night(open_das
     capture(window, tmp_path, "history")
     click(window, "lastNightDisclosure")
     assert qml_item(window, "lastNightDetails").property("visible")
+    assert qml_item(window, "historyRunChoice0-1").property("text") == (
+        "Run 2 · Payon Forest · Difficulty 30 · Oath points: 4 · Kept: Sacred Excalibur"
+        " · Wishlist skipped: Gungnir (already owned)")
     assert qml_item(window, "lastNightRewards").property("text").startswith("14,400 zeny")
     assert qml_item(window, "lastNightMaterials").property("text") == "Ore 4 · Star Crumb 2"
     capture(window, tmp_path, "history-expanded")

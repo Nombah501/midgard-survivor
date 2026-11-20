@@ -27,7 +27,7 @@ def test_bundled_assets_and_version_without_a_checkout(tmp_path, monkeypatch, fr
     bundled = package / "_farmer"
     checkout = _REPO / "farmer"
     for name in ("src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py",
-                 "presets/one-run.json", "targets.json"):
+                 "scenarios/one-run.json", "targets.json"):
         target = bundled / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(checkout / name, target)
@@ -91,7 +91,8 @@ def test_onedir_smoke_accepts_an_aliased_extraction_path(tmp_path, monkeypatch):
     onedir = extracted / "midgard-farm"
     inputs = onedir / "_internal" / "midgard_farm" / "_farmer"
     checkout = _REPO / "farmer"
-    for name in ("src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py", "targets.json"):
+    for name in ("src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py",
+                 "scenarios/one-run.json", "targets.json"):
         target = inputs / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(checkout / name, target)

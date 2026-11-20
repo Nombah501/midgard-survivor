@@ -202,6 +202,39 @@ def test_bad_preset_does_not_overwrite_config(launcher, tmp_path):
     assert not (launcher.profile / "fake-game.json").exists()
 
 
+
+@pytest.mark.parametrize("key", [
+    "auto_loadout", "auto_pet", "auto_cards", "auto_stats", "auto_rebirth",
+    "auto_rebirth_lv", "override_pick_order", "pet_priority",
+    "auto_keep", "class_rotate", "classes", "stage_pool", "keep_on_defeat", "swap_margin",
+])
+@pytest.mark.parametrize("use_preset", [False, True], ids=["farmer-cfg", "preset"])
+def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_preset):
+    config = launcher.profile / "farmer.cfg"
+    source = tmp_path / "old preset.json" if use_preset else config
+    source.write_text(json.dumps({key: [] if key == "pet_priority" else False}))
+    original = config.read_bytes()
+
+    args = (str(source),) if use_preset else ()
+    assert key in launcher.run(78, *args).stderr
+    assert config.read_bytes() == original
+    assert not (launcher.profile / "fake-game.json").exists()
+
+
+@pytest.mark.parametrize("key", [
+    "stage", "danger", "class", "builds.class", "oaths", "wishlist",
+    "auto_upgrades", "auto_sage", "auto_fuse", "auto_potential", "auto_storage_prune",
+])
+def test_run_choice_keys_in_presets_are_unfixable(launcher, tmp_path, key):
+    preset = tmp_path / "old preset.json"
+    config = {"builds": {"class": "archer"}} if key == "builds.class" else {key: None}
+    preset.write_text(json.dumps(config))
+
+    assert key in launcher.run(78, str(preset)).stderr
+    assert (launcher.profile / "farmer.cfg").read_text() == "{}"
+    assert not (launcher.profile / "fake-game.json").exists()
+
+
 def test_display_override_runs_windowed_and_adjusts_config(launcher, monkeypatch):
     monkeypatch.setenv("FARMER_DISPLAY", "true")
     launcher.run()

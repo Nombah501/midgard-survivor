@@ -18,6 +18,10 @@ Open the installed `midgard-farm` window and use **Start service** for the first
 
 If the legacy checkout mounted the farmer patch on Linux, restore the official patch with the legacy `uninstall.sh` before starting the new service. The new app expects its own `patches/official-state.json` in the game profile and will not guess from legacy backups.
 
+## AFK maintenance
+
+Open **Maintenance** on the **AFK session** screen to choose Kafra/Sage upgrades, spare-card fusion, Star Smith for unworn items, and storage cleanup. Upgrades and fusion start enabled; Star Smith and cleanup start disabled. The window remembers these choices on this machine and applies them on **Start** or **Resume**. Presets tune limits and reserves, not which actions are enabled.
+
 ## App updates
 
 The background service checks the private releases at startup and every 24 hours. It downloads the newest stable release, verifies its SHA-256 sidecar, and waits for the AFK session to reach its terminal outcome and the game to close. The app then switches `current` and restarts the service. If the selected service does not report ready within 60 seconds, an independent watchdog from the previous release restores it and excludes the failed version from future checks.
@@ -89,14 +93,13 @@ With the service running, start `MidgardSurvivors.exe` manually once, accept any
    @'
    import json, tempfile
    from pathlib import Path
-   from midgard_farm.core.commands import Start, submit
+   from midgard_farm.core.commands import Character, SessionSettings, Start, submit
    from midgard_farm.platform import current
 
-   preset = json.loads(Path("../farmer/presets/one-run.json").read_text(encoding="utf-8"))
-   preset["max_runs"] = 3
+   preset = {"objective": "balanced", "max_runs": 3, "run_minutes": 12}
    path = Path(tempfile.mkdtemp()) / "three-runs.json"
    path.write_text(json.dumps(preset), encoding="utf-8")
-   print(submit(current(), Start(None, path)))
+   print(submit(current(), Start(Character("swordsman", 0), path, SessionSettings("prontera", 1))))
    '@ | ..\.venv\Scripts\python.exe -
    ```
 

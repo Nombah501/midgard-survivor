@@ -4,13 +4,13 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The catalog is written atomically before the first run of every game start, including the smoke run.
-- [ ] After a successful smoke run the app publishes the sandbox catalog as the latest catalog; covered by the smoke/game-update tests with the fake game writing a fixture catalog.
-- [ ] The app reads the latest catalog from the real profile or the published copy, whichever is newer.
-- [ ] The AFK screen shows the catalog refresh time, or that no catalog exists; covered by a GUI test.
-- [ ] A verify scenario checks a real game start writes a catalog listing the profile's unlocked locations, oaths and legendaries.
-- [ ] Static checks and the pytest suite pass.
+- [x] The catalog is written atomically before the first run of every game start, including the smoke run.
+- [x] After a successful smoke run the app publishes the sandbox catalog as the latest catalog; covered by the smoke/game-update tests with the fake game writing a fixture catalog.
+- [x] The app reads the latest catalog from the real profile or the published copy, whichever is newer.
+- [x] The AFK screen shows the catalog refresh time, or that no catalog exists; covered by a GUI test.
+- [x] A verify scenario checks a real game start writes a catalog listing the profile's unlocked locations, oaths and legendaries.
+- [x] Static checks and the pytest suite pass.
 
 Spec: [`../spec.md`](../spec.md).

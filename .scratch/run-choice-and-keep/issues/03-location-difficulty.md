@@ -4,15 +4,19 @@
 
 **Blocked by:** 02.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Start and Resume requests carry the run choice; malformed requests are rejected through the existing rejection path; covered by tests.
-- [ ] The service writes the run choice into `farmer.cfg`; the preset never contributes location, difficulty or class; a preset containing `stage`, `danger`, `class` or `class_rotate` is refused as unfixable naming the key.
-- [ ] The window's location and difficulty lists follow the catalog (range follows the location, locked locations disabled, only Automatic without a catalog) and the choice is remembered; covered by GUI tests with fixture catalogs.
-- [ ] A choice changed while paused applies from the next run after Resume.
-- [ ] The preset list no longer offers `one-run`, `synx-hell` or `sniper-hell`; smoke and verify still run with an explicit location and difficulty.
-- [ ] A verify scenario: a fixed location and difficulty appear as the run's target in status and journal; another: a locked location ends the session as a failure naming the location, and the supervisor does not retry it.
-- [ ] The AFK current-run view and history show location and difficulty.
-- [ ] Static checks and the pytest suite pass.
+- [x] Start and Resume requests carry the run choice; malformed requests are rejected through the existing rejection path; covered by tests.
+- [x] The service writes the run choice into `farmer.cfg`; the preset never contributes location, difficulty or class; a preset containing `stage`, `danger`, `class` or `class_rotate` is refused as unfixable naming the key.
+- [x] The window's location and difficulty lists follow the catalog (range follows the location, locked locations disabled, only Automatic without a catalog) and the choice is remembered; covered by GUI tests with fixture catalogs.
+- [x] A choice changed while paused applies from the next run after Resume.
+- [x] The preset list no longer offers `one-run`, `synx-hell` or `sniper-hell`; smoke and verify still run with an explicit location and difficulty.
+- [x] A verify scenario: a fixed location and difficulty appear as the run's target in status and journal; another: a locked location ends the session as a failure naming the location, and the supervisor does not retry it.
+- [x] The AFK current-run view and history show location and difficulty.
+- [x] Static checks and the pytest suite pass.
+
+Real verification on patch 0.2.5: `run-choice`, `run-choice-resume`,
+`invalid-location`, `invalid-difficulty`, and `one-run` passed. The profile
+had every location unlocked, so `invalid-location` uses an unknown ID.
 
 Spec: [`../spec.md`](../spec.md).

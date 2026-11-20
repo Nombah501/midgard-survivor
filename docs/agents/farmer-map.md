@@ -22,7 +22,7 @@ Cross-cutting:
 ## Around the game
 
 - `farmer/tools/supervisor.py`: restart, backoff, quarantine (with run.sh's preflight `detail`), notifications, the single-supervisor lock, the systemd unit (`--print-unit`). Its tests are in `farmer/tests/test_supervisor.py`.
-- `farmer/run.sh`: preflight (exit 78 = unfixable: game/patch/build, cfg not a JSON object, profile dir not writable or below `FARMER_MIN_FREE_MB`), the launcher `flock` (the only single-instance guard), network isolation for supervised sessions, backups and known-good. Its tests are in `farmer/tests/test_run_sh.py`.
+- `farmer/run.sh`: preflight (exit 78 = unfixable: game/patch/build, cfg not a JSON object or using keys from `farmer/obsolete_config_keys.json`, profile dir not writable or below `FARMER_MIN_FREE_MB`), the launcher `flock` (the only single-instance guard), network isolation for supervised sessions, backups and known-good. Its tests are in `farmer/tests/test_run_sh.py`.
 - Contracts and operator docs: `farmer/README.md` (AFK session, commands, isolation/backup, status). Decisions: `docs/adr/`.
 
 ## Verification

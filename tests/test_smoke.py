@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from fake_smoke_game import CATALOG
 from midgard_farm import platform
 from midgard_farm.core import patch_info, smoke
 from test_platform import lock_freed_within
@@ -54,6 +55,7 @@ def setup_smoke(tmp_path, monkeypatch, fake_game_name):
     (profile / "profile.run").write_bytes(b"real run save")
     (profile / "farmer_stop").touch()
     (profile / "farmer_status.json").write_text('{"phase":"done"}', encoding="utf-8")
+    (profile / "farmer_catalog.json").write_text(json.dumps(CATALOG | {"written_at": 1}), encoding="utf-8")
     (profile / "farmer.log").write_text("old FINISH marker", encoding="utf-8")
     (profile / "farmer_runs.jsonl").write_text("old journal", encoding="utf-8")
     patches = profile / "patches"
@@ -108,12 +110,13 @@ def test_smoke_mounts_and_plays_only_in_sandbox(setup_smoke, farmer_mounted):
     }
     assert record["official_linked"] and record["bridge_linked"]
     assert record["args"] == ["--headless"] and record["farmer_enabled"] == "1"
-    preset = Path(__file__).resolve().parents[1] / "farmer" / "presets" / "one-run.json"
+    preset = Path(__file__).resolve().parents[1] / "farmer" / "scenarios" / "one-run.json"
     assert record["config"] == json.loads(preset.read_text(encoding="utf-8")) | {
         "speed": 10.0, "max_runs": 1, "hard_exit": True, "endless": False, "display": False,
     }
     assert not record["stale_files"]
     assert not Path(record["profile"]).exists()
+    assert json.loads((os_.app_data_dir() / "farmer_catalog.json").read_bytes()) == CATALOG
     assert _snapshot(profile) == before
 
 
@@ -166,6 +169,7 @@ def test_smoke_does_not_attribute_first_log_to_retry_install_failure(setup_smoke
     ("no_kills", "no kills in the last run"),
     ("no_zeny", "no zeny gained in the last run"),
     ("no_finish", "missing FINISH marker"),
+    ("no_catalog", "missing or invalid farmer_catalog.json"),
     ("output:SCRIPT ERROR: fake error", "script error in game output"),
     ("output:Parse Error: fake error", "script error in game output"),
     ("output:Invalid call. Fake error", "script error in game output"),
@@ -181,6 +185,7 @@ def test_each_failed_criterion_denies_smoke(setup_smoke, monkeypatch, mode, reas
     assert not result.passed and result.reason == reason and result.attempts == 2
     assert {p.name for p in records.iterdir()} == {"attempt-1.json", "attempt-2.json"}
     assert {p.name for p in result.log_path.parent.iterdir()} == {"attempt-1.log", "attempt-2.log"}
+    assert not (os_.app_data_dir() / "farmer_catalog.json").exists()
     if mode.startswith("output:"):
         assert mode.removeprefix("output:") in result.log_path.read_text()
 

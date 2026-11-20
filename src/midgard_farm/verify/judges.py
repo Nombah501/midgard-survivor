@@ -6,6 +6,8 @@ from collections import Counter
 from pathlib import Path
 
 from ..core import smoke
+from ..core.catalog import read_catalog
+from ..core.history import read_history
 from .drive import Driven, Run
 from .soak import judge_files, read_jsonl
 
@@ -46,6 +48,58 @@ def one_run(run: Run, driven: Driven, status: dict) -> None:
     _done(status)
     reason = smoke.judge_one_run(run.os, run.profile, driven.outputs[0])
     need(not reason, reason)
+
+
+def catalog(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    data = read_catalog(run.os, run.profile)
+    if data is None:
+        raise VerificationFailure("no valid catalog")
+    evidence = status.get("catalog_evidence")
+    if not evidence:
+        raise VerificationFailure("no boot-time catalog evidence")
+    need(data["written_at"] <= evidence["before_run"], "catalog was not written before the first run")
+    need(data["unlocked_max_difficulty"] == evidence["unlocked_max_difficulty"], "wrong unlocked maximum difficulty")
+    expected = {key: not prerequisite or bool(evidence["cleared_locations"].get(prerequisite))
+                for key, prerequisite in evidence["location_prerequisites"].items()}
+    locations = data["locations"]
+    need(expected and len(locations) == len(expected)
+         and {entry["id"]: entry["unlocked"] for entry in locations} == expected, "wrong location unlocks")
+    for entry in locations:
+        need(entry["name"] and 1 <= entry["min_difficulty"] <= entry["max_difficulty"] <= data["max_difficulty"],
+             f"invalid location name or difficulty range: {entry['id']}")
+    oaths = data["oaths"]
+    need(oaths and len(oaths) == len(evidence["oath_points"])
+         and {entry["id"]: [rank["points"] for rank in entry["ranks"]] for entry in oaths} == evidence["oath_points"],
+         "wrong oath ranks or costs")
+    for entry in oaths:
+        need(entry["name"] and entry["description"] and entry["ranks"]
+             and all(rank["rank"] == n and rank["description"] for n, rank in enumerate(entry["ranks"], 1)),
+             f"missing oath name or rank descriptions: {entry['id']}")
+    legendaries = data["legendaries"]
+    need(legendaries and all(entry["name"] for entry in legendaries)
+         and sorted(entry["id"] for entry in legendaries) == sorted(evidence["legendary_ids"]), "wrong legendaries")
+    need(sorted(data["owned_item_ids"]) == sorted(set(evidence["stored_ids"])), "wrong owned item ids")
+
+
+def preparation_unchanged(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    need(status["totals"]["runs"] == 1, "expected one completed run")
+    need(status["last"]["game_s"] > 0, "the run did not advance")
+    snapshots = status.get("preparation") or {}
+    before, after = snapshots.get("before"), snapshots.get("after")
+    if not before or not after:
+        raise VerificationFailure("missing preparation snapshots")
+    need(before["free_points"] > 0, "the starting character must have unspent stat points")
+    need(before["potentials"], "the starting profile must have worn equipment")
+    need(after["free_points"] >= before["free_points"], "unspent stat points decreased")
+    for field in ("loadouts", "potentials", "album", "stats", "rebirths", "rebirth_levels", "pick_order", "pick_limits"):
+        need(before[field] == after[field], f"character preparation changed: {field}")
+    # The game itself can activate a newly tamed pet when no pet was selected.
+    if before["pet"]:
+        need(before["pet"] == after["pet"], "character preparation changed: pet")
 
 
 def stop(run: Run, driven: Driven, status: dict) -> None:
@@ -97,6 +151,88 @@ def checkpoint_corrupt(run: Run, driven: Driven, status: dict) -> None:
 
 def _journal(path: Path) -> list[dict]:
     return read_jsonl(path) if path.is_file() else []
+
+
+def run_choice(run: Run, driven: Driven, status: dict, expected: tuple[tuple[str, int], ...],
+               oath_points: tuple[int, ...] = ()) -> None:
+    _exit(driven)
+    _done(status)
+    target = status.get("target") or {}
+    need((target.get("stage"), target.get("danger")) == expected[-1], "wrong location or difficulty in status target")
+    rows = _journal(run.artifact("journal.jsonl"))
+    need([r.get("run_id") for r in rows] == [f"{run.session}-r{i+1}" for i in range(len(expected))],
+         "wrong run ids in journal")
+    need(tuple((r.get("stage"), r.get("danger")) for r in rows) == expected, "wrong location or difficulty in journal")
+    if oath_points:
+        need(tuple(r.get("oath_points") for r in rows) == oath_points, "wrong oath points in journal")
+        need(target.get("oath_points") == status["last"].get("oath_points") == oath_points[-1],
+             "wrong oath points in status")
+        saved = status.get("oath_evidence") or {}
+        need({"before", "after"} <= saved.keys(), "missing saved oath snapshots")
+        need(saved["before"] == saved["after"], "saved oath set changed")
+        if not any(oath_points):
+            need(saved["before"], "this scenario requires a profile with saved oaths to test that they are not inherited")
+    outcome = driven.outcome or {}
+    need([a["outcome"] for a in outcome.get("attempts", [])] == ["finished"], "session restarted")
+    session_notes = [r for r in read_history(run.os) if r.get("session_id") == run.session]
+    need(len(session_notes) == 1, "no completed session in history")
+    need(session_notes[0].get("run_choices") == [
+        {key: r[key] for key in ("run_id", "stage", "danger", "oath_points", "kept", "keep_skipped")
+         if key in r and (key not in ("kept", "keep_skipped") or r[key])} for r in rows
+    ], "history did not retain the location, difficulty and oath points of each run")
+
+
+def wishlist_keep(run: Run, driven: Driven, status: dict) -> None:
+    rows = _journal(run.artifact("journal.jsonl"))
+    run_choice(run, driven, status, expected=(("prontera", 1), ("prontera", 1)))
+    evidence = status.get("wishlist_evidence", [])
+    need(len(evidence) == 2, "missing two keep snapshots")
+    first, second = evidence
+    ids = first["fixture_ids"]
+    need(len(ids) == len(set(ids)) == 3 and ids == second["fixture_ids"], "missing fixture items")
+    expensive, wanted, unwanted = ids
+    need(second["before"]["stored_ids"].count(wanted) == 1, "first keep did not persist into the next run")
+    for index, (data, row) in enumerate(zip(evidence, rows, strict=True)):
+        need(data["wishlist"] == [expensive, wanted] and not data["free"], "not a paid wishlist offer")
+        before, after = data["before"], data["after"]
+        offer = data["offer"]
+        drops = {item["id"]: item for item in offer}
+        need(all(item in drops and drops[item]["legend_coins"] > 0 for item in ids),
+             "fixture legendaries are missing from the game's offer")
+        expected = [] if index else [wanted]
+        added = Counter(after["stored_ids"]) - Counter(before["stored_ids"])
+        need(added == Counter(expected), "wrong items added to saved storage")
+        need(after["stored_ids"].count(wanted) == 1 and unwanted not in after["stored_ids"],
+             "duplicate wishlist keep or unwanted legendary in storage")
+        need(row["kept"] == expected, "journal kept items disagree with saved storage")
+        skips = {item["id"]: item["reason"] for item in row["keep_skipped"]}
+        need(skips.get(expensive) == "over_zeny_limit", "journal did not record the unaffordable item")
+        if index:
+            need(skips.get(wanted) == "already_owned", "journal did not record the owned wishlist item")
+        spent = 0 if index else drops[wanted]["cost"]
+        need(after["zeny"] == before["zeny"] + sum(i["sell_zeny"] for i in offer) - spent and (index or spent > 0),
+             "wrong zeny debited for paid keep")
+        expected_cash = sum(i["legend_coins"] for i in offer) - (0 if index else drops[wanted]["legend_coins"])
+        need(after["legend_coins"] == before["legend_coins"] + expected_cash, "legendary offers were not cashed in")
+    log = run.artifact("farmer.log").read_text(encoding="utf-8")
+    need(any(wanted in line and "already_owned" in line for line in log.splitlines()),
+         "owned wishlist skip and reason missing from log")
+
+
+def invalid_choice(run: Run, driven: Driven, status: dict, field: str, selection: str) -> None:
+    _exit(driven, 2)
+    reason = "invalid_" + field
+    need(status.get("phase") == "failed" and status.get("terminal") and status.get("failed"), "no terminal failure")
+    need(status.get("finish_reason") == reason, f"finish_reason != {reason}")
+    need(status.get("exit_code") and (status.get("totals") or {}).get("started") == 0,
+         "invalid choice was allowed to start a run")
+    need(not _journal(run.artifact("journal.jsonl")), "invalid choice created a journal entry")
+    outcome = driven.outcome or {}
+    need(outcome.get("kind") == "quarantined" and outcome.get("reason") == reason, "choice was not quarantined")
+    attempts = outcome.get("attempts", [])
+    need(len(attempts) == 1 and attempts[0]["outcome"] == "fatal", "supervisor retried an invalid choice")
+    detail = attempts[0].get("detail", "")
+    need(field in detail.lower() and selection in detail, "failure detail did not name the invalid field and value")
 
 
 def command(run: Run, driven: Driven, status: dict) -> None:

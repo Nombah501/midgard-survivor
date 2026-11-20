@@ -146,7 +146,9 @@ rate = value / wall_seconds
 - Победа и `danger < ceiling` → через `win_streak` (2) пробуем `+1`.
 - Смерть до `min_run_seconds` или провал по kill-rate → рука в cooldown,
   danger−1; после 2 провалов — соседняя стадия/безопасная рука.
-- Жёсткие `stage`/`danger` в конфиге отключают автоподбор (для тестов).
+- Жёсткие `stage`/`danger` в конфиге идут из выбора окна и отключают
+  автоподбор соответствующего поля. Фиксированная сложность не ограничена
+  потолком стратегии, но должна входить в диапазон игры для локации.
 - `featured` (ежедневная карта, +25%) добавляет бонус к score.
 
 ### 5.3 Draft
@@ -184,16 +186,14 @@ rate = value / wall_seconds
 ### 5.5 Loot / keep / neskolko
 
 - `menus.auto_pick=true` → игра сама делает `LootRoll.auto_pick`.
-- Keep: считаем ценность `score + pot(120+20*tier+5*lines) + 20*trait + unique`.
-  Берём до `KEEP_WIN` (3) бесплатных при победе; при поражении — 1 платный,
-  если `keep_on_defeat` и цена ≤ `keep_max_pct` банка. Не берём perm/lent/
-  дубликаты unique/мусор без слотов.
+- Keep: только легендарные предметы из `wishlist`, которых ещё нет на
+  складе; perm/lent не сохраняются. До `KEEP_WIN` (3) бесплатных при
+  победе или Ymir; после поражения — 1 платный в пределах `keep_max_pct`.
 - Запись в склад — одной транзакцией:
   `copy={id,slots,extra_slots,refine:0,cards:[],uid,trait?,pot?}` →
   `Save.storage().append(copy)` → `mark_dirty()` → `flush()`.
-- Если склад полон: swap только если новый предмет ценнее самого дешёвого
-  незащищённого (не loadout, не unique/legend/wings, без pot/trait) на
-  `swap_margin`; иначе пропуск + предупреждение.
+- Если склад полон: убрать самый слабый незащищённый предмет (не loadout,
+  не unique/legend/wings, без pot/trait). Пропуски идут в лог и журнал забега.
 - После keep — штатная уборка конца забега: для невзятых `_worn` →
   `Equipment.sell_price`, для legendary/unique → `Equipment.cash_in`
   (legend_coin), затем `_keep_offer=[]`, `_keep_pending=false`. Это ровно то,
@@ -224,30 +224,24 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 
 ## 6. Городская политика (без входа в город)
 
-Порядок maintenance после каждого забега (каждый шаг идемпотентен):
+Окно запоминает четыре переключателя обслуживания и передаёт их при Start
+или Resume. Служба переносит их в `farmer.cfg`, но отклоняет эти ключи в
+пресетах. Пресеты хранят только резервы, приоритеты и лимиты.
+
+Порядок обслуживания после каждого забега:
 
 1. `claim_achievement` для всех `unclaimed_achievements`.
-2. Апгрейды Kafra: по `upgrade_priority`, пока `zeny − cost ≥ reserve`.
+2. Если включены апгрейды, Kafra: по `upgrade_priority`, пока `zeny − cost ≥ reserve`.
    Без `doom`/`bloody_branch` по умолчанию. `kafra_storage` — до
    `storage_target` (не 48).
-3. Sage-апгрейды: `passive_slot → sage_book → sage_root → sage_start →
+3. Тот же переключатель включает Sage: `passive_slot → sage_book → sage_root → sage_start →
    fly_wing → magnifier`.
-4. Rebirth: `can_rebirth` → `rebirth`; `rebirth_lv_ready` → `take_rebirth_lv`.
-5. Class stats: `free_points` → `set_class_stats` по `build.stats`, после
-   rebirth.
-6. Card fusion: `can_fuse` для карт, у которых copies > `fuse_keep[id]` (по
-   умолчанию 0) → `fuse_card`; считаем потраченные копии.
-7. Album: `set_equipped_cards` — лучшие owned карты по весам objective
-   (`loot/zeny/card/dmg/skill_dmg/crit/hp/move/...`), до `card_slots()`.
-8. Loadout: для активного класса заполнить `Save.set_loadout_slot` лучшими
-   складскими предметами (score+pot), уважая `loadout_cap`, тип слота, класс.
-9. Питомец: `set_active_pet` по `pet_priority`/весам (zeny→golden_bug/poring,
-   cards→lunatic, xp→spore, survival→sohee/marina, damage→ork_warrior/isis).
-10. Star Smith (опция): выбрать лучший складской предмет с `pot`/подходящим
-    слотом; роллить при `star_crumb ≥ potential_reserve + cost`, лочить
-    лучшие линии; `hel_tear` — только на semi-perfect legendary линии.
-11. Prune (опция): при `storage ≥ cap - reserve` удалить самые дешёвые
-    незащищённые предметы без pot/trait; только если это освобождает место.
+4. Если включено слияние лишних копий карт, проверяем `can_fuse` и остаток
+   не меньше `fuse_keep[id]` (по умолчанию 0) после оплаты слияния.
+5. Если включён Star Smith, роллим только складские предметы, не надетые ни
+   на одного персонажа, в пределах `potential_reserve` и `potential_max_rolls`.
+6. Если включена очистка склада, при остатке не более `keep_reserve_slots` слотов убираем
+   только незащищённые складские предметы. Надетые предметы не удаляются.
 
 Всё, что не имеет API без UI, не автоматизируем (см. §2).
 
@@ -271,12 +265,16 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 
 ## 8. Конфиг (v1)
 
+Ниже пример готового `farmer.cfg`, не пресета. Значения `auto_upgrades`,
+`auto_sage`, `auto_fuse`, `auto_potential` и `auto_storage_prune` в режиме
+службы записываются из выбора оператора.
+
 ```jsonc
 {
   "objective": "balanced",          // zeny|ores|crumbs|xp|cards|pets|coins|progress|balanced
   "weights": {"zeny":1,"ore":2500,"crumb":60000,"tear":200000,"xp":1,"card":50000,"pet":200000,"coin":20000,"ymir":100000},
-  "class": "", "classes": [], "class_rotate": false,
-  "stage": "", "stage_pool": [], "danger": "auto", "danger_ceiling": 30,
+  "class": "",
+  "stage": "", "danger": "auto", "danger_ceiling": 30,
   "auto_danger": true, "explore_every": 5, "danger_step": 1,
   "featured_bonus": true,
   "speed": 4.0, "game_speed": 3,
@@ -284,15 +282,12 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
   "endless": false, "endless_minutes": 4, "endless_mvps": 0,
   "max_runs": 0, "max_minutes": 0, "stop_after_wins": 0,
   "display": false, "offline": true, "hard_exit": true,
-  "auto_keep": true, "keep_on_defeat": false, "keep_reserve_slots": 2,
-  "keep_max_pct": 0.05, "swap_margin": 1.25,
-  "auto_stats": true, "auto_rebirth": false, "auto_rebirth_lv": false,
+  "wishlist": [], "keep_reserve_slots": 2, "keep_max_pct": 0.05,
   "auto_achievements": true,
   "auto_upgrades": true, "upgrade_reserve": 500000, "storage_target": 120,
   "upgrade_priority": ["bubble_gum","battle_manual","greed","blessing","increase_agi","yggdrasil_fruit","fury","gloria","magnificat","angelus","hp_recovery","telescope","kafra_status","kafra_summon","kafra_area","kafra_amount","kafra_blow","vultures_eye","memorize","card_slot","kafra_cart","kafra_storage"],
   "auto_sage": true, "sage_priority": ["passive_slot","sage_book","sage_root","sage_start","fly_wing","magnifier"],
-  "auto_cards": true, "auto_fuse": true, "fuse_keep": {},
-  "auto_loadout": true, "auto_pet": true, "pet_priority": [],
+  "auto_fuse": true, "fuse_keep": {},
   "auto_potential": false, "potential_reserve": 20, "potential_max_rolls": 10,
   "auto_storage_prune": false,
   "builds": {
@@ -340,10 +335,10 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
    сценария свой timeout; проверяются exit 0, `phase=done`, победа/частичный
    банк/`ENDLESS_DONE`; результат — `farmer/logs/verify-*/summary.json`.
 4. `./tools/farm.py --list` — персонажи/стадии; `--char`/`--class` и
-   `--stage` фиксируют выбор. Неизвестный или закрытый класс/стадия должны
-   дать `CLASS_LOCKED`/`STAGE_LOCKED`, без тихого fallback.
-5. `./run.sh presets/synx-hell.json` — solo SinX, Prontera D25 (hell 10),
-   speed 4, cap 42 game-min; профильные `pick_order`/`pick_limits`; проверить
+   `--stage` фиксируют выбор. Неизвестная или закрытая локация даёт
+   `invalid_location`, без тихого fallback.
+5. `./tools/farm.py --char sinx --stage prontera --danger 25 --speed 4 --run-minutes 42`
+   — solo SinX, Prontera D25 (hell 10); профильные `pick_order`/`pick_limits`; проверить
    `PROFILE_BUILD`, `job=assassin_cross`, дельты зеньги/руды/крошек. Смерть на
    ~25.5 game-min допустима: забег банкуется и следующий стартует сам.
 6. Sandbox: `max_runs:3` на целевой руке → нет двойного банка, нет потери loot,
@@ -384,9 +379,7 @@ chest/card ≤ 3 с. Смерть в endless игра сама банкует к
 Строки `cb571a15` получены `./tools/verify.sh`; источники чисел —
 `farmer/logs/verify-*/summary.json`. Строки `267a2584` — solo SinX на профиле:
 короткий smoke и полный забег; последний умер на 25.5 game-min, но это
-endless-victory с банком, поэтому `synx-hell` оставлен на speed 4 и
-перезапускает забег. Maintenance проверялся на предыдущих сборках; партия
-удалена. Выбор класса/стадии — `tools/farm.py` + `targets.json`; закрытые
-класс/стадия дают `CLASS_LOCKED`/`STAGE_LOCKED`.
+endless-victory с банком. Использовался speed 4. Maintenance проверялся
+на предыдущих сборках.
 
 Все прогоны — на копии профиля; основной профиль не изменялся.

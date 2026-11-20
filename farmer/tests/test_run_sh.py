@@ -24,6 +24,7 @@ def launcher(tmp_path, monkeypatch):
     farmer.mkdir()
     run = farmer / "run.sh"
     shutil.copy2(HERE.parent / "run.sh", run)
+    shutil.copy2(HERE.parent / "obsolete_config_keys.json", farmer)
     xdg = tmp_path / "xdg"
     data = xdg / "godot/app_userdata/Midgard Survivors"
     patches = data / "patches"
@@ -107,6 +108,27 @@ def test_manual_launch_keeps_network_and_needs_no_unshare(launcher):
     assert record["netns"] == os.readlink("/proc/self/ns/net")
     assert record["interfaces"] == sorted(name for _, name in socket.if_nameindex())
     assert not (run.parent / "backups/known-good").exists()
+
+
+@pytest.mark.parametrize("key", [
+    "auto_loadout", "auto_pet", "auto_cards", "auto_stats", "auto_rebirth",
+    "auto_rebirth_lv", "override_pick_order", "pet_priority", "auto_keep",
+    "class_rotate", "classes", "stage_pool", "keep_on_defeat", "swap_margin",
+])
+@pytest.mark.parametrize("use_preset", [False, True], ids=["farmer-cfg", "preset"])
+def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_preset):
+    run, data, _ = launcher
+    cfg = data / "farmer.cfg"
+    source = tmp_path / "old preset.json" if use_preset else cfg
+    source.write_text(json.dumps({key: False}))
+    original = cfg.read_bytes()
+    args = [source] if use_preset else []
+
+    result = subprocess.run([run, *args], capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 78 and key in result.stderr
+    assert cfg.read_bytes() == original
+    assert not (data / "fake-game.json").exists()
 
 
 def test_sandbox_install_uses_separate_backup_directory(launcher, monkeypatch):

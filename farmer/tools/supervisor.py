@@ -48,7 +48,7 @@ DATA_DIR = (
 )
 EXIT_PREFLIGHT = 78  # run.sh EX_CONFIG: missing game/patch, stale build, bad preset
 # Farmer terminal reasons a restart cannot fix.
-FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt"}
+FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt", "invalid_location", "invalid_difficulty", "invalid_oath"}
 # Present only while a session has no terminal outcome: a supervisor that
 # systemd restarts after its own crash continues the same AFK session.
 SESSION_FILE = DATA_DIR / "farmer_supervisor_session"

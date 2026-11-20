@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from fake_smoke_game import CATALOG
 from midgard_farm import platform
 from midgard_farm.core import game_update, patch_info
 from midgard_farm.core.farmer_patch import farmer_hash
@@ -192,6 +193,8 @@ def test_game_update_refreshes_then_builds_then_smokes_before_real_install(farm)
     ]
     result = json.loads(farm.patches.joinpath("state.json").read_bytes())
     assert result == json.loads(before) | {"file": "patch_farmer.pck", "farmer": 1}
+    assert json.loads((farm.os.app_data_dir() / "farmer_catalog.json").read_bytes()) == CATALOG
+    assert not (farm.profile / "farmer_catalog.json").exists()
     info = patch_info.load(patch_info.info_path(farm.os))
     assert hashlib.sha256(farm.patches.joinpath("patch_farmer.pck").read_bytes()).hexdigest() == info.result_sha256
     assert farm.profile.joinpath("profile.json").read_bytes() == profile_before

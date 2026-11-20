@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the Midgard Survivors farmer.
 #   ./run.sh                         use the current farmer.cfg
-#   ./run.sh presets/one-run.json    copy a preset into place, then run
+#   ./run.sh scenarios/one-run.json  copy a config into place, then run
 #   FARMER_DISPLAY=1 ./run.sh        windowed instead of headless
 set -euo pipefail
 
@@ -72,13 +72,29 @@ if [[ -n "${FARMER_SESSION_ID:-}" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
-if [[ $# -ge 1 ]]; then
-	[[ -f "$1" ]] || die "preset not found: $1"
-	cp "$1" "$DATA/farmer.cfg"
+CFG="${1:-$DATA/farmer.cfg}"
+if [[ ! -f "$CFG" ]]; then
+	[[ $# -eq 0 ]] || die "preset not found: $CFG"
+	die "no farmer.cfg; pass a preset or create one"
 fi
-[[ -f "$DATA/farmer.cfg" ]] || die "no farmer.cfg; pass a preset or create one"
-python3 -c 'import json,sys; sys.exit(not isinstance(json.load(open(sys.argv[1])), dict))' \
-	"$DATA/farmer.cfg" 2>/dev/null || die "farmer.cfg is not a JSON object: $DATA/farmer.cfg"
+OBSOLETE_KEYS="$FARMER_DIR/obsolete_config_keys.json"
+[[ -f "$OBSOLETE_KEYS" ]] || die "missing obsolete config key list: $OBSOLETE_KEYS"
+if ! obsolete="$(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    config = json.load(source)
+if not isinstance(config, dict):
+    sys.exit(1)
+with open(sys.argv[2], encoding="utf-8") as source:
+    keys = json.load(source)
+print(", ".join(key for key in keys if key in config))
+' "$CFG" "$OBSOLETE_KEYS" 2>/dev/null)"; then
+	die "farmer.cfg is not a JSON object: $CFG"
+fi
+[[ -z "$obsolete" ]] || die "remove unsupported keys from $CFG: $obsolete"
+if [[ $# -ge 1 ]]; then
+	cp "$CFG" "$DATA/farmer.cfg"
+fi
 
 DISPLAY_MODE="$(python3 -c 'import json,sys; print("1" if json.load(open(sys.argv[1])).get("display",False) else "0")' "$DATA/farmer.cfg" 2>/dev/null || echo 0)"
 if [[ "${FARMER_DISPLAY:-}" == "1" || "${FARMER_DISPLAY:-}" == "true" ]]; then

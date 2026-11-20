@@ -10,7 +10,8 @@ from functools import partial
 from pathlib import Path
 
 from ..assets import presets_dir
-from ..core import farmer_patch, patch_info, smoke
+from ..core import catalog, farmer_patch, patch_info, smoke
+from ..core.commands import SessionSettings
 from ..core.supervisor import Policy
 from ..platform import Platform
 from . import drive, judges, soak
@@ -26,12 +27,46 @@ class Scenario:
 
 
 _SHORT: dict[str, object] = {"run_minutes": 0.2, "stall_seconds": 10.0}
-_COMMANDS = _SHORT | {"max_runs": 2, "auto_keep": True, "keep_on_defeat": True}
-# Bounded scenarios inherit the shared one-run preset, including speed 10,
+_COMMANDS = _SHORT | {"max_runs": 2}
+_OATH_RUNS = _SHORT | {"max_runs": 2, "danger_ceiling": 30}
+_OATH_TARGETS = (("prontera", 30), ("prontera", 30))
+_resume_settings = partial(SessionSettings, upgrades=False, card_fusion=False)
+# Bounded scenarios inherit the shared one-run config, including speed 10,
 # hard exit and display false. All check exits, evidence and script errors.
 SCENARIOS = {
     # Done + terminal metadata, a win and last victory, kills/zeny > 0, FINISH.
     "one-run": Scenario(300, {}, drive.direct, judges.one_run),
+    "catalog": Scenario(300, {}, partial(drive.direct, FARMER_TEST_CATALOG="1"), judges.catalog),
+    "preparation-unchanged": Scenario(300, {
+        "auto_achievements": True, "auto_upgrades": True, "auto_sage": True, "auto_fuse": True,
+        "auto_potential": True, "potential_reserve": 0, "potential_max_rolls": 500,
+        "auto_storage_prune": True, "keep_reserve_slots": 500, "upgrade_reserve": 0,
+    }, partial(drive.direct, FARMER_TEST_PREPARATION="1"), judges.preparation_unchanged),
+    "wishlist-keep": Scenario(120, _SHORT | {"max_runs": 2, "keep_max_pct": 0.20, "auto_achievements": False},
+                              partial(drive.supervised, FARMER_TEST_WISHLIST="1"), judges.wishlist_keep),
+    "run-choice": Scenario(120, _SHORT | {"objective": "progress", "danger_ceiling": 1, "danger": 2},
+                           drive.supervised, partial(judges.run_choice, expected=(("prontera", 2),))),
+    "run-choice-resume": Scenario(180, _SHORT | {"max_runs": 2},
+                                  partial(drive.supervised, resume=_resume_settings("prontera", 2)),
+                                  partial(judges.run_choice, expected=(("prontera", 1), ("prontera", 2)))),
+    "oaths": Scenario(180, _OATH_RUNS | {"danger": 30, "oaths": {"tough": 3, "elite": 1}},
+                      partial(drive.supervised, FARMER_TEST_OATHS="1",
+                              resume=_resume_settings("prontera", 30, {"hunt": 2})),
+                      partial(judges.run_choice, expected=_OATH_TARGETS, oath_points=(6, 2))),
+    "oaths-disabled": Scenario(180, _OATH_RUNS | {"danger": "auto", "objective": "progress"},
+                               partial(drive.supervised, FARMER_TEST_OATHS="1",
+                                       resume=_resume_settings("prontera", 30)),
+                               partial(judges.run_choice, expected=_OATH_TARGETS, oath_points=(0, 0))),
+    "invalid-oath": Scenario(120, {"danger": 30, "oaths": {"not-an-oath": 1}}, drive.supervised,
+                             partial(judges.invalid_choice, field="oath", selection="not-an-oath")),
+    "invalid-oath-rank": Scenario(120, {"danger": 30, "oaths": {"mvp_fury": 3}}, drive.supervised,
+                                  partial(judges.invalid_choice, field="oath", selection="mvp_fury")),
+    "invalid-oath-difficulty": Scenario(120, {"danger": "auto", "oaths": {"tough": 1}}, drive.supervised,
+                                        partial(judges.invalid_choice, field="oath", selection="fixed difficulty 30")),
+    "invalid-location": Scenario(120, {"stage": "not-a-location"}, drive.supervised,
+                                 partial(judges.invalid_choice, field="location", selection="not-a-location")),
+    "invalid-difficulty": Scenario(120, {"danger": 31}, drive.supervised,
+                                   partial(judges.invalid_choice, field="difficulty", selection="31")),
     # Done + terminal metadata, last run with kills and game time, STOP max_minutes.
     "stop": Scenario(180, {"class": "thief", "max_minutes": 1.0, "stall_seconds": 10.0, "max_runs": 0},
                      drive.direct, judges.stop),
@@ -105,7 +140,8 @@ def _stage_candidate(os_: Platform, candidate: Path) -> patch_info.PatchInfo:
 
 def _collect(run: drive.Run) -> None:
     for name, suffix in (("farmer.log", "farmer.log"), ("farmer_status.json", "status.json"),
-                         ("farmer_runs.jsonl", "journal.jsonl"), ("farmer_session.json", "checkpoint.json")):
+                         ("farmer_runs.jsonl", "journal.jsonl"), ("farmer_session.json", "checkpoint.json"),
+                         (catalog.FILENAME, "catalog.json")):
         path = run.profile / name
         if path.is_file():
             shutil.copyfile(path, run.artifact(suffix))
@@ -166,11 +202,11 @@ def run_scenario(os_: Platform, source: Path, candidate: Path, work: Path, out: 
     row = {
         "scenario": name, "verdict": "FAIL" if reason else "PASS", "exit": driven.code, "reason": reason,
         **{k: status.get(k) for k in ("phase", "terminal", "failed", "finish_reason", "exit_code", "run_id",
-                                      "heartbeat_seq", "build")},
+                                      "heartbeat_seq", "build", "target")},
         **{k: totals.get(k) if isinstance(totals, dict) else None for k in ("runs", "wins", "losses", "kills", "zeny")},
         "last": {k: last.get(k) if isinstance(last, dict) else None
-                 for k in ("victory", "endless", "endless_mvps", "kills", "zeny_gain", "xp_gain", "cards_gain", "kept",
-                           "game_s", "wall_s")},
+                 for k in ("stage", "danger", "victory", "endless", "endless_mvps", "kills", "zeny_gain", "xp_gain",
+                           "cards_gain", "kept", "keep_skipped", "game_s", "wall_s", "oath_points")},
         "build_sha256": info.result_sha256,
     }
     run.artifact("result.json").write_text(json.dumps(row, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

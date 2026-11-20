@@ -11,8 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..assets import farmer_inputs
 from ..platform import Platform
 from . import patch_info
+from .commands import MAINTENANCE_CONFIG_KEYS
+
+
+_OBSOLETE_KEYS = farmer_inputs() / "obsolete_config_keys.json"
+_RUN_CHOICE_KEYS = ("stage", "danger", "class", "oaths", "wishlist")
 
 
 class PreflightError(Exception):
@@ -111,6 +117,16 @@ def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, preset: Pat
         config = _json_object(contents)
     except ValueError as exc:
         raise PreflightError(f"farmer.cfg is not a JSON object: {cfg}") from exc
+    obsolete = json.loads(_read_preflight_input(_OBSOLETE_KEYS, Path.read_bytes))
+    removed = [key for key in obsolete if key in config]
+    if preset is not None:
+        removed.extend(key for key in _RUN_CHOICE_KEYS if key in config)
+        removed.extend(key for keys in MAINTENANCE_CONFIG_KEYS.values() for key in keys if key in config)
+        if isinstance(builds := config.get("builds"), dict) and "class" in builds:
+            removed.append("builds.class")
+    if removed:
+        source = f"preset {cfg}" if preset is not None else str(cfg)
+        raise PreflightError(f"remove unsupported keys from {source}: {', '.join(removed)}")
     write_config = preset is not None
     if os.environ.get("FARMER_DISPLAY") in {"1", "true"}:
         config["display"] = True

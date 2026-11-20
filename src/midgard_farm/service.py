@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import assets, platform
 from .core import app_update
-from .core.commands import Start, submit
+from .core.commands import Resume, Start, submit
 from .core.config import read_config
 from .core.game_update import START_GAME_AND_UPDATE
 from .core.launch import GameBusy, run_attempt, shutdown_request
@@ -87,7 +87,7 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
             return 1
 
         def before_start() -> bool:
-            for path, command in pending_commands(os_):
+            for path, command in pending_commands(os_, state):
                 if command != "rollback_app":
                     continue
                 queued, reason = updater.begin(manual=True)
@@ -113,9 +113,11 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
                     last_missing = reason
                     state.set(StateKind.FARMER_UNAVAILABLE, guidance)
                     log(f"profile not found: {reason}")
-                for path, command in pending_commands(os_):
+                for path, command in pending_commands(os_, state):
                     if isinstance(command, Start):
                         refuse_command(os_, state, path, "start", guidance)
+                    elif isinstance(command, Resume):
+                        refuse_command(os_, state, path, "resume", guidance)
                     elif command in ("check_again", "restore_official", "rollback_app"):
                         refuse_command(os_, state, path, command, guidance)
                     else:

@@ -75,7 +75,8 @@ class Farm:
         return path
 
     def start(self):
-        return self.send("start", character={"class": "archer", "job_path": 1}, preset=str(self.preset))
+        return self.send("start", character={"class": "archer", "job_path": 1}, preset=str(self.preset),
+                         settings={"location": "payon", "difficulty": 12})
 
     def outcome(self):
         def read():
@@ -174,9 +175,8 @@ def farm(tmp_path, monkeypatch, service_game_platform):
     else:
         game.write_bytes(f"#!{sys.executable}\n".encode() + FAKE.read_bytes())
         game.chmod(0o755)
-    preset.write_text(json.dumps({"stage": "payon", "danger": 12, "class": "thief",
-                                  "display": sys.platform == "win32", "builds": {"class": "mage",
-                                  "archer": {"job_path": 0, "skills": ["agi"]}}}))
+    preset.write_text(json.dumps({"display": sys.platform == "win32", "speed": 5,
+                                  "builds": {"archer": {"job_path": 0, "skills": ["agi"]}}}))
     return Farm(os_, profile, preset, plan)
 
 
@@ -188,10 +188,14 @@ def plan_game(farm, *steps):
     farm.plan.write_text("\n".join(steps))
 
 
-def test_clean_finish_uses_character_and_preset_without_restart(farm):
+@pytest.mark.parametrize(("difficulty", "oaths"), [(12, {}), (30, {"tough": 2, "elite": 1})])
+def test_clean_finish_uses_character_and_preset_without_restart(farm, difficulty, oaths):
     plan_game(farm, "clean:max_runs", "crash")
     with farm.service():
-        farm.start()
+        farm.send("start", character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
+                  settings={"location": "payon", "difficulty": difficulty, "oaths": oaths,
+                            "wishlist": ["sacred_excalibur", "gungnir"],
+                            "upgrades": False, "card_fusion": False, "star_smith": True, "storage_cleanup": True})
         outcome, directory = farm.outcome()
     assert (outcome["kind"], outcome["reason"]) == ("finished", "max_runs")
     assert len(outcome["attempts"]) == 1
@@ -199,10 +203,64 @@ def test_clean_finish_uses_character_and_preset_without_restart(farm):
     assert farm.notifications() == ["stop"]
     assert farm.plan.with_suffix(".count").read_text() == "1"
     config = json.loads((farm.profile / "farmer.cfg").read_bytes())
-    assert (config["stage"], config["danger"], config["class"]) == ("payon", 12, "archer")
+    assert (config["stage"], config["danger"], config["class"], config["oaths"]) == ("payon", difficulty, "archer", oaths)
+    assert config["wishlist"] == ["sacred_excalibur", "gungnir"]
+    assert config["auto_upgrades"] is config["auto_sage"] is config["auto_fuse"] is False
+    assert config["auto_potential"] is config["auto_storage_prune"] is True
     assert config["job_paths"]["archer"] == 1
     assert config["builds"] == {"archer": {"job_path": 1, "skills": ["agi"]}}
-    assert json.loads(farm.preset.read_bytes())["class"] == "thief"
+    assert json.loads(farm.preset.read_bytes())["speed"] == config["speed"] == 5
+
+
+@pytest.mark.parametrize("settings", [[], {"location": [], "difficulty": 1},
+                                      {"location": None, "difficulty": True}, {"location": None}])
+def test_malformed_start_and_resume_are_refused(farm, settings):
+    with farm.service():
+        for command in ("start", "resume"):
+            request = farm.send(command, character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
+                                settings=settings)
+            rejection = commands.rejection_path(farm.os_, request)
+            row = wait_for(lambda: json.loads(farm.os_.read_shared(rejection)))
+            assert row["command"] == command and "settings" in row["reason"]
+    assert not (farm.profile / "farmer.cfg").exists()
+
+
+@pytest.mark.parametrize("oaths", [None, ["tough"], {"": 1}, {"tough": "1"}, {"tough": True}, {"tough": 1.5}, {"tough": 0}])
+def test_malformed_oath_ranks_are_refused(farm, oaths):
+    with farm.service():
+        for command in ("start", "resume"):
+            request = farm.send(command, character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
+                                settings={"location": "prontera", "difficulty": 30, "oaths": oaths})
+            rejection = commands.rejection_path(farm.os_, request)
+            row = wait_for(lambda: json.loads(farm.os_.read_shared(rejection)))
+            assert row["command"] == command and "settings.oaths" in row["reason"]
+    assert not (farm.profile / "farmer.cfg").exists()
+
+
+@pytest.mark.parametrize("wishlist", [None, "gungnir", {"gungnir": True}, [1], [True], [" "], ["a\0b"], ["a", "a"]])
+def test_malformed_wishlists_are_refused(farm, wishlist):
+    with farm.service():
+        for command in ("start", "resume"):
+            request = farm.send(command, character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
+                                settings={"location": None, "difficulty": None, "wishlist": wishlist})
+            rejection = commands.rejection_path(farm.os_, request)
+            row = wait_for(lambda: json.loads(farm.os_.read_shared(rejection)))
+            assert row["command"] == command and "settings.wishlist" in row["reason"]
+    assert not (farm.profile / "farmer.cfg").exists()
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("upgrades", 0), ("card_fusion", "false"), ("star_smith", None), ("storage_cleanup", []),
+])
+def test_non_boolean_maintenance_switches_are_refused(farm, key, value):
+    with farm.service():
+        for command in ("start", "resume"):
+            request = farm.send(command, character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
+                                settings={"location": None, "difficulty": None, key: value})
+            rejection = commands.rejection_path(farm.os_, request)
+            row = wait_for(lambda: json.loads(farm.os_.read_shared(rejection)))
+            assert row["command"] == command and f"settings.{key}" in row["reason"]
+    assert not (farm.profile / "farmer.cfg").exists()
 
 
 def test_goal_finish_notifies_goal(farm):
@@ -230,7 +288,8 @@ def test_operator_terminal_command_notifies_stop_without_restart(farm, command):
     assert (known_good_snapshot(farm.data / "backups") is not None) == (command == "finish")
 
 
-def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm):
+@pytest.mark.parametrize("structured", [False, True])
+def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured):
     plan_game(farm, "commands", "crash")
     with farm.service(run_stall_window=0.75):
         farm.start()
@@ -240,8 +299,27 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm):
         wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
             d["phase"] == "paused" and d["heartbeat"] - paused["heartbeat"] >= 0.9
         ))
-        farm.send("resume")
+        if structured:
+            farm.send("resume", settings={"location": "prontera", "difficulty": 30, "oaths": {"tough": 3},
+                                          "wishlist": ["gungnir"], "upgrades": False, "card_fusion": False,
+                                          "star_smith": True, "storage_cleanup": True})
+        else:
+            farm.send("resume")
         resumed = farm.status("run")
+        config = json.loads((farm.profile / "farmer.cfg").read_bytes())
+        assert (config["stage"], config["danger"], config["oaths"]) == (
+            ("prontera", 30, {"tough": 3}) if structured else ("payon", 12, {}))
+        assert config["wishlist"] == (["gungnir"] if structured else [])
+        assert config["auto_upgrades"] is config["auto_sage"] is config["auto_fuse"] is (not structured)
+        assert config["auto_potential"] is config["auto_storage_prune"] is structured
+        assert config["class"] == "archer" and config["job_paths"] == {"archer": 1}
+        saved = json.loads((farm.data / "session.json").read_bytes())
+        assert saved["start"]["settings"] == {
+            "location": config["stage"], "difficulty": config["danger"], "oaths": config["oaths"],
+            "wishlist": config["wishlist"],
+            "upgrades": not structured, "card_fusion": not structured,
+            "star_smith": structured, "storage_cleanup": structured,
+        }
         wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
             d["phase"] == "run" and d["pid"] == running["pid"] and d["heartbeat_seq"] >= resumed["heartbeat_seq"] + 3
         ))

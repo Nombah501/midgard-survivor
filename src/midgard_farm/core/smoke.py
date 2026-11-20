@@ -13,9 +13,9 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from ..assets import presets_dir
+from ..assets import farmer_inputs
 from ..platform import Platform
-from . import farmer_patch
+from . import catalog, farmer_patch
 from .patch_info import INSTALLED_PACK
 
 _TIMEOUT_SECONDS = 300
@@ -28,12 +28,12 @@ _STALE = {
     "farmer.cfg", "farmer_command", "farmer_command.claimed", "farmer_stop", "farmer_status.json",
     "farmer.log", "farmer.log.prev", "farmer.run.lock", "farmer_runs.jsonl", "farmer_session.json",
     "farmer_supervisor.lock", "farmer_supervisor_session", "farmer_test_crashed",
+    catalog.FILENAME, f"{catalog.FILENAME}.tmp",
 }
 
 
 def one_run_config() -> dict[str, object]:
-    # Run at verify speed, independently of the selectable preset's speed.
-    config: dict[str, object] = json.loads((presets_dir() / "one-run.json").read_bytes())
+    config: dict[str, object] = json.loads((farmer_inputs() / "scenarios" / "one-run.json").read_bytes())
     config["speed"] = 10.0
     return config
 
@@ -183,7 +183,12 @@ def _attempt(
         # A verified headless finish can SIGKILL itself; on Windows the exit code is not meaningful.
         if os_.game_exit_status_reliable and code not in (0, -9):
             return f"game exited with code {code}"
-        return judge_one_run(os_, sandbox, log_path)
+        reason = judge_one_run(os_, sandbox, log_path)
+        if reason:
+            return reason
+        if stop_requested():
+            raise _SmokeStopped
+        return "" if catalog.publish(os_, sandbox, app_dir) else f"missing or invalid {catalog.FILENAME}"
     finally:
         # TemporaryDirectory can chmod files on cleanup; a linked pack must never be chmodded.
         shutil.rmtree(data_home)

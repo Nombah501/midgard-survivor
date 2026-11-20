@@ -4,13 +4,13 @@
 
 **Blocked by:** 03.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The oath facts are checked against the current patch and any difference is recorded in the spec's Further Notes before building on them.
-- [ ] The oath panel is enabled only at fixed difficulty 30, shows the points total and is remembered; covered by GUI tests.
-- [ ] Start and Resume carry oath ranks into `farmer.cfg`; malformed ranks are rejected; covered by tests.
-- [ ] A verify scenario at difficulty 30 shows the chosen oath points on the run in status and journal, and the profile's own oath set unchanged.
-- [ ] Invalid oath choices end the session as a failure naming the field.
-- [ ] Static checks and the pytest suite pass.
+- [x] The oath facts are checked against the current patch and any difference is recorded in the spec's Further Notes before building on them.
+- [x] The oath panel is enabled only at fixed difficulty 30, shows the points total and is remembered; covered by GUI tests.
+- [x] Start and Resume carry oath ranks into `farmer.cfg`; malformed ranks are rejected; covered by tests.
+- [x] A verify scenario at difficulty 30 shows the chosen oath points on the run in status and journal, and the profile's own oath set unchanged.
+- [x] Invalid oath choices end the session as a failure naming the field.
+- [x] Static checks and the pytest suite pass.
 
 Spec: [`../spec.md`](../spec.md).

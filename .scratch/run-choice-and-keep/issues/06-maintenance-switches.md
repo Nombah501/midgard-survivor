@@ -4,11 +4,11 @@
 
 **Blocked by:** 01, 03.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The four switches are on the AFK screen, editable only when Start or Resume is possible, and remembered; covered by GUI tests.
-- [ ] Start and Resume carry the switches; the service writes them into `farmer.cfg`; the preset never contributes them; a preset containing a switch key is refused naming the key.
-- [ ] Each switchable maintenance action follows its switch; Star Smith never touches a worn item.
-- [ ] Static checks and the pytest suite pass.
+- [x] The four switches are on the AFK screen, editable only when Start or Resume is possible, and remembered; covered by GUI tests.
+- [x] Start and Resume carry the switches; the service writes them into `farmer.cfg`; the preset never contributes them; a preset containing a switch key is refused naming the key.
+- [x] Each switchable maintenance action follows its switch; Star Smith never touches a worn item.
+- [x] Static checks and the pytest suite pass.
 
 Spec: [`../spec.md`](../spec.md).

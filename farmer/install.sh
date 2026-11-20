@@ -86,7 +86,7 @@ INSTALLED_SHA="$(sha256sum "$PATCHES/patch_farmer.pck" | cut -d' ' -f1)"
 echo "Installed $PATCHES/patch_farmer.pck"
 echo "  official: $PATCH_FILE"
 echo "  backup:   $BACKUP"
-echo "  next:     ./run.sh presets/one-run.json"
+echo "  next:     ./run.sh scenarios/one-run.json"
 }
 
 main "$@"

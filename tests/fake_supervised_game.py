@@ -127,7 +127,7 @@ if kind == "commands":
             os._exit(0)
         if command == "pause":
             phase = "paused"
-        elif command == "resume":
+        elif command in ("resume", "resume_settings"):
             phase = "run"
         if deadline is not None and time.monotonic() >= deadline:
             status("done", "fixture_deadline")

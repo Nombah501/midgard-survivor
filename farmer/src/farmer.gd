@@ -13,6 +13,7 @@ const API_VERSION := 3
 
 const CFG_PATH := "user://farmer.cfg"
 const STATUS_PATH := "user://farmer_status.json"
+const CATALOG_PATH := "user://farmer_catalog.json"
 const ARMS_PATH := "user://farmer_arms.json"
 const RUNS_PATH := "user://farmer_runs.jsonl"
 const CHECKPOINT_PATH := "user://farmer_session.json"
@@ -65,6 +66,7 @@ var total_materials: Dictionary = {}
 var active_class := ""
 var active_stage := ""
 var active_danger := 1
+var active_oath_points := 0
 var next_arm_hint := ""
 
 var run_state: Dictionary = {}
@@ -84,6 +86,13 @@ var _finish_after_run := ""
 var _pause_requested := false
 var _hard_finished := false
 var _test_wait_at_keep := false
+var _catalog_written := false
+var _test_preparation: Dictionary = {}
+var _test_catalog: Dictionary = {}
+var _test_oaths: Dictionary = {}
+var _test_wishlist_ids: Array[String] = []
+var _test_wishlist_runs: Array = []
+var _test_verify_wishlist := false
 var _test_freeze_run_time := false
 
 var _potential_script = null
@@ -113,6 +122,7 @@ func _ready() -> void:
 		session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
 	_test_wait_at_keep = _test_env("WAIT_AT_KEEP") == "1"
 	_test_freeze_run_time = _test_env("FREEZE_RUN_TIME") == "1"
+	_test_verify_wishlist = _test_env("WISHLIST") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
 	_mark_transition("boot")
@@ -190,6 +200,17 @@ func _discover_world() -> void:
 
 
 func _on_world_ready() -> void:
+	if not _catalog_written:
+		if not _write_catalog():
+			_fail_session("catalog_write_failed")
+			return
+		_catalog_written = true
+		if _test_env("CATALOG") == "1":
+			_test_catalog = _catalog_evidence()
+		if not _validate_run_choice():
+			return
+		if _test_env("OATHS") == "1":
+			_test_oaths["before"] = Save._read(Save.PATH).get("oaths")
 	_apply_autopilot()
 	_replace_player_input()
 	Save.set_setting("onboarded", true)
@@ -253,6 +274,11 @@ func _prepare_run() -> void:
 	if active_class == "" or active_stage == "":
 		_finish("no_target")
 		return
+	if _test_env("PREPARATION") == "1":
+		# Set up unspent points in the sandbox by earning XP, not by editing allocated stats.
+		if Save.free_points(active_class) <= 0:
+			Save.add_class_xp(active_class, Save.class_climb_xp(active_class))
+		_test_preparation["before"] = _preparation_snapshot(Save.data)
 	_apply_build_settings(active_class)
 	var run_id := "%s-r%d" % [session_id, runs_started + 1]
 	run_state = _snapshot_run_state()
@@ -287,11 +313,10 @@ func _prepare_run() -> void:
 	world.speed = clampi(int(cfg.get("game_speed", 3)), 1, 3)
 	Save.set_setting("onboarded", true)
 	Save.set_setting("endless_auto_pick", false)
-	var job_paths := {}
-	if GameData.CLASSES.has(active_class):
-		job_paths[active_class] = _job_path(active_class)
-	Save.set_meta("farmer_job_paths", job_paths)
+	# The game consumes even an empty override; never inherit the saved set.
+	world.oaths_next = cfg["oaths"] if active_danger == GameData.DANGER_MAX else {}
 	world.start_run(active_class)
+	active_oath_points = int(world.oath_points())
 	_replace_player_input()
 	_apply_autopilot()
 	Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
@@ -433,6 +458,8 @@ func _end_run_safe(victory: bool) -> void:
 	if not world.running:
 		return
 	run_state["victory"] = victory
+	if _test_verify_wishlist:
+		_test_seed_wishlist_offer()
 	world._end_run(victory)
 	_set_autopilot_flags(false)
 
@@ -609,6 +636,19 @@ func _check_command(now: int) -> void:
 			elif phase == "settle" and str(menus._mode) == "end":
 				_check_settle()
 			_finish("abort")
+		"resume_settings":
+			# The service publishes the new cfg before releasing the pause.
+			if phase != "paused":
+				return
+			if not _load_cfg():
+				_fail_session("cfg_invalid")
+				return
+			if not _validate_run_choice():
+				return
+			_pause_requested = false
+			phase = "idle"
+			_mark_transition("resume")
+			_write_status()
 		"pause", "resume":
 			_pause_requested = command == "pause"
 			if phase == "idle" or phase == "paused":
@@ -1009,40 +1049,49 @@ func _do_keep() -> void:
 			offer = (world.menus._keep_offer as Array).duplicate()
 	var victory := bool(run_state.get("victory", false))
 	var free := victory or int(world.run_ymir) > 0
-	var slots := int(GameData.KEEP_WIN) if free else (1 if bool(cfg.get("keep_on_defeat", false)) else 0)
+	var slots := int(GameData.KEEP_WIN) if free else 1
 	var kept: Array = []
-	if bool(cfg.get("auto_keep", false)) and slots > 0 and not offer.is_empty():
-		var sorted: Array = []
+	var skipped: Array = []
+	var wishlist: Array = cfg["wishlist"]
+	var wishlist_evidence := {}
+	if _test_verify_wishlist:
+		wishlist_evidence = _test_wishlist_evidence(offer, free)
+	if not wishlist.is_empty() and not offer.is_empty():
+		var owned := {}
+		for item in Save.storage():
+			owned[str(item.id)] = true
 		for it in offer:
-			if it is Dictionary and not bool(it.get("_kept", false)):
-				sorted.append(it)
-		sorted.sort_custom(func(a, b): return _keep_value(a) > _keep_value(b))
-		var n := 0
-		for it in sorted:
-			if n >= slots:
-				break
-			if not _keep_ok(it):
+			if not (it is Dictionary) or bool(it.get("_kept", false)):
 				continue
+			var id := str(it.get("id", ""))
+			if not wishlist.has(id):
+				continue
+			var reason := ""
 			var cost := 0
-			if not free:
+			if owned.has(id):
+				reason = "already_owned"
+			elif not _keep_ok(it):
+				reason = "not_keepable"
+			elif kept.size() >= slots:
+				reason = "no_keep_slots"
+			elif not free:
 				cost = int(world.menus._keep_cost(it))
-				if cost > 0:
-					var max_cost := int(float(Save.zeny()) * float(cfg.get("keep_max_pct", 0.05)))
-					if Save.zeny() < cost or cost > max_cost:
-						continue
-			if Save.storage().size() >= Save.storage_cap():
-				if not _make_room(_keep_value(it)):
-					_log("KEEP_SKIP_FULL %s" % str(it.get("id", "")))
-					continue
-			if cost > 0 and not Save.spend(cost):
+				if cost > int(float(Save.zeny()) * float(cfg["keep_max_pct"])):
+					reason = "over_zeny_limit"
+			if reason.is_empty() and Save.storage().size() >= Save.storage_cap() and not _make_room():
+				reason = "storage_full"
+			if reason.is_empty() and cost > 0 and not Save.spend(cost):
+				reason = "not_enough_zeny"
+			if reason.is_empty() and not _append_storage(it):
+				reason = "storage_full"
+			if not reason.is_empty():
+				skipped.append({"id": id, "reason": reason})
+				_log("KEEP_SKIP %s reason=%s" % [id, reason])
 				continue
-			if _append_storage(it):
-				it["_kept"] = true
-				kept.append(str(it.get("id", "")))
-				n += 1
-				_log("KEEP %s %s val=%.0f pot=%s trait=%s" % [
-					str(it.get("id", "")), "free" if cost == 0 else "paid:%d" % cost,
-					_keep_value(it), str(_item_has_pot(it)), str(it.get("trait", ""))])
+			it["_kept"] = true
+			owned[id] = true
+			kept.append(id)
+			_log("KEEP %s %s" % [id, "free" if cost == 0 else "paid:%d" % cost])
 	# Native-style settlement for everything that was not kept.
 	for it in offer:
 		if not (it is Dictionary):
@@ -1059,7 +1108,11 @@ func _do_keep() -> void:
 		world.menus._keep_offer = []
 		world.menus._keep_pending = false
 	Save.flush()
+	if _test_verify_wishlist:
+		wishlist_evidence["after"] = _keep_snapshot(Save._read(Save.PATH))
+		_test_wishlist_runs.append(wishlist_evidence)
 	run_state["kept"] = kept
+	run_state["keep_skipped"] = skipped
 	run_state["settled"] = _reward_snapshot()
 	_log("KEEP_DONE kept=%d offer=%d victory=%s" % [kept.size(), offer.size(), str(victory)])
 	# The profile is flushed: the run is settled. A crash from here on must
@@ -1087,32 +1140,7 @@ func _reward_snapshot() -> Dictionary:
 
 
 func _keep_ok(it: Dictionary) -> bool:
-	if Equipment.is_perm(it):
-		return false
-	if bool(it.get("lent", false)):
-		return false
-	if Equipment.is_unique(it):
-		for s in Save.storage():
-			if str((s as Dictionary).get("id", "")) == str(it.get("id", "")):
-				return false
-	return true
-
-
-func _keep_value(it: Dictionary) -> float:
-	var v := float(Equipment.score(it))
-	var pot = it.get("pot", null)
-	if pot is Dictionary and not (pot as Dictionary).is_empty():
-		v += 120.0 + float(int((pot as Dictionary).get("tier", 1))) * 25.0
-		var lines = (pot as Dictionary).get("lines", [])
-		if lines is Array:
-			v += float((lines as Array).size()) * 6.0
-	if str(it.get("trait", "")) != "":
-		v += 25.0
-	if Equipment.is_unique(it):
-		v += 200.0
-	elif Equipment.is_legendary(it):
-		v += 90.0
-	return v
+	return Equipment.is_legendary(it) and not Equipment.is_perm(it) and not bool(it.get("lent", false))
 
 
 func _item_has_pot(it: Dictionary) -> bool:
@@ -1168,7 +1196,7 @@ func _clean_pot(p) -> Dictionary:
 	return {"tier": clampi(int((p as Dictionary).get("tier", 1)), 1, 3), "lines": out}
 
 
-func _make_room(need_value: float) -> bool:
+func _make_room() -> bool:
 	var victim := ""
 	var victim_score := 1.0e30
 	for it in Save.storage():
@@ -1189,8 +1217,6 @@ func _make_room(need_value: float) -> bool:
 			victim = uid
 	if victim == "":
 		return false
-	if need_value <= victim_score * float(cfg.get("swap_margin", 1.25)):
-		return false
 	Save.remove_from_storage(victim)
 	_log("STORAGE_SWAP removed=%s score=%.0f" % [victim, victim_score])
 	return true
@@ -1205,24 +1231,13 @@ func _do_maintenance() -> void:
 	last_maint = {}
 	if world == null or not is_instance_valid(world):
 		return
-	var cid := active_class
 	_claim_achievements()
 	if bool(cfg.get("auto_upgrades", true)):
 		_buy_upgrades()
 	if bool(cfg.get("auto_sage", true)):
 		_buy_sage()
-	if bool(cfg.get("auto_rebirth", false)):
-		_do_rebirth(cid)
-	if bool(cfg.get("auto_stats", true)):
-		_auto_stats(cid)
 	if bool(cfg.get("auto_fuse", true)):
 		_auto_fuse()
-	if bool(cfg.get("auto_cards", true)):
-		_auto_album()
-	if bool(cfg.get("auto_loadout", true)):
-		_auto_loadout(cid)
-	if bool(cfg.get("auto_pet", true)):
-		_auto_pet()
 	if bool(cfg.get("auto_potential", false)):
 		_auto_potential()
 	if bool(cfg.get("auto_storage_prune", false)):
@@ -1319,55 +1334,6 @@ func _buy_sage() -> void:
 		_log("SAGE " + str(bought))
 
 
-func _do_rebirth(cid: String) -> void:
-	if cid == "":
-		return
-	if Save.can_rebirth(cid):
-		if Save.rebirth(cid):
-			last_maint["rebirth"] = cid
-			_log("REBIRTH %s ymir=%d" % [cid, Save.ymir_fragments()])
-	if bool(cfg.get("auto_rebirth_lv", false)) and Save.rebirth_lv_ready(cid):
-		if Save.take_rebirth_lv(cid):
-			last_maint["rebirth_lv"] = cid
-			_log("REBIRTH_LV %s rlv=%d" % [cid, Save.rebirth_lv(cid)])
-
-
-func _auto_stats(cid: String) -> void:
-	if cid == "" or not GameData.CLASSES.has(cid):
-		return
-	var free := int(Save.free_points(cid))
-	if free <= 0:
-		return
-	var stats: Dictionary = Save.class_stats(cid).duplicate()
-	var order := _stat_order(cid)
-	for i in free:
-		var st := str(order[i % order.size()]) if not order.is_empty() else "vit"
-		stats[st] = int(stats.get(st, 0)) + 1
-	Save.set_class_stats(cid, stats)
-	last_maint["stats_%s" % cid] = free
-	_log("STATS %s +%d %s" % [cid, free, str(order)])
-
-
-func _stat_order(cid: String) -> Array:
-	var b: Dictionary = _build_for(cid)
-	var out: Array = []
-	var raw = b.get("stats", [])
-	if raw is Array:
-		for s in raw:
-			var sid := str(s)
-			if GameData.STATS.has(sid) and not out.has(sid):
-				out.append(sid)
-	if out.is_empty():
-		var base: Dictionary = GameData.CLASSES.get(cid, {}).get("stats", {})
-		var keys: Array = base.keys()
-		keys.sort_custom(func(a, b2): return int(base[a]) > int(base[b2]))
-		for k in keys:
-			out.append(str(k))
-		if not out.has("vit"):
-			out.append("vit")
-	return out
-
-
 func _auto_fuse() -> void:
 	var keep: Dictionary = cfg.get("fuse_keep", {})
 	var fused := 0
@@ -1388,167 +1354,6 @@ func _auto_fuse() -> void:
 		_log("FUSE +%d" % fused)
 
 
-func _auto_album() -> void:
-	var slots := int(GameData.card_slots())
-	if slots <= 0:
-		return
-	var weights := _card_weights()
-	var owned: Array = []
-	var ids: Array = Save.data.get("cards", {}).keys()
-	for id in ids:
-		var cid := str(id)
-		if GameData.CARDS.has(cid) and Save.has_card(cid):
-			owned.append(cid)
-	var et: Dictionary = Save.data.get("eternal", {})
-	for id in et.keys():
-		var cid := str(id)
-		if GameData.CARDS.has(cid) and not owned.has(cid):
-			owned.append(cid)
-	owned.sort_custom(func(a, b): return _card_score(a, weights) > _card_score(b, weights))
-	var chosen: Array = owned.slice(0, slots)
-	if chosen == Save.equipped_cards():
-		return
-	Save.set_equipped_cards(chosen)
-	last_maint["album"] = chosen.size()
-	_log("ALBUM " + str(chosen))
-
-
-func _card_score(id: String, weights: Dictionary) -> float:
-	var d: Dictionary = GameData.CARDS.get(id, {})
-	if d.is_empty():
-		return 0.0
-	var score := 0.0
-	var mods: Dictionary = d.get("mods", {})
-	for k in mods:
-		score += absf(float(mods[k])) * float(weights.get(str(k), weights.get("_default", 1.0))) * 100.0
-	var fx: Dictionary = d.get("effects", {})
-	for k in fx:
-		score += absf(float(fx[k])) * float(weights.get(str(k), weights.get("_default", 1.0))) * 100.0
-	if d.has("proc") or d.has("proc_hit"):
-		score += float(weights.get("proc", 10.0)) * 50.0
-	return score
-
-
-func _card_weights() -> Dictionary:
-	var w := {
-		"loot": 3.0, "zeny": 3.0, "card": 2.0, "drop_find": 2.5, "xp": 1.0,
-		"dmg": 2.0, "skill_dmg": 1.6, "basic_dmg": 1.4, "proc_dmg": 1.2,
-		"crit": 1.0, "crit_dmg": 0.9, "aspd": 0.9, "move": 0.6,
-		"max_hp_pct": 0.9, "armor": 0.4, "haste": 0.8, "duration": 0.5,
-		"area": 0.5, "count": 1.5, "heal_power": 0.5, "regen": 0.5,
-		"proc": 1.2, "_default": 1.0,
-	}
-	var obj := str(cfg.get("objective", "balanced"))
-	match obj:
-		"zeny":
-			w["loot"] = 6.0
-			w["zeny"] = 6.0
-			w["drop_find"] = 3.0
-			w["card"] = 2.0
-			w["dmg"] = 1.5
-		"ores":
-			w["drop_find"] = 6.0
-			w["loot"] = 2.0
-			w["dmg"] = 2.0
-		"crumbs":
-			w["drop_find"] = 3.0
-			w["dmg"] = 3.5
-			w["skill_dmg"] = 3.0
-			w["crit_dmg"] = 2.5
-			w["card"] = 2.0
-		"xp":
-			w["xp"] = 6.0
-			w["dmg"] = 2.5
-			w["skill_dmg"] = 2.0
-		"cards", "pets":
-			w["card"] = 6.0
-			w["drop_find"] = 4.0
-			w["loot"] = 2.0
-			w["dmg"] = 2.0
-		"progress":
-			w["dmg"] = 4.0
-			w["skill_dmg"] = 3.0
-			w["max_hp_pct"] = 2.5
-			w["armor"] = 2.0
-	return w
-
-
-func _auto_loadout(cid: String) -> void:
-	if cid == "" or not GameData.CLASSES.has(cid):
-		return
-	if world.menus == null or not is_instance_valid(world.menus):
-		return
-	var changes := _loadout_for(cid)
-	if changes > 0:
-		last_maint["loadout"] = changes
-		_log("LOADOUT changes=%d" % changes)
-
-
-func _loadout_for(cid: String) -> int:
-	var cap := int(Save.loadout_cap())
-	var lo: Dictionary = Save.loadout(cid)
-	var pieces := 0
-	for k in lo.keys():
-		if not (k in GameData.LOADOUT_FREE_SLOTS):
-			pieces += 1
-	var candidates: Array = []
-	for it in Save.storage():
-		if not (it is Dictionary) or (it as Dictionary).is_empty():
-			continue
-		var uid := str((it as Dictionary).get("uid", ""))
-		if uid == "":
-			continue
-		var owner := str(Save.loadout_owner(uid))
-		if owner != "" and owner != cid:
-			continue
-		candidates.append(it)
-	candidates.sort_custom(func(a, b): return _item_value(a) > _item_value(b))
-	var changes := 0
-	for it in candidates:
-		if changes >= 12:
-			break
-		var uid := str((it as Dictionary).get("uid", ""))
-		var key := _loadout_key(it, lo)
-		if key == "":
-			continue
-		var cur := str(lo.get(key, ""))
-		if cur == uid:
-			continue
-		if cur != "":
-			var old := Save.storage_item(cur)
-			if not old.is_empty() and _item_value(old) >= _item_value(it):
-				continue
-		elif not (key in GameData.LOADOUT_FREE_SLOTS) and not lo.has(key):
-			if pieces >= cap:
-				continue
-		var why := str(Menus._loadout_block(cid, it, key, lo))
-		if why != "":
-			continue
-		if key == "weapon" and Equipment.two_hands(it) and lo.has("shield"):
-			Save.set_loadout_slot(cid, "shield", "")
-			lo.erase("shield")
-			pieces = maxi(0, pieces - 1)
-		Save.set_loadout_slot(cid, key, uid)
-		if not (key in GameData.LOADOUT_FREE_SLOTS) and cur == "":
-			pieces += 1
-		changes += 1
-	return changes
-
-
-func _loadout_key(it: Dictionary, lo: Dictionary) -> String:
-	var d: Dictionary = Equipment.item_def(it)
-	var slot := str(d.get("slot", ""))
-	if slot == "":
-		return ""
-	if slot == "acc":
-		if not lo.has("acc1"):
-			return "acc1"
-		if not lo.has("acc2"):
-			return "acc2"
-		return "acc1"
-	return slot
-
-
 func _item_value(it: Dictionary) -> float:
 	var v := float(Equipment.score(it))
 	var pot = it.get("pot", null)
@@ -1562,57 +1367,11 @@ func _item_value(it: Dictionary) -> float:
 	return v
 
 
-func _auto_pet() -> void:
-	var prio: Array = cfg.get("pet_priority", [])
-	var owned: Array = []
-	var pets: Dictionary = Save.data.get("pets", {})
-	for id in pets.keys():
-		var pid := str(id)
-		if bool(pets[id]) and GameData.PETS.has(pid):
-			owned.append(pid)
-	if owned.is_empty():
-		return
-	var chosen := ""
-	if not prio.is_empty():
-		for id in prio:
-			if owned.has(str(id)):
-				chosen = str(id)
-				break
-	if chosen == "":
-		var weights := _card_weights()
-		var best := -1.0
-		for id in owned:
-			var sc := _pet_score(str(id), weights)
-			if sc > best:
-				best = sc
-				chosen = str(id)
-	if chosen != "" and Save.active_pet() != chosen:
-		Save.set_active_pet(chosen)
-		last_maint["pet"] = chosen
-		_log("PET %s" % chosen)
-
-
-func _pet_score(id: String, weights: Dictionary) -> float:
-	var d: Dictionary = GameData.PETS.get(id, {})
-	if d.is_empty():
-		return 0.0
-	var score := 0.0
-	var mods: Dictionary = d.get("mods", {})
-	for k in mods:
-		score += absf(float(mods[k])) * float(weights.get(str(k), weights.get("_default", 1.0))) * 100.0
-	var fx: Dictionary = d.get("effects", {})
-	for k in fx:
-		score += absf(float(fx[k])) * float(weights.get(str(k), weights.get("_default", 1.0))) * 100.0
-	if d.get("skill", {}) is Dictionary and not (d.get("skill", {}) as Dictionary).is_empty():
-		score += 50.0
-	return score
-
-
 func _auto_potential() -> void:
 	if _potential_script == null:
 		return
 	var reserve := int(cfg.get("potential_reserve", 0))
-	var max_rolls := int(cfg.get("potential_max_rolls", 0))
+	var max_rolls := int(cfg["potential_max_rolls"])
 	if max_rolls <= 0:
 		return
 	var rolls := 0
@@ -1622,6 +1381,9 @@ func _auto_potential() -> void:
 			continue
 		var d: Dictionary = Equipment.item_def(it)
 		if not d.has("refine") or d.get("fixed", false) or d.get("unique", false):
+			continue
+		var uid := str(it.get("uid", ""))
+		if uid == "" or Save.loadout_owner(uid) != "":
 			continue
 		candidates.append(it)
 	candidates.sort_custom(func(a, b): return _item_value(a) > _item_value(b))
@@ -1699,26 +1461,64 @@ func _auto_prune() -> void:
 # Target / arm selection
 # ---------------------------------------------------------------------------
 
+func _validate_run_choice() -> bool:
+	var location = cfg.get("stage")
+	if not (location is String):
+		_fail_session("invalid_location", true, "Location must be a location id or Automatic.")
+		return false
+	var stage := str(location)
+	if stage != "" and not _stage_ok(stage):
+		var problem := "is locked or unavailable" if GameData.STAGES.has(stage) else "is unknown"
+		_fail_session("invalid_location", true, "Location '%s' %s." % [stage, problem])
+		return false
+	var difficulty = cfg.get("danger")
+	var fixed_difficulty := difficulty is int or difficulty is float
+	if fixed_difficulty:
+		if stage == "":
+			stage = _fallback_stage()
+		var lo := _stage_min_danger(stage)
+		var hi := _stage_max_danger(stage)
+		if float(difficulty) != floorf(float(difficulty)) or difficulty < lo or difficulty > hi:
+			_fail_session("invalid_difficulty", true,
+				"Difficulty %s is outside the allowed integer range %d–%d for location '%s'." % [difficulty, lo, hi, stage])
+			return false
+	elif not (difficulty is String) or difficulty not in ["auto", "max", "best", "stage"]:
+		_fail_session("invalid_difficulty", true, "Difficulty must be an integer or Automatic.")
+		return false
+	var oaths = cfg["oaths"]
+	if not (oaths is Dictionary):
+		_fail_session("invalid_oath", true, "Oaths must map oath ids to ranks.")
+		return false
+	if not oaths.is_empty() and (not fixed_difficulty or int(difficulty) != GameData.DANGER_MAX):
+		_fail_session("invalid_oath", true, "Oaths require fixed difficulty %d." % GameData.DANGER_MAX)
+		return false
+	for id in oaths:
+		var oath := GameData.oath_def(str(id))
+		if oath.is_empty():
+			_fail_session("invalid_oath", true, "Unknown oath '%s'." % id)
+			return false
+		var rank = oaths[id]
+		if not (rank is int or rank is float) or rank < 1 or rank > oath.pts.size() or rank != floorf(float(rank)):
+			_fail_session("invalid_oath", true, "Oath '%s' has no rank %s." % [id, str(rank)])
+			return false
+	return true
+
+
 func _choose_target() -> Dictionary:
-	var stage := ""
+	var stage := str(cfg.get("stage", ""))
 	var danger := 0
 	var raw = cfg.get("danger", "auto")
 	var obj := str(cfg.get("objective", "balanced"))
-	if str(cfg.get("stage", "")) != "":
-		stage = str(cfg.get("stage", ""))
-		if not _stage_ok(stage):
-			_log("STAGE_LOCKED %s" % stage)
+	var fixed_difficulty := raw is int or raw is float
+	if stage != "" or fixed_difficulty or obj == "progress" or str(raw) in ["max", "best", "stage"]:
+		if stage == "":
+			stage = _fallback_stage()
+		if stage == "":
 			return {}
-	if stage != "":
-		danger = _danger_for(stage)
-		if obj == "progress":
-			danger = _stage_max_danger(stage)
-	elif obj == "progress":
-		stage = _fallback_stage()
-		danger = _stage_max_danger(stage)
-	elif (raw is int or raw is float) or str(raw) in ["max", "best", "stage"]:
-		stage = _fallback_stage()
-		danger = _danger_for(stage)
+		if fixed_difficulty:
+			danger = int(raw)
+		else:
+			danger = _stage_max_danger(stage) if obj == "progress" else _danger_for(stage)
 	else:
 		var arm := _pick_arm()
 		if not arm.is_empty():
@@ -1727,16 +1527,18 @@ func _choose_target() -> Dictionary:
 		else:
 			stage = _fallback_stage()
 			danger = _danger_for(stage)
-	if stage == "" or not _stage_ok(stage):
-		stage = _fallback_stage()
-		danger = _danger_for(stage)
-	if stage == "":
-		return {}
-	var cid := _choose_class()
+		if stage == "" or not _stage_ok(stage):
+			stage = _fallback_stage()
+			if stage == "":
+				return {}
+			danger = _danger_for(stage)
+	var cid := active_class if active_class != "" else _choose_class()
 	if cid == "":
 		_log("TARGET_FAIL class")
 		return {}
-	danger = clampi(danger, _stage_min_danger(stage), mini(_stage_max_danger(stage), int(cfg.get("danger_ceiling", 30))))
+	if not fixed_difficulty:
+		var lo := _stage_min_danger(stage)
+		danger = clampi(danger, lo, maxi(lo, mini(_stage_max_danger(stage), int(cfg.get("danger_ceiling", 30)))))
 	_log("TARGET stage=%s danger=%d class=%s" % [stage, danger, cid])
 	return {"stage": stage, "danger": danger, "class": cid}
 
@@ -1850,10 +1652,8 @@ func _stage_max_danger(sid: String) -> int:
 
 func _danger_for(sid: String) -> int:
 	var lo := _stage_min_danger(sid)
-	var hi := mini(_stage_max_danger(sid), int(cfg.get("danger_ceiling", 30)))
+	var hi := maxi(lo, mini(_stage_max_danger(sid), int(cfg.get("danger_ceiling", 30))))
 	var raw = cfg.get("danger", "auto")
-	if raw is int or raw is float:
-		return clampi(int(raw), lo, hi)
 	var s := str(raw)
 	if s == "best":
 		var d := int(Save.danger_best(sid))
@@ -1894,29 +1694,17 @@ func _choose_class() -> String:
 			return fixed
 		_log("CLASS_LOCKED %s" % fixed)
 		return ""
-	var list: Array = cfg.get("classes", [])
-	var cands: Array = []
-	for c in list:
-		var cid := str(c)
-		if _class_ok(cid):
-			cands.append(cid)
-	if cands.is_empty():
-		for id in GameData.CLASSES:
-			var cid := str(id)
-			if _class_ok(cid):
-				cands.append(cid)
-	if cands.is_empty():
-		return "swordsman"
-	if bool(cfg.get("class_rotate", false)) and not cands.is_empty():
-		return str(cands[runs_started % cands.size()])
-	var best := str(cands[0])
+	var best := "swordsman"
 	var best_score := -1.0
-	for c in cands:
-		var prog: Dictionary = Save.class_progress(str(c))
+	for id in GameData.CLASSES:
+		var cid := str(id)
+		if not _class_ok(cid):
+			continue
+		var prog: Dictionary = Save.class_progress(cid)
 		var score := float(int(prog.get("level", 1))) + 100.0 * float(int(prog.get("rlv", 0)))
 		if score > best_score:
 			best_score = score
-			best = str(c)
+			best = cid
 	return best
 
 
@@ -2034,11 +1822,6 @@ func _goal_done() -> bool:
 # ---------------------------------------------------------------------------
 
 func _build_for(cid: String) -> Dictionary:
-	var builds = cfg.get("builds", {})
-	if builds is Dictionary and builds.get(cid) is Dictionary:
-		return builds[cid]
-	# The game stores the player's level-up order in Save; use it unless the
-	# config explicitly provides a build. This keeps a customized SinX build.
 	var orders = Save.setting("pick_order", {})
 	if orders is Dictionary:
 		var raw_order = orders.get(cid, [])
@@ -2056,6 +1839,9 @@ func _build_for(cid: String) -> Dictionary:
 			if limits is Dictionary and limits.get(cid) is Dictionary:
 				pcaps = (limits[cid] as Dictionary).duplicate()
 			return {"skills": pskills, "stats": pstats, "caps": pcaps}
+	var builds = cfg.get("builds", {})
+	if builds is Dictionary and builds.get(cid) is Dictionary:
+		return builds[cid]
 	var out := {"skills": [], "stats": []}
 	var d: Dictionary = GameData.CLASSES.get(cid, {})
 	if d.is_empty():
@@ -2105,7 +1891,8 @@ func _build_for(cid: String) -> Dictionary:
 
 
 func _job_path(cid: String) -> int:
-	var b: Dictionary = _build_for(cid)
+	var builds: Dictionary = cfg.get("builds", {})
+	var b: Dictionary = builds.get(cid) if builds.get(cid) is Dictionary else {}
 	if b.has("job_path"):
 		return clampi(int(b["job_path"]), 0, maxi(0, GameData.job_paths(cid).size() - 1))
 	var paths = cfg.get("job_paths", {})
@@ -2115,28 +1902,12 @@ func _job_path(cid: String) -> int:
 
 
 func _apply_build_settings(cid: String) -> void:
-	var b: Dictionary = _build_for(cid)
-	var orders: Dictionary = Save.setting("pick_order", {})
-	if not (orders is Dictionary):
-		orders = {}
-	var existing = orders.get(cid, [])
-	if existing is Array and not existing.is_empty() and not bool(cfg.get("override_pick_order", false)):
-		var limits = Save.setting("pick_limits", {})
-		var mine = limits.get(cid, {}) if limits is Dictionary else {}
-		_log("PROFILE_BUILD class=%s order=%s limits=%s" % [cid, str(existing), str(mine)])
-		return
-	var order: Array = b.get("pick_order", [])
-	if order.is_empty():
-		order = (b.get("skills", []) as Array) + (b.get("stats", []) as Array)
-	orders[cid] = order
-	Save.set_setting("pick_order", orders)
-	var limits: Dictionary = b.get("caps", {})
-	if not limits.is_empty():
-		var all: Dictionary = Save.setting("pick_limits", {})
-		if not (all is Dictionary):
-			all = {}
-		all[cid] = limits
-		Save.set_setting("pick_limits", all)
+	var orders = Save.setting("pick_order", {})
+	var order = orders.get(cid, []) if orders is Dictionary else []
+	var limits = Save.setting("pick_limits", {})
+	var caps = limits.get(cid, {}) if limits is Dictionary else {}
+	_log("PROFILE_BUILD class=%s order=%s limits=%s" % [cid, str(order), str(caps)])
+	Save.set_meta("farmer_job_paths", {cid: _job_path(cid)})
 
 
 # ---------------------------------------------------------------------------
@@ -2256,7 +2027,7 @@ func _write_checkpoint(stage: String, pending: Dictionary = {}) -> bool:
 		"started_unix": session_started_unix,
 		"phase": stage,
 		"run_id": str(run_state.get("run_id", "")),
-		"target": {"stage": active_stage, "danger": active_danger, "class": active_class},
+		"target": {"stage": active_stage, "danger": active_danger, "class": active_class, "oath_points": active_oath_points},
 		"totals": _totals(),
 		"pre_run": run_state,
 		"result": pending,
@@ -2305,6 +2076,7 @@ func _restore_checkpoint() -> bool:
 	var target: Dictionary = cp["target"]
 	active_stage = str(target.get("stage", ""))
 	active_danger = int(target.get("danger", 1))
+	active_oath_points = int(target.get("oath_points", 0))
 	active_class = str(target.get("class", ""))
 	var run_id := str(cp.get("run_id", ""))
 	match str(cp.get("phase", "")):
@@ -2344,6 +2116,90 @@ func _test_env(name: String) -> String:
 	if not session_id.begins_with("verify-"):
 		return ""
 	return OS.get_environment("FARMER_TEST_" + name)
+
+
+func _test_seed_wishlist_offer() -> void:
+	# Avoid random drops; the game's own end screen still builds the keep offer.
+	if _test_wishlist_ids.is_empty():
+		var owned: Array = Save.storage().map(func(it): return str(it.id))
+		var regular: Array[String] = []
+		var unique := ""
+		for id in GameData.ITEMS:
+			var item := Equipment.make(id, 0)
+			if not Equipment.is_legendary(item) or Equipment.is_perm(item):
+				continue
+			if Equipment.is_unique(item):
+				if unique.is_empty() and not owned.has(id):
+					unique = id
+			elif not owned.has(id):
+				regular.append(id)
+			if regular.size() >= 2 and not unique.is_empty():
+				break
+		if regular.size() < 2 or unique.is_empty():
+			return
+		_test_wishlist_ids.assign([unique, regular[0], regular[1]])
+		cfg["wishlist"] = [unique, regular[0]]
+		# Keep the native minimum price from making both offers unaffordable.
+		Save.add_zeny(maxi(0, 100000 - int(Save.zeny())))
+	for id in _test_wishlist_ids:
+		world.player.equipment.bag.append(Equipment.make(id, 0))
+
+
+func _test_wishlist_evidence(offer: Array, free: bool) -> Dictionary:
+	var items: Array = []
+	for item in offer:
+		var coins := int(Equipment.legend_coins(item))
+		items.append({
+			"id": str(item.id), "legend_coins": coins,
+			"cost": 0 if free else int(world.menus._keep_cost(item)),
+			"sell_zeny": int(Equipment.sell_price(item)) if coins == 0 and item.get("_worn", false) else 0,
+		})
+	return {
+		"fixture_ids": _test_wishlist_ids, "offer": items, "free": free,
+		"wishlist": cfg["wishlist"], "before": _keep_snapshot(Save.data),
+	}
+
+
+func _keep_snapshot(profile: Dictionary) -> Dictionary:
+	var storage: Array = profile.get("storage", [])
+	var materials: Dictionary = profile.get("materials", {})
+	return {
+		"stored_ids": storage.map(func(item): return str(item.id)),
+		"legend_coins": int(materials.get("legend_coin", 0)), "zeny": int(profile.get("zeny", 0)),
+	}
+
+
+# Only the sandbox verifier captures these fields; ordinary status stays unchanged.
+func _preparation_snapshot(profile: Dictionary) -> Dictionary:
+	if profile.is_empty():
+		return {}
+	var loadouts := {}
+	var worn := {}
+	for cid in profile.get("loadouts", {}):
+		var loadout: Dictionary = profile["loadouts"][cid]
+		if not loadout.is_empty():
+			loadouts[cid] = loadout
+			for uid in loadout.values():
+				worn[str(uid)] = true
+	var potentials := {}
+	for item in profile.get("storage", []):
+		var uid := str(item.get("uid", ""))
+		if worn.has(uid):
+			potentials[uid] = item.get("pot")
+	var stats := {}
+	var rebirth_levels := {}
+	var progress: Dictionary = profile.get("classes", {})
+	for cid in GameData.CLASSES:
+		var entry: Dictionary = progress.get(cid, {})
+		stats[cid] = entry.get("stats", {})
+		rebirth_levels[cid] = int(entry.get("rlv", 0))
+	var settings: Dictionary = profile.get("settings", {})
+	return {
+		"loadouts": loadouts, "potentials": potentials, "pet": profile.get("pet", ""),
+		"album": profile.get("card_slots", []), "stats": stats, "free_points": Save.free_points(active_class),
+		"rebirths": profile.get("rebirths", {}), "rebirth_levels": rebirth_levels,
+		"pick_order": settings.get("pick_order", {}), "pick_limits": settings.get("pick_limits", {}),
+	}.duplicate(true)
 
 
 # One-shot per sandbox: the relaunch (or supervisor restart) passes the same point.
@@ -2387,6 +2243,7 @@ func _build_result() -> Dictionary:
 		"class": active_class,
 		"stage": active_stage,
 		"danger": active_danger,
+		"oath_points": active_oath_points,
 		"victory": bool(run_state.get("victory", false)),
 		"died": bool(run_state.get("died", false)),
 		"forced": bool(run_state.get("forced", false)),
@@ -2413,6 +2270,7 @@ func _build_result() -> Dictionary:
 		"job": str(p.job2.get("id", "")) if p != null and is_instance_valid(p) else "",
 		"max_danger": int(Save.max_danger()) if Save.has_method("max_danger") else 0,
 		"kept": run_state.get("kept", []),
+		"keep_skipped": run_state.get("keep_skipped", []),
 		"value": 0.0,
 		"rate": 0.0,
 	}
@@ -2499,9 +2357,11 @@ func _load_cfg() -> bool:
 	var out := {
 		"objective": "balanced",
 		"weights": {},
-		"class": "", "classes": [], "class_rotate": false,
+		"class": "",
 		"builds": {},
 		"stage": "", "danger": "auto", "danger_ceiling": 30,
+		"oaths": {},
+		"wishlist": [],
 		"auto_danger": true, "explore_every": 5, "danger_step": 1,
 		"featured_bonus": true,
 		"speed": 4.0, "game_speed": 3,
@@ -2509,16 +2369,13 @@ func _load_cfg() -> bool:
 		"endless": false, "endless_minutes": 4.0, "endless_mvps": 0,
 		"max_runs": 0, "max_minutes": 0.0, "stop_after_wins": 0,
 		"display": false, "offline": true, "hard_exit": true,
-		"auto_keep": false, "keep_on_defeat": false, "keep_reserve_slots": 2,
-		"keep_max_pct": 0.05, "swap_margin": 1.25,
-		"auto_stats": true, "auto_rebirth": false, "auto_rebirth_lv": false,
+		"keep_reserve_slots": 2, "keep_max_pct": 0.05,
 		"auto_achievements": true,
 		"auto_upgrades": true, "upgrade_reserve": 500000, "storage_target": 120,
 		"upgrade_priority": ["bubble_gum", "battle_manual", "greed", "blessing", "increase_agi", "yggdrasil_fruit", "fury", "gloria", "magnificat", "angelus", "hp_recovery", "telescope", "kafra_status", "kafra_summon", "kafra_area", "kafra_amount", "kafra_blow", "vultures_eye", "memorize", "card_slot", "kafra_cart", "kafra_storage"],
 		"auto_sage": true, "sage_priority": ["passive_slot", "sage_book", "sage_root", "sage_start", "fly_wing", "magnifier"],
-		"auto_cards": true, "auto_fuse": true, "fuse_keep": {},
-		"auto_loadout": true, "auto_pet": true, "pet_priority": [],
-		"auto_potential": false, "potential_reserve": 20, "potential_max_rolls": 0,
+		"auto_fuse": true, "fuse_keep": {},
+		"auto_potential": false, "potential_reserve": 20, "potential_max_rolls": 10,
 		"auto_storage_prune": false,
 		"altar_priority": ["freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "odin", "emperium"],
 		"altar_range": 12.0,
@@ -2543,10 +2400,17 @@ func _load_cfg() -> bool:
 		errors.append("weights must be an object")
 	if not (cfg.get("builds") is Dictionary):
 		errors.append("builds must be an object")
-	if not (cfg.get("classes") is Array):
-		errors.append("classes must be an array")
 	if not (cfg.get("goals") is Dictionary):
 		errors.append("goals must be an object")
+	if not (cfg["wishlist"] is Array):
+		errors.append("wishlist must be an array of item ids")
+	else:
+		var ids := {}
+		for id in cfg["wishlist"]:
+			if not (id is String) or id.strip_edges().is_empty() or ids.has(id):
+				errors.append("wishlist must be an array of distinct item ids")
+				break
+			ids[id] = true
 	if not errors.is_empty():
 		_log("CFG invalid: " + str(errors))
 		return false
@@ -2566,7 +2430,7 @@ func _load_cfg() -> bool:
 	cfg["storage_target"] = clampi(int(cfg.get("storage_target", 120)), 20, 500)
 	cfg["upgrade_reserve"] = maxi(0, int(cfg.get("upgrade_reserve", 500000)))
 	cfg["potential_reserve"] = maxi(0, int(cfg.get("potential_reserve", 20)))
-	cfg["potential_max_rolls"] = maxi(0, int(cfg.get("potential_max_rolls", 0)))
+	cfg["potential_max_rolls"] = maxi(0, int(cfg["potential_max_rolls"]))
 	return true
 
 
@@ -2607,7 +2471,7 @@ func _write_status() -> void:
 		"api": API_VERSION,
 		"build": _build_info(),
 		"objective": str(cfg.get("objective", "")),
-		"target": {"stage": active_stage, "danger": active_danger, "class": active_class},
+		"target": {"stage": active_stage, "danger": active_danger, "class": active_class, "oath_points": active_oath_points},
 		"totals": _totals(),
 		"rates": _rates(),
 		"arms": arms,
@@ -2646,6 +2510,14 @@ func _write_status() -> void:
 			"ymir": int(Save.ymir_fragments()) if Save.has_method("ymir_fragments") else 0,
 		},
 	}
+	if _test_preparation.has("after"):
+		data["preparation"] = _test_preparation
+	if not _test_catalog.is_empty():
+		data["catalog_evidence"] = _test_catalog
+	if _test_oaths.has("after"):
+		data["oath_evidence"] = _test_oaths
+	if not _test_wishlist_runs.is_empty():
+		data["wishlist_evidence"] = _test_wishlist_runs
 	_atomic_write(STATUS_PATH, JSON.stringify(data))
 
 
@@ -2664,6 +2536,67 @@ func _rates() -> Dictionary:
 	out["crumbs_h"] = float(total_materials.get("star_crumb", 0)) / wall_min * 60.0
 	out["xp_h"] = float(total_xp) / wall_min * 60.0
 	return out
+
+
+func _write_catalog() -> bool:
+	var unlocked_max := int(Save.max_danger())
+	var locations: Array = []
+	for id in GameData.STAGES:
+		if not world.is_stage_exported(id):
+			continue
+		var bounds: Vector2i = GameData.stage_danger_range(id, unlocked_max)
+		locations.append({
+			"id": id, "name": TranslationServer.translate(str(GameData.STAGES[id].name)),
+			"unlocked": bool(world.is_stage_unlocked(id)), "min_difficulty": bounds.x, "max_difficulty": bounds.y,
+		})
+	var oaths: Array = []
+	for oath in GameData.OATHS:
+		var ranks: Array = []
+		for i in (oath.pts as Array).size():
+			ranks.append({
+				"rank": i + 1, "description": TranslationServer.translate(str(oath.ranks[i])), "points": oath.pts[i],
+			})
+		oaths.append({
+			"id": oath.id, "name": TranslationServer.translate(str(oath.name)),
+			"description": TranslationServer.translate(str(oath.desc)), "ranks": ranks,
+		})
+	var legendaries: Array = []
+	for id in GameData.ITEMS:
+		var item: Dictionary = GameData.ITEMS[id]
+		if bool(item.get("legendary", false)):
+			legendaries.append({"id": id, "name": TranslationServer.translate(str(item.name))})
+	var owned: Dictionary = {}
+	for item in Save.storage():
+		owned[str(item.id)] = true
+	return _atomic_write(CATALOG_PATH, JSON.stringify({
+		"schema": 1, "written_at": Time.get_unix_time_from_system(),
+		"max_difficulty": GameData.DANGER_MAX, "unlocked_max_difficulty": unlocked_max,
+		"locations": locations, "oaths": oaths, "legendaries": legendaries, "owned_item_ids": owned.keys(),
+	}))
+
+
+func _catalog_evidence() -> Dictionary:
+	# Verify against the profile's progress and the game's own item and oath rules.
+	var locations: Dictionary = {}
+	for id in GameData.STAGES:
+		if world.is_stage_exported(id):
+			locations[id] = str(GameData.STAGES[id].get("unlock", ""))
+	var oath_points: Dictionary = {}
+	for oath in GameData.OATHS:
+		var points: Array = []
+		for rank in range(1, (oath.ranks as Array).size() + 1):
+			points.append(GameData.oath_points({oath.id: rank}))
+		oath_points[oath.id] = points
+	var legendaries: Array = []
+	for id in GameData.ITEMS:
+		if Equipment.is_legendary({"id": id}):
+			legendaries.append(id)
+	return {
+		"before_run": Time.get_unix_time_from_system(), "location_prerequisites": locations,
+		"cleared_locations": Save.data.stages.duplicate(), "oath_points": oath_points, "legendary_ids": legendaries,
+		"unlocked_max_difficulty": Save.max_danger(),
+		"stored_ids": Save.storage().map(func(item): return str(item.id)),
+	}
 
 
 func _build_info() -> Dictionary:
@@ -2742,12 +2675,12 @@ func _save_arms() -> void:
 	_atomic_write(ARMS_PATH, JSON.stringify(arms))
 
 
-func _fail_session(reason: String, allow_hard_exit := true) -> void:
+func _fail_session(reason: String, allow_hard_exit := true, detail := "") -> void:
 	if failed:
 		return
 	failed = true
 	finish_reason = reason
-	last_error = reason
+	last_error = detail if detail != "" else reason
 	phase = "failed"
 	exit_code = 1
 	_mark_transition("fail:" + reason)
@@ -2767,6 +2700,10 @@ func _finish(reason: String) -> void:
 	if not _flush_profile_verified():
 		_fail_session("flush_failed", false)
 		return
+	if _test_preparation.has("before"):
+		_test_preparation["after"] = _preparation_snapshot(Save._read(Save.PATH))
+	if _test_oaths.has("before"):
+		_test_oaths["after"] = Save._read(Save.PATH).get("oaths")
 	if reason == "abort":
 		if phase == "keep":
 			run_state["settled"] = _reward_snapshot()

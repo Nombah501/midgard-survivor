@@ -11,6 +11,21 @@ from pathlib import Path
 from midgard_farm import platform
 
 
+CATALOG = {
+    "schema": 1, "written_at": 1767225600.25, "max_difficulty": 30, "unlocked_max_difficulty": 4,
+    "locations": [
+        {"id": "prontera", "name": "Prontera", "unlocked": True, "min_difficulty": 1, "max_difficulty": 5},
+        {"id": "payon", "name": "Payon Forest", "unlocked": False, "min_difficulty": 1, "max_difficulty": 5},
+    ],
+    "oaths": [
+        {"id": "tough", "name": "Tough Monsters", "description": "Monsters have more HP.",
+         "ranks": [{"rank": 1, "description": "+30% HP", "points": 1}]},
+    ],
+    "legendaries": [{"id": "sacred_excalibur", "name": "Sacred Excalibur"}],
+    "owned_item_ids": ["sacred_excalibur"],
+}
+
+
 def main():
     real = Path(os.environ["FAKE_SMOKE_PROFILE"])
     profile = platform.current().godot_user_data_root() / real.name
@@ -35,6 +50,8 @@ def main():
         record["netns"] = os.readlink("/proc/self/ns/net")
         record["interfaces"] = [name for _, name in socket.if_nameindex()]
     (records / f"attempt-{attempt + 1}.json").write_text(json.dumps(record), encoding="utf-8")
+    if mode != "no_catalog":
+        (profile / "farmer_catalog.json").write_text(json.dumps(CATALOG), encoding="utf-8")
     (profile / "profile.json").write_text("sandbox played", encoding="utf-8")
     status = {
         "phase": "done", "terminal": True, "failed": False,

@@ -4,13 +4,13 @@ import json
 import math
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .. import assets
-from ..core import app_update, commands, game_update
+from ..core import app_update, catalog, commands, game_update
 from ..core.history import read_history
 from ..core.profile import ProfileNotFound, find_profile
 from ..core.state import ServiceState, StateKind, read_state
@@ -21,7 +21,6 @@ from ..platform import Platform
 @dataclass(frozen=True)
 class _Preset:
     path: Path
-    fixed: commands.Character | None
     description: str
 
 
@@ -55,17 +54,15 @@ def _catalog(os_: Platform) -> tuple[dict[commands.Character, str], list[_Preset
     for path in sorted(assets.presets_dir().glob("*.json")):
         if not (data := _object(os_, path)):
             continue
-        class_id = data.get("class")
-        fixed = _character(class_id, _mapping(data.get("job_paths")).get(class_id, 0)) if isinstance(class_id, str) else None
-        stage = data.get("stage")
-        location = stages.get(stage, stage) if stage else "Automatic"
-        danger = data.get("danger", "Automatic")
-        if danger in ("auto", "max") and data.get("danger_ceiling") is not None:
-            danger = f"{'Automatic' if danger == 'auto' else 'Maximum'}, up to {data['danger_ceiling']}"
-        description = f"Location: {location}  ·  Difficulty: {danger}"
-        if fixed:
-            description += "  ·  Character fixed by preset"
-        presets.append(_Preset(path, fixed, description))
+        objective = _label(data.get("objective", "balanced"))
+        limits = [label.format(value) for key, label in (
+            ("run_minutes", "{:g} min per run"), ("max_runs", "{:g} runs"),
+            ("max_minutes", "{:g} min per session"), ("stop_after_wins", "{:g} wins"),
+        ) if (value := _number(data.get(key))) is not None and value > 0]
+        description = " · ".join((f"Objective: {objective}",
+                                  f"Automatic difficulty ceiling: {data.get('danger_ceiling', 30)}",
+                                  ", ".join(limits) if limits else "No run limits"))
+        presets.append(_Preset(path, description))
     return characters, presets, stages
 
 
@@ -143,12 +140,112 @@ def _heartbeat_age(timestamp: float | None) -> str:
     return f"{seconds} s ago"
 
 
+def _catalog_refresh(latest: dict[str, Any] | None) -> str:
+    if latest is not None:
+        try:
+            return datetime.fromtimestamp(latest["written_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError, OverflowError):
+            pass
+    return ""
+
+
+def _locations(latest: dict[str, Any] | None) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = [{"id": None, "label": "Automatic", "enabled": True}]
+    for item in latest["locations"] if latest is not None else ():
+        row = _mapping(item)
+        sid, name = _text(row.get("id")), _text(row.get("name"))
+        lo, hi = row.get("min_difficulty"), row.get("max_difficulty")
+        if sid and name and type(lo) is int and type(hi) is int and 1 <= lo <= hi <= 30:
+            options.append({"id": sid, "label": name, "enabled": row.get("unlocked") is True,
+                            "min_difficulty": lo, "max_difficulty": hi})
+    return options
+
+
+def _difficulties(location: dict[str, Any]) -> list[str]:
+    if location["id"] is None:
+        return ["Automatic"]
+    return ["Automatic", *(str(level) for level in range(location["min_difficulty"], location["max_difficulty"] + 1))]
+
+
+def _oath_rows(latest: dict[str, Any] | None, selected: dict[str, int]) -> list[dict[str, Any]]:
+    catalog_rows = latest["oaths"] if latest is not None else []
+    rows = {}
+    for item in catalog_rows:
+        oath = _mapping(item)
+        oath_id, name = _text(oath.get("id")), _text(oath.get("name"))
+        ranks = []
+        for value in oath.get("ranks", []) if isinstance(oath.get("ranks"), list) else ():
+            rank = _mapping(value)
+            if type(rank.get("rank")) is int and rank["rank"] > 0 and type(rank.get("points")) is int:
+                ranks.append(rank)
+        if oath_id and name and ranks:
+            rows[oath_id] = (name, ranks)
+    # A remembered choice removed by a catalog refresh must be visible and removable.
+    if latest is not None:
+        for oath_id in selected:
+            rows.setdefault(oath_id, (oath_id, []))
+    result = []
+    for oath_id, (name, ranks) in rows.items():
+        options = [{"rank": 0, "points": 0, "description": ""}, *ranks]
+        index = next((i for i, option in enumerate(options) if option["rank"] == selected.get(oath_id, 0)), -1)
+        result.append({"id": oath_id, "label": name, "ranks": options, "selected_index": index})
+    return result
+
+
+def _legendary_names(latest: dict[str, Any] | None) -> dict[str, str]:
+    names = {}
+    for item in latest["legendaries"] if latest is not None else ():
+        row = _mapping(item)
+        item_id, name = _text(row.get("id")), _text(row.get("name"))
+        if item_id.strip() and "\0" not in item_id and name:
+            names[item_id] = name
+    return names
+
+
+def _wishlist_rows(names: dict[str, str], owned_ids: list, wishlist: list[str]) -> list[dict[str, Any]]:
+    selected = set(wishlist)
+    owned = {item for item in owned_ids if isinstance(item, str)}
+    # A saved item missing from the latest catalog must still be removable.
+    return [{"id": item, "label": name, "owned": item in owned, "selected": item in selected}
+            for item, name in sorted(({item: item for item in wishlist} | names).items(),
+                                     key=lambda pair: (pair[1].casefold(), pair[0]))]
+
+
+def _keep_text(run: dict[str, Any], item_names: dict[str, str]) -> list[str]:
+    parts = []
+    if isinstance(items := run.get("kept"), list):
+        kept = [item_names.get(item, _label(item)) for item in items if isinstance(item, str) and item]
+        if kept:
+            parts.append(f"Kept: {', '.join(kept)}")
+    if isinstance(items := run.get("keep_skipped"), list):
+        skipped = []
+        for item in items:
+            row = _mapping(item)
+            if item_id := _text(row.get("id")):
+                name = item_names.get(item_id, _label(item_id))
+                reason = _text(row.get("reason")).replace("_", " ")
+                skipped.append(f"{name} ({reason})" if reason else name)
+        if skipped:
+            parts.append(f"Wishlist skipped: {', '.join(skipped)}")
+    return parts
+
+
+def _target_text(stage: object, danger: object, names: dict[str, str], oath_points: object) -> str:
+    parts = [names.get(stage, stage)] if isinstance(stage, str) and stage else []
+    if level := _number(danger):
+        parts.append(f"Difficulty {level:.0f}")
+    if (points := _number(oath_points)) is not None:
+        parts.append(f"Oath points: {points:.0f}")
+    return " · ".join(parts)
+
+
 @dataclass(frozen=True)
 class HistoryRow:
     date: str
     title: str
     summary: str
     session_id: str = ""
+    run_choices: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -195,7 +292,7 @@ class QuarantineView:
     paths: list[str] = field(default_factory=list)
 
 
-def _history_view(rows: list[dict[str, Any]]) -> HistoryView:
+def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names: dict[str, str]) -> HistoryView:
     entries: list[HistoryRow] = []
     newest_session = ""
     totals: dict[str, Any] = {}
@@ -218,8 +315,17 @@ def _history_view(rows: list[dict[str, Any]]) -> HistoryView:
                     for failure in failures:
                         if (label := _label(failure)) and label not in summary:
                             summary.append(label)
+                choices = []
+                if isinstance(runs := row.get("run_choices"), list):
+                    for value in runs:
+                        run = _mapping(value)
+                        target = _target_text(run.get("stage"), run.get("danger"), names, run.get("oath_points"))
+                        if target:
+                            number = _text(run.get("run_id")).rpartition("-r")[2]
+                            prefix = f"Run {number} · {target}" if number.isdecimal() else target
+                            choices.append(" · ".join([prefix, *_keep_text(run, item_names)]))
                 entries.append(HistoryRow(date, f"AFK session · {_label(row.get('outcome')) or _DASH}",
-                                          " · ".join(summary), session))
+                                          " · ".join(summary), session, choices))
             case "game_update":
                 if row.get("action") == "restore_official":
                     title = "Official patch restored" if row.get("outcome") == "restored" else "Restore official patch"
@@ -264,17 +370,33 @@ class SessionView:
     active: bool = False
     paused: bool = False
     can_pause: bool = False
+    can_resume: bool = False
     can_control: bool = False
     characters: list[str] = field(default_factory=list)
     presets: list[str] = field(default_factory=list)
     character_index: int = -1
     preset_index: int = -1
+    locations: list[dict[str, Any]] = field(default_factory=list)
+    location_index: int = 0
+    difficulties: list[str] = field(default_factory=list)
+    difficulty_index: int = 0
+    can_pick_run_choice: bool = False
+    oaths: list[dict[str, Any]] = field(default_factory=list)
+    oath_points: int = 0
+    can_pick_oaths: bool = False
+    wishlist_items: list[dict[str, Any]] = field(default_factory=list)
+    wishlist_count: int = 0
+    can_edit_wishlist: bool = False
+    maintenance: dict[str, bool] = field(default_factory=lambda: commands.SessionSettings().maintenance())
+    can_edit_maintenance: bool = False
     can_start: bool = False
     can_pick_character: bool = False
     can_pick_preset: bool = False
     preset_description: str = ""
+    catalog_refresh: str = ""
     start_reason: str = ""
     start_refusal: str = ""
+    resume_refusal: str = ""
     action_error: str = ""
     service_missing: bool = False
     history: HistoryView = field(default_factory=HistoryView)
@@ -289,31 +411,60 @@ class SessionModel:
         self._characters, self._presets, self._stages = _catalog(os_)
         saved = _object(os_, self._settings)
         self._character = _character(saved.get("class"), saved.get("job_path"))
-        if ("class" not in saved or saved["class"] is not None) and self._character not in self._characters:
+        if self._character not in self._characters:
             self._character = next(iter(self._characters), None)
         self._preset = next((p for p in self._presets if p.path.name == saved.get("preset")), None)
         if self._preset is None:
             self._preset = next((p for p in self._presets if p.path.name == "night.json"),
                                 self._presets[0] if self._presets else None)
+        try:
+            self._session_settings = commands.SessionSettings.decode(saved["settings"])
+        except (KeyError, ValueError):
+            self._session_settings = commands.SessionSettings()
         self._last_start: Path | None = None
         self._pending_start = False
+        self._last_resume: tuple[Path, str] | None = None
         self._action_error = ""
         self._patch_request: tuple[commands.PatchCommand, Path] | None = None
         self._app_version = assets.version()
         self._rollback_request: Path | None = None
         self._history_rows: list[dict[str, Any]] = []
         self._history = HistoryView()
+        self._history_stage_names: dict[str, str] = {}
+        self._history_item_names: dict[str, str] = {}
         self._last_update: tuple[str, str] = ("No outcome yet", "")
 
     def poll(self) -> SessionView:
         state = read_state(self._os)
-        self._refresh_history()
+        paused = state.farmer_phase == "paused"
+        latest = catalog.read_latest(self._os)
+        locations = _locations(latest)
+        names = self._stages | {row["id"]: row["label"] for row in locations[1:]}
+        item_names = _legendary_names(latest)
+        self._refresh_history(names, item_names)
+        location = self._session_settings.location
+        level = self._session_settings.difficulty
+        location_index = next((i for i, row in enumerate(locations) if row["enabled"] and row["id"] == location),
+                              -1 if paused else 0)
+        difficulties = _difficulties(locations[max(0, location_index)])
+        difficulty_index = (difficulties.index(str(level)) if str(level) in difficulties
+                            else (-1 if paused and level is not None else 0))
+        oath_difficulty = level == 30 and difficulty_index > 0
+        oaths = _oath_rows(latest, self._session_settings.oaths)
+        unavailable_oaths = [oath for oath in oaths if oath["selected_index"] < 0]
+        oath_blocker = ""
+        if unavailable_oaths:
+            names_unavailable = ", ".join(oath["label"] for oath in unavailable_oaths)
+            oath_blocker = f"Saved oaths unavailable: {names_unavailable}. Choose Show oaths and set them to Off."
+        if unavailable_oaths and not oath_difficulty:
+            # Outside fixed difficulty 30, allow only clearing unavailable ranks.
+            oaths = [oath | {"ranks": oath["ranks"][:1]} for oath in unavailable_oaths]
+        oath_points = sum(oath["ranks"][i]["points"] for oath in oaths
+                          if (i := oath["selected_index"]) >= 0) if oath_difficulty else 0
         status = self._read_status(state)
         preset = self._preset
-        fixed = preset.fixed if preset else None
-        selected = fixed or self._character
-        options = [*self._characters, None]
-        characters = [*self._characters.values(), "Preset decides"]
+        options = list(self._characters)
+        characters = list(self._characters.values())
         presets = [p.path.name for p in self._presets]
         missing = state.kind is StateKind.STALE
         busy = not missing and (state.session_id is not None or state.kind is StateKind.ACTIVE)
@@ -330,17 +481,21 @@ class SessionModel:
             phase = "Ready to start"
         else:
             phase = state.kind.value.replace("_", " ").capitalize()
-        reason = self._start_blocker(state, busy, selected, quarantine)
+        reason = self._start_blocker(state, busy, quarantine)
         refusal = self._start_refusal(state)
         if self._pending_start and not reason:
             reason = "Start requested; waiting for the service."
         rates = _mapping(status.get("rates"))
         materials = f"{_format_number(rates.get('ore_h'), 1)} / {_format_number(rates.get('crumbs_h'), 1)}"
         totals = _mapping(status.get("totals"))
-        run, detail = self._run_text(status, totals)
+        run, detail = self._run_text(status, totals, names)
         can_control = (state.kind is StateKind.ACTIVE and bool(state.session_id)
                        and farmer_phase in ("", "idle", "run", "settle", "keep", "maint", "paused")
                        and status.get("terminal") is not True)
+        resume_refusal, resume_pending = self._resume_feedback(state, paused)
+        can_resume = paused and can_control and not resume_pending
+        can_pick_run_choice = (not busy and not self._pending_start) or can_resume
+        wishlist = self._session_settings.wishlist
         return SessionView(
             phase=phase, heartbeat_age=_heartbeat_age(state.last_heartbeat),
             zeny=_format_number(rates.get("zeny_h")), materials=materials if rates else _DASH,
@@ -348,14 +503,25 @@ class SessionModel:
             run_totals=" · ".join(f"{_format_number(totals.get(key))} {label}"
                                   for key, label in (("runs", "settled"), ("wins", "wins"), ("lost", "lost")))
             if totals else _DASH,
-            session_id=state.session_id or "", active=busy, paused=farmer_phase == "paused",
+            session_id=state.session_id or "", active=busy, paused=paused,
             can_control=can_control, can_pause=can_control and bool(farmer_phase),
+            can_resume=can_resume and not oath_blocker,
             characters=characters, presets=presets,
-            character_index=options.index(selected) if selected in options else -1,
+            character_index=options.index(self._character) if self._character in self._characters else -1,
             preset_index=self._presets.index(preset) if preset else -1,
-            can_start=not reason, can_pick_character=not busy and fixed is None and bool(characters),
+            can_start=not (reason or oath_blocker), can_pick_character=not busy and bool(characters),
             can_pick_preset=not busy and bool(presets), preset_description=preset.description if preset else "",
-            start_reason=reason, start_refusal=refusal, action_error=self._action_error, service_missing=missing,
+            locations=locations, location_index=location_index, difficulties=difficulties,
+            difficulty_index=difficulty_index, can_pick_run_choice=can_pick_run_choice,
+            oaths=oaths, oath_points=oath_points,
+            can_pick_oaths=bool(oaths and (oath_difficulty or oath_blocker) and (not reason or can_resume)),
+            wishlist_items=_wishlist_rows(item_names, latest["owned_item_ids"], wishlist) if latest is not None else [],
+            wishlist_count=len(wishlist), can_edit_wishlist=latest is not None and can_pick_run_choice,
+            maintenance=self._session_settings.maintenance(), can_edit_maintenance=not reason or can_resume,
+            catalog_refresh=_catalog_refresh(latest),
+            start_reason=reason or oath_blocker, start_refusal=refusal,
+            resume_refusal=(oath_blocker or resume_refusal) if can_resume else resume_refusal,
+            action_error=self._action_error, service_missing=missing,
             history=self._history, updates=updates, quarantine=quarantine,
         )
 
@@ -369,18 +535,17 @@ class SessionModel:
         status = _object(self._os, profile / "farmer_status.json")
         return status if status.get("session") == state.session_id else {}
 
-    def _run_text(self, status: dict[str, Any], totals: dict[str, Any]) -> tuple[str, str]:
-        if status.get("phase") not in ("run", "settle", "keep") or not status.get("run_id"):
+    def _run_text(self, status: dict[str, Any], totals: dict[str, Any], names: dict[str, str]) -> tuple[str, str]:
+        if status.get("phase") not in ("run", "settle", "keep", "maint") or not status.get("run_id"):
             return _DASH, ""
         game = _mapping(status.get("game"))
         target = _mapping(status.get("target"))
-        stage = game.get("stage") or target.get("stage")
+        choice = _target_text(target.get("stage") or game.get("stage"), target.get("danger") or game.get("danger"),
+                              names, target.get("oath_points"))
         started = _number(totals.get("started"))
         parts = [f"Run {started:.0f}" if started else "Run in progress"]
-        if isinstance(stage, str):
-            parts.append(self._stages.get(stage, stage))
-        if danger := _number(game.get("danger")) or _number(target.get("danger")):
-            parts.append(f"Difficulty {danger:.0f}")
+        if choice:
+            parts.append(choice)
         detail = []
         if level := _number(game.get("level")):
             detail.append(f"Level {level:.0f}")
@@ -436,14 +601,17 @@ class SessionModel:
                               "Check again" if retry else "Start a new session", retry,
                               retry and can_check_again, attempts, paths)
 
-    def _refresh_history(self) -> None:
+    def _refresh_history(self, names: dict[str, str], item_names: dict[str, str]) -> None:
         try:
             rows = read_history(self._os)
         except OSError:
             return  # Retain the last readable history until the file becomes available.
-        if rows != self._history_rows:
+        if (rows != self._history_rows or names != self._history_stage_names
+                or item_names != self._history_item_names):
             self._history_rows = rows
-            self._history = _history_view(rows)
+            self._history_stage_names = names
+            self._history_item_names = item_names
+            self._history = _history_view(rows, names, item_names)
             latest = max((row for row in rows if row["kind"] == "game_update" and _update_outcome(row)),
                          key=lambda row: row["timestamp"], default=None)
             self._last_update = (_update_outcome(latest), _text(latest.get("detail"))) if latest else ("No outcome yet", "")
@@ -526,8 +694,19 @@ class SessionModel:
                 self._pending_start = False
         return ""
 
-    def _start_blocker(self, state: ServiceState, busy: bool, selected: commands.Character | None,
-                       quarantine: QuarantineView) -> str:
+    def _resume_feedback(self, state: ServiceState, paused: bool) -> tuple[str, bool]:
+        if self._last_resume is None:
+            return "", False
+        request, session = self._last_resume
+        if not paused or state.session_id != session:
+            self._last_resume = None
+            return "", False
+        for row in state.command_refusals:
+            if row.get("request") == request.name and row.get("command") == "resume":
+                return _text(row.get("reason")), False
+        return "", request.exists()
+
+    def _start_blocker(self, state: ServiceState, busy: bool, quarantine: QuarantineView) -> str:
         if state.kind is StateKind.STALE:
             return "Service not running"
         if quarantine.needs_check_again:
@@ -538,13 +717,13 @@ class SessionModel:
             return state.reason or state.kind.value.replace("_", " ").capitalize()
         if self._preset is None:
             return "No presets found."
-        if selected is not None and selected not in self._characters:
-            return "No character available for this preset."
+        if self._character is None:
+            return "No character available."
         return ""
 
     def select_character(self, index: int) -> None:
-        if self.poll().can_pick_character and 0 <= index <= len(self._characters):
-            self._character = list(self._characters)[index] if index < len(self._characters) else None
+        if self.poll().can_pick_character and 0 <= index < len(self._characters):
+            self._character = list(self._characters)[index]
             self._save_picks()
 
     def select_preset(self, index: int) -> None:
@@ -552,9 +731,65 @@ class SessionModel:
             self._preset = self._presets[index]
             self._save_picks()
 
+    def select_location(self, location: str | None) -> None:
+        view = self.poll()
+        selected = next((row for row in view.locations if row["id"] == location and row["enabled"]), None)
+        if view.can_pick_run_choice and selected is not None:
+            previous = str(self._session_settings.difficulty)
+            difficulty = int(previous) if previous in _difficulties(selected) else None
+            self._session_settings = replace(self._session_settings, location=location, difficulty=difficulty)
+            self._save_picks()
+
+    def select_difficulty(self, level: str) -> None:
+        view = self.poll()
+        if view.can_pick_run_choice and level in view.difficulties:
+            self._session_settings = replace(self._session_settings, difficulty=None if level == "Automatic" else int(level))
+            self._save_picks()
+
+    def select_oath(self, oath_id: str, rank: int) -> None:
+        view = self.poll()
+        if not view.can_pick_oaths:
+            return
+        for oath in view.oaths:
+            if oath["id"] == oath_id and any(option["rank"] == rank for option in oath["ranks"]):
+                selected = self._session_settings.oaths.copy()
+                if rank:
+                    selected[oath_id] = rank
+                else:
+                    selected.pop(oath_id, None)
+                self._session_settings = replace(self._session_settings, oaths=selected)
+                self._save_picks()
+                return
+
+    def set_wishlisted(self, item_id: str, selected: bool) -> None:
+        view = self.poll()
+        if not view.can_edit_wishlist:
+            return
+        for row in view.wishlist_items:
+            if row["id"] == item_id and row["selected"] != selected:
+                wishlist = self._session_settings.wishlist
+                self._session_settings = replace(self._session_settings, wishlist=(
+                    [*wishlist, item_id] if selected else [item for item in wishlist if item != item_id]
+                ))
+                self._save_picks()
+                return
+
+    def set_maintenance(self, name: str, enabled: bool) -> None:
+        if name in commands.MAINTENANCE_CONFIG_KEYS and self.poll().can_edit_maintenance:
+            changes: dict[str, Any] = {name: enabled}
+            self._session_settings = replace(self._session_settings, **changes)
+            self._save_picks()
+
+    def _selected_settings(self, view: SessionView, *, resuming: bool = False) -> commands.SessionSettings:
+        settings = self._session_settings
+        if not resuming:
+            level = int(view.difficulties[view.difficulty_index]) if view.difficulty_index else None
+            settings = replace(settings, location=view.locations[view.location_index]["id"], difficulty=level)
+        return settings if settings.difficulty == 30 else replace(settings, oaths={})
+
     def _save_picks(self) -> None:
-        choice: dict[str, str | int | None] = {"preset": self._preset.path.name if self._preset else None,
-                                              "class": None}
+        choice: dict[str, Any] = {"preset": self._preset.path.name if self._preset else None, "class": None,
+                                  "settings": asdict(self._session_settings)}
         if self._character is not None:
             choice.update({"class": self._character.class_id, "job_path": self._character.job_path})
         try:
@@ -575,9 +810,10 @@ class SessionModel:
         return request
 
     def start(self) -> Path | None:
-        if not self.poll().can_start or self._preset is None:
+        view = self.poll()
+        if not view.can_start or self._preset is None:
             return None
-        request = self._submit(commands.Start(self._preset.fixed or self._character, self._preset.path))
+        request = self._submit(commands.Start(self._character, self._preset.path, self._selected_settings(view)))
         if request is not None:
             self._last_start = request
             self._patch_request = None
@@ -588,8 +824,14 @@ class SessionModel:
         view = self.poll()
         if (not view.can_control or view.session_id != session_id
                 or (action in ("pause", "resume") and not view.can_pause)
-                or (action == "pause" and view.paused) or (action == "resume" and not view.paused)):
+                or (action == "pause" and view.paused) or (action == "resume" and not view.can_resume)):
             return None
+        if action == "resume":
+            # A stale catalog must not alter the remembered run choice; the farmer checks it live.
+            request = self._submit(commands.Resume(self._selected_settings(view, resuming=True)))
+            if request is not None:
+                self._last_resume = request, session_id
+            return request
         return self._submit(action)
 
     def patch_command(self, command: commands.PatchCommand) -> Path | None:

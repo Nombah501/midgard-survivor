@@ -19,7 +19,10 @@ from midgard_farm.verify import scenarios
 from test_profile import make_profile
 
 ALL = (
-    "one-run", "stop", "endless", "flush-fail", "crash-run", "crash-settled", "crash-journaled",
+    "one-run", "catalog", "preparation-unchanged", "wishlist-keep", "run-choice", "run-choice-resume",
+    "oaths", "oaths-disabled", "invalid-oath", "invalid-oath-rank", "invalid-oath-difficulty", "invalid-location",
+    "invalid-difficulty", "stop", "endless", "flush-fail", "crash-run", "crash-settled",
+    "crash-journaled",
     "cmd-finish", "cmd-abort", "cmd-abort-settled", "cmd-pause-resume", "cmd-legacy", "checkpoint-corrupt",
     "supervised-kill-run", "supervised-crash-settled", "run-stall",
 )
@@ -110,6 +113,8 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
     assert row["verdict"] == "PASS", row
     assert json.loads((out / f"{name}.result.json").read_text()) == row
     assert (out / f"{name}.run.log").exists()
+    if name == "catalog":
+        assert (out / "catalog.catalog.json").is_file()
     assert (root / source.name / "patches" / "official.pck").samefile(source / "patches/official.pck")
     assert (source / "profile.json").read_text() == "100"
     assert [path.read_bytes() for path in protected] == before
@@ -126,6 +131,16 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
 @pytest.mark.parametrize(("name", "fault", "reason"), [
     ("one-run", "no-transition", "last_transition empty"),
     ("one-run", "no-victory", "last run was not a victory"),
+    ("catalog", "no-catalog", "no valid catalog"),
+    ("catalog", "empty-locations", "wrong location unlocks"),
+    ("preparation-unchanged", "rerolled-worn-item", "character preparation changed: potentials"),
+    ("preparation-unchanged", "no-free-points", "the starting character must have unspent stat points"),
+    ("wishlist-keep", "duplicate-wishlist-item", "wrong items added to saved storage"),
+    ("wishlist-keep", "no-wishlist-cash-in", "legendary offers were not cashed in"),
+    ("run-choice", "wrong-run-journal-target", "wrong location or difficulty in journal"),
+    ("oaths", "wrong-oath-journal-points", "wrong oath points in journal"),
+    ("oaths", "changed-saved-oaths", "saved oath set changed"),
+    ("invalid-location", "no-choice-diagnostic", "failure detail did not name the invalid field and value"),
     ("stop", "script-error", "script error"),
     ("endless", "no-mvp", "endless_mvps == 0"),
     ("crash-settled", "unbanked-zeny", "profile zeny moved"),
@@ -271,7 +286,7 @@ def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, cus
     preset = None
     if custom:
         preset = tmp_path / "custom.json"
-        preset.write_text(json.dumps({"class": "", "builds": {"class": "archer", "archer": {"job_path": 1}},
+        preset.write_text(json.dumps({"builds": {"archer": {"job_path": 1}},
                                       "job_paths": {"swordsman": 2}, "display": True}))
     row = execute(verification, "soak", hours=0.00001, soak_preset=preset)
     assert row["verdict"] == "FAIL" and row["exit"] == 0  # No post-warmup RSS in this intentionally short run.
@@ -280,9 +295,9 @@ def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, cus
     summary = json.loads(verdict.splitlines()[0])
     assert summary["runs"] == 1
     config = json.loads(next(root.glob("*/farmer.cfg")).read_text())
-    assert config["class"] == "" and config["max_minutes"] == 0.00001 * 60
+    assert config["stage"] == "" and config["danger"] == "auto" and config["max_minutes"] == 0.00001 * 60
     if custom:
-        assert config["builds"] == {"class": "archer", "archer": {"job_path": 1}}
+        assert config["builds"] == {"archer": {"job_path": 1}}
         assert config["job_paths"] == {"swordsman": 2} and not config["display"]
     samples = [json.loads(line) for line in (out / "soak.samples.jsonl").read_text().splitlines()]
     assert samples[0]["heartbeat_seq"] is None and samples[-1]["phase"] == "done"

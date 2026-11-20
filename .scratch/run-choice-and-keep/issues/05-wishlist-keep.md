@@ -4,13 +4,13 @@
 
 **Blocked by:** 02, 03.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The wishlist editor searches the catalog's legendaries, marks owned ones, is disabled without a catalog, and is remembered; covered by GUI tests.
-- [ ] Start and Resume carry the wishlist into `farmer.cfg`; malformed wishlists are rejected; covered by tests.
-- [ ] Value-based keep and `auto_keep` are gone; a preset with `auto_keep` is refused naming the key.
-- [ ] A verify scenario: with an offered item on the wishlist, only that item is added to storage; an owned wishlist item is not kept again; non-wishlist legendaries are cashed in.
-- [ ] Skipped wishlist items appear in the log and run journal with a reason; kept items appear in the journal and history.
-- [ ] Static checks and the pytest suite pass.
+- [x] The wishlist editor searches the catalog's legendaries, marks owned ones, is disabled without a catalog, and is remembered; covered by GUI tests.
+- [x] Start and Resume carry the wishlist into `farmer.cfg`; malformed wishlists are rejected; covered by tests.
+- [x] Value-based keep and `auto_keep` are gone; a preset with `auto_keep` is refused naming the key.
+- [x] A verify scenario: with an offered item on the wishlist, only that item is added to storage; an owned wishlist item is not kept again; non-wishlist legendaries are cashed in.
+- [x] Skipped wishlist items appear in the log and run journal with a reason; kept items appear in the journal and history.
+- [x] Static checks and the pytest suite pass.
 
 Spec: [`../spec.md`](../spec.md).

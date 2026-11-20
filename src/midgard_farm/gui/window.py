@@ -107,6 +107,26 @@ class _Backend(QObject):
     def selectPreset(self, index: int) -> None:
         self._enqueue(partial(self._model.select_preset, index))
 
+    @Slot(str)
+    def selectLocation(self, location: str) -> None:
+        self._enqueue(partial(self._model.select_location, location or None))
+
+    @Slot(str)
+    def selectDifficulty(self, level: str) -> None:
+        self._enqueue(partial(self._model.select_difficulty, level))
+
+    @Slot(str, int)
+    def selectOath(self, oath_id: str, rank: int) -> None:
+        self._enqueue(partial(self._model.select_oath, oath_id, rank))
+
+    @Slot(str, bool)
+    def setWishlisted(self, item_id: str, selected: bool) -> None:
+        self._enqueue(partial(self._model.set_wishlisted, item_id, selected))
+
+    @Slot(str, bool)
+    def setMaintenance(self, name: str, enabled: bool) -> None:
+        self._enqueue(partial(self._model.set_maintenance, name, enabled))
+
     @Slot()
     def start(self) -> None:
         self._enqueue(self._model.start)

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ..platform import LockHeld, NetworkIsolationError, Platform
 from .backup import backup_directory, publish_known_good, snapshot_profile
-from .commands import Character
+from .commands import Character, SessionSettings
 from .preflight import check_prerequisites, preflight
 from .run_progress import RUN_STALLED
 
@@ -85,23 +85,20 @@ class AttemptExit:
                 and (not os_.game_exit_status_reliable or self.normalized_code in (0, 137)))
 
 
-def _select_character(config_bytes: bytes, character: Character) -> bytes:
-    config = json.loads(config_bytes)
+def _select_character(config: dict, character: Character) -> None:
     cid, branch = character.class_id, character.job_path
     config["class"] = cid
     config["job_paths"] = {cid: branch}
-    # In Godot, builds.class and an explicit build job path take precedence.
-    builds = config.get("builds")
-    if isinstance(builds, dict):
-        builds.pop("class", None)
+    # An explicit build job path takes precedence in the game.
+    if isinstance(builds := config.get("builds"), dict):
         if isinstance(build := builds.get(cid), dict) and "job_path" in build:
             build["job_path"] = branch
-    return json.dumps(config, indent=2).encode()
 
 
 def run_attempt(
     os_: Platform, profile: Path, preset: Path | None, session_id: str | None, *,
     take_service_lock: bool = False, character: Character | None = None,
+    settings: SessionSettings | None = None,
     log_path: Path | None = None, watch: Callable[[dict | None], str | None] | None = None,
     poll_interval: float = 0.05,
 ) -> AttemptExit:
@@ -130,9 +127,14 @@ def run_attempt(
         backups = backup_directory(os_)
         snapshot_profile(profile, backups)
         config = plan.config
-        if character is not None:
-            assert config is not None, "character selection requires a preset"
-            config = _select_character(config, character)
+        if character is not None or settings is not None:
+            assert config is not None, "session settings require a preset"
+            selected = json.loads(config)
+            if character is not None:
+                _select_character(selected, character)
+            if settings is not None:
+                selected.update(settings.config())
+            config = json.dumps(selected, indent=2).encode()
         if config is not None:
             os_.write_atomic(profile / "farmer.cfg", config)
         (profile / "farmer_stop").unlink(missing_ok=True)

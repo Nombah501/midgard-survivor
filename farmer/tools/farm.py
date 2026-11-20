@@ -7,7 +7,7 @@ Examples:
   ./tools/farm.py --char sniper --stage ra_san --danger 25
   ./tools/farm.py --class archer --job-path 0 --stage orc --danger 15
 
-The config is generated from presets/synx-hell.json; the preset is not edited.
+The config is generated from presets/crumbs.json; the preset is not edited.
 The farmer still uses the selected class's profile pick_order/pick_limits.
 """
 import argparse
@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGETS_PATH = ROOT / "targets.json"
-BASE_PRESET = ROOT / "presets" / "synx-hell.json"
+BASE_PRESET = ROOT / "presets" / "crumbs.json"
 
 
 def load_targets():

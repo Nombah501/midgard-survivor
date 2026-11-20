@@ -63,9 +63,9 @@ def _number(value: object) -> int | float:
 _REWARDS = {"zeny": "zeny_gain", "xp": "xp_gain", "kills": "kills", "coins": "coins_gain", "ymir": "ymir_gain"}
 
 
-def session_totals(os_: Platform, profile: Path, session_id: str,
-                   status_totals: dict[str, Any]) -> dict[str, Any]:
-    """Use the cumulative farmer status, plus cards, run time and materials from the journal."""
+def session_summary(os_: Platform, profile: Path, session_id: str,
+                    status_totals: dict[str, Any]) -> dict[str, Any]:
+    """Collect cumulative totals and the actual run choices from the journal."""
     try:
         rows = _rows(os_.read_shared(profile / "farmer_runs.jsonl"))
     except FileNotFoundError:
@@ -78,6 +78,7 @@ def session_totals(os_: Platform, profile: Path, session_id: str,
     materials: Counter[str] = Counter()
     rewards: Counter[str] = Counter()
     runs = wins = cards = 0
+    choices: list[dict[str, Any]] = []
     wall_s = 0.0
     for row in rows:
         if row.get("session") != session_id:
@@ -86,6 +87,15 @@ def session_totals(os_: Platform, profile: Path, session_id: str,
             if run_id in seen:
                 continue
             seen.add(run_id)
+            stage, danger = row.get("stage"), _number(row.get("danger"))
+            if isinstance(stage, str) and stage and danger:
+                choice = {"run_id": run_id, "stage": stage, "danger": int(danger)}
+                if "oath_points" in row:
+                    choice["oath_points"] = int(_number(row["oath_points"]))
+                for key in ("kept", "keep_skipped"):
+                    if isinstance(items := row.get(key), list) and items:
+                        choice[key] = items
+                choices.append(choice)
         runs += 1
         wins += row.get("victory") is True
         wall_s += _number(row.get("wall_s"))
@@ -101,8 +111,9 @@ def session_totals(os_: Platform, profile: Path, session_id: str,
     accounted = _number(status_totals.get("runs")) >= runs
     tallies = {"runs": runs, "wins": wins, "losses": runs - wins,
                **{name: rewards[name] for name in _REWARDS}}
-    return {**{key: _number(status_totals[key]) if accounted and key in status_totals else value
-               for key, value in tallies.items()},
-            "started": max(runs, _number(status_totals.get("started"))),
-            "lost": _number(status_totals.get("lost")), "wall_s": wall_s, "cards_gain": cards,
-            "materials": dict(materials)}
+    totals = {**{key: _number(status_totals[key]) if accounted and key in status_totals else value
+                 for key, value in tallies.items()},
+              "started": max(runs, _number(status_totals.get("started"))),
+              "lost": _number(status_totals.get("lost")), "wall_s": wall_s, "cards_gain": cards,
+              "materials": dict(materials)}
+    return {"totals": totals, "run_choices": choices}

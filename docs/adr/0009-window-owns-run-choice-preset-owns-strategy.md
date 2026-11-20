@@ -13,4 +13,6 @@ The app spec had a preset carry location and difficulty and the window never edi
 
 - Oaths are passed to the game per run and only apply at difficulty 30; the profile's own oath set is never written (ADR 0008).
 - Presets that differed only by location, difficulty or class (`synx-hell`, `sniper-hell`) are deleted; `one-run` moves to test data.
-- Changing the choice mid-session means Finish or Pause, change, then Start or Resume, so every run maps to one choice.
+- Character and preset are fixed at Start for the whole session. To change
+  either, finish and start a new session. Location, difficulty, oaths, wishlist
+  and maintenance switches can also change while paused, for the next run.

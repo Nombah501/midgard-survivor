@@ -160,7 +160,7 @@ INSTALLED_SHA="$(sha256sum "$SB_DATA/patches/patch_farmer.pck" | cut -d' ' -f1)"
 [[ "$INSTALLED_SHA" == "$PCK_SHA" ]] || die "sandbox install hash mismatch"
 
 write_cfg() {
-	local name="$1" override="$2" base="${3:-$FARMER_DIR/presets/one-run.json}"
+	local name="$1" override="$2" base="${3:-$FARMER_DIR/scenarios/one-run.json}"
 	python3 - "$base" "$OUT_DIR/$name.json" "$override" <<'PY'
 import json
 import sys
@@ -727,7 +727,7 @@ write_cfg flush-fail '{"speed":10.0,"max_runs":1,"run_minutes":0.2,"max_minutes"
 # Short forced runs: settlement and keep still happen, a run takes seconds.
 write_cfg crash-run '{"speed":10.0,"max_runs":1,"run_minutes":0.2,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
 write_cfg crash-settled '{"speed":10.0,"max_runs":2,"run_minutes":0.2,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
-write_cfg commands '{"speed":10.0,"max_runs":2,"run_minutes":0.2,"stall_seconds":10.0,"auto_keep":true,"keep_on_defeat":true,"hard_exit":true,"endless":false,"display":false}'
+write_cfg commands '{"speed":10.0,"max_runs":2,"run_minutes":0.2,"stall_seconds":10.0,"hard_exit":true,"endless":false,"display":false}'
 
 for scenario in "${SCENARIOS[@]}"; do
 	case "$scenario" in
