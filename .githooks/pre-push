@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Check every pushed commit as it was committed: export it to a clean directory
+# and run the app's type check and tests there (plus the farmer tests when
+# farmer/ changed). CI tests only the tip of a push, so a commit that passed
+# only with files left uncommitted could otherwise land unnoticed.
+# Docs-only commits are skipped. Bypass in an emergency: git push --no-verify.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+PY="$ROOT/.venv/bin/python"
+ZERO=0000000000000000000000000000000000000000
+CODE='^(src|tests|packaging|farmer)/|^pyproject\.toml$'
+
+[ -x "$PY" ] || { echo "pre-push: $PY missing; create the venv (see README) or push with --no-verify" >&2; exit 1; }
+
+declare -A seen=()
+commits=()
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$ZERO" ] && continue  # Deleting a ref.
+  if [ "$remote_sha" = "$ZERO" ]; then
+    range=("$local_sha" --not --remotes)
+  else
+    range=("$remote_sha..$local_sha")
+  fi
+  while read -r commit; do
+    [ -n "$commit" ] && [ -z "${seen[$commit]:-}" ] || continue
+    seen[$commit]=1
+    commits+=("$commit")
+  done < <(git rev-list --reverse "${range[@]}")
+done
+
+work=""
+trap '[ -n "$work" ] && rm -rf "$work"' EXIT
+
+# Run "$@" in directory $1; any failure rejects the push. (A `( ... ) || ...`
+# subshell would not do: bash ignores `set -e` inside it.)
+run_in() {
+  local dir=$1; shift
+  if ! (cd "$dir" && "$@"); then
+    echo "pre-push: $short fails on its own; fix it (or amend/split) before pushing" >&2
+    exit 1
+  fi
+}
+
+for commit in "${commits[@]}"; do
+  changed="$(git diff-tree --no-commit-id --name-only -r --root "$commit")"
+  grep -qE "$CODE" <<<"$changed" || continue
+  short="$(git log -1 --format=%h "$commit")"
+  echo "pre-push: checking $(git log -1 --format='%h %s' "$commit")"
+  work="$(mktemp -d)"
+  git archive "$commit" | tar -x -C "$work"
+  for target in linux win32; do
+    other=$([ "$target" = linux ] && echo windows || echo linux)
+    run_in "$work" "$PY" -m mypy --python-version 3.13 --platform "$target" --follow-imports=silent \
+      --exclude "midgard_farm/platform/${other}\.py$" src
+  done
+  run_in "$work" env QT_QPA_PLATFORM=offscreen PYTHONPATH="$work/src" "$PY" -m pytest -q -p no:cacheprovider tests
+  if grep -q '^farmer/' <<<"$changed"; then
+    run_in "$work/farmer" "$PY" -m pytest -q -p no:cacheprovider tests
+  fi
+  rm -rf "$work"
+  work=""
+done
