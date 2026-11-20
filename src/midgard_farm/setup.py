@@ -18,7 +18,8 @@ def _prompt_token() -> str:
     with warnings.catch_warnings():
         # getpass would otherwise fall back to typing the token in the clear.
         warnings.simplefilter("error", GetPassWarning)
-        return getpass("Fine-grained read-only release token: ")
+        # Hidden input: nothing echoes, and the classic Windows console pastes with a right-click.
+        return getpass("Release token for app updates (typing is hidden; Enter to skip): ")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

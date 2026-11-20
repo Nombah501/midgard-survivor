@@ -8,7 +8,7 @@ Download and unpack the private release archive for your OS. Open a normal termi
 | --- | --- |
 | `./midgard-farm-setup` | `.\midgard-farm-setup.exe` |
 
-Enter a fine-grained GitHub token with **Contents: Read-only** for the private release repository. Setup hides what you type and stores the token in your app data directory, not in the archive or logs. Rerunning setup reuses the stored token.
+Enter a fine-grained GitHub token with **Contents: Read-only** for the private release repository, or press Enter to skip it: the farm works without a token, only app self-update stays off until you rerun setup and enter one. Setup hides what you type (nothing appears; in the classic Windows console paste with a right-click) and stores the token in your app data directory, not in the archive or logs. Rerunning setup reuses the stored token.
 
 Setup installs the app under `versions/<release>/` in `$XDG_DATA_HOME/midgard-farm` (default `~/.local/share/midgard-farm`) or `%LOCALAPPDATA%\MidgardFarm` and prints the installed window's path. It registers a systemd user unit on Linux and a hidden, least-privilege logon task on Windows. Both run the stable launcher in `bin/`, which reads `current` on every start. Only rerunning setup refreshes the launcher; stop the service first if setup needs to replace it.
 

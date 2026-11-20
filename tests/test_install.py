@@ -121,6 +121,16 @@ def test_setup_selects_the_version_stores_the_token_privately_and_can_be_rerun(f
     assert fake.registration == [str(launcher)]
 
 
+def test_setup_installs_without_a_token_when_the_operator_skips_it(fake, bundle, monkeypatch):
+    monkeypatch.setattr(setup, "getpass", lambda _: "")
+
+    assert setup.main([]) == 0
+    data = fake.app_data_dir()
+    assert (data / "current").read_bytes() == b"2.1.0\n"
+    assert fake.registration
+    assert not (data / "release-token").exists()
+
+
 def test_setup_repairs_an_empty_installed_version_before_selecting_it(fake, bundle, monkeypatch):
     monkeypatch.setattr(setup, "getpass", lambda _: "fixture-token")
     data = fake.app_data_dir()

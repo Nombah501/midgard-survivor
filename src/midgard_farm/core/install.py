@@ -124,10 +124,12 @@ def _install_locked(os_: Platform, source: Path, target: Path, version: str,
         token_present = False
     if not token_present:
         token = prompt_token().strip()
-        if not token or not token.isprintable() or any(character.isspace() for character in token):
-            raise SetupError("enter a non-empty read-only release token without whitespace")
-        # Platform.write_atomic starts from mkstemp (0600 on Linux); no token in argv or logs.
-        os_.write_atomic(token_file, (token + "\n").encode("utf-8"))
+        # Empty skips: the farm runs without a token, only app self-update stays off until setup reruns.
+        if token:
+            if not token.isprintable() or any(character.isspace() for character in token):
+                raise SetupError("enter a read-only release token without whitespace, or press Enter to skip")
+            # Platform.write_atomic starts from mkstemp (0600 on Linux); no token in argv or logs.
+            os_.write_atomic(token_file, (token + "\n").encode("utf-8"))
 
     if not _bundle_complete(target, suffix):
         if target == source:
