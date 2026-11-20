@@ -94,7 +94,7 @@ def check(onedir: Path) -> None:
     presets = sorted(checkout.glob("presets/*.json"))
     expected_assets = [checkout / name for name in (
         "src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py",
-        "scenarios/one-run.json", "targets.json",
+        "scenarios/one-run.json", "targets.json", "obsolete_config_keys.json",
     )] + presets
     expected_hash = farmer_hash(checkout)
     expected_characters = {row["label"] for row in json.loads((checkout / "targets.json").read_bytes())["characters"].values()}
