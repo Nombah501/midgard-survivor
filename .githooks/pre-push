@@ -54,9 +54,11 @@ for commit in "${commits[@]}"; do
     run_in "$work" "$PY" -m mypy --python-version 3.13 --platform "$target" --follow-imports=silent \
       --exclude "midgard_farm/platform/${other}\.py$" src
   done
-  run_in "$work" env QT_QPA_PLATFORM=offscreen PYTHONPATH="$work/src" "$PY" -m pytest -q -p no:cacheprovider tests
+  # Pytest temp lives in $work so the trap removes it; the default /tmp/pytest-of-$USER
+  # keeps ~600 MB per run and filled the /tmp quota on 2026-11-20.
+  run_in "$work" env QT_QPA_PLATFORM=offscreen PYTHONPATH="$work/src" "$PY" -m pytest -q -p no:cacheprovider --basetemp="$work/.pytest-tmp" tests
   if grep -q '^farmer/' <<<"$changed"; then
-    run_in "$work/farmer" "$PY" -m pytest -q -p no:cacheprovider tests
+    run_in "$work/farmer" "$PY" -m pytest -q -p no:cacheprovider --basetemp="$work/.pytest-tmp-farmer" tests
   fi
   rm -rf "$work"
   work=""
