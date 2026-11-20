@@ -37,6 +37,12 @@ def status(phase="run", reason=""):
             "failed": phase == "failed", "finish_reason": reason,
             "heartbeat_seq": seq, "pid": os.getpid(), "session": os.environ["FARMER_SESSION_ID"]}
     data["heartbeat"] = time.time()
+    if kind == "commands":
+        data["game"] = {"time": seq if arg == "endless" else 640, "in_raid": arg == "raid"}
+        if arg == "clock-reset" and seq > 6:
+            data["game"]["time"] = seq - 6
+        if arg == "endless":
+            data["run"] = {"endless_started_at": 300}
     if kind == "commands" and arg == "summary":
         data["totals"] = {"started": 2, "runs": 1, "wins": 1, "losses": 0, "lost": 1,
                           "zeny": 7200, "xp": 50, "kills": 40, "coins": 3, "ymir": 2}
@@ -89,7 +95,8 @@ if kind == "hang":
     plan.with_suffix(".grandchild").write_text(str(child.pid))
     forever()
 if kind == "commands":
-    phase = "run"
+    phase = arg.removeprefix("phase-") if arg.startswith("phase-") else "run"
+    deadline = time.monotonic() + 2 if arg == "timed-stall" else None
     while True:
         command = ""
         try:
@@ -122,6 +129,9 @@ if kind == "commands":
             phase = "paused"
         elif command == "resume":
             phase = "run"
+        if deadline is not None and time.monotonic() >= deadline:
+            status("done", "fixture_deadline")
+            os._exit(0)
         status(phase)
         time.sleep(0.05)
 raise RuntimeError(f"unknown fake game plan: {kind}:{arg}")

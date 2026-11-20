@@ -45,6 +45,8 @@ class ServiceState:
     game_update_classification: str | None = None
     last_restore: dict[str, Any] | None = None
     keep_official: bool = False
+    run_progress: dict[str, Any] | None = None
+    heartbeat_stale_after: float | None = None
 
 
 class _PatchChanges(TypedDict, total=False):
@@ -57,6 +59,7 @@ class _StateChanges(TypedDict, total=False):
     session_id: str | None
     farmer_phase: str | None
     last_heartbeat: float | None
+    heartbeat_stale_after: float
     last_outcome: dict[str, Any] | None
     quarantine: dict[str, Any] | None
     refusals_superseded_through: str
@@ -110,6 +113,7 @@ def read_state(os_: Platform) -> ServiceState:
     outcome, quarantine = payload.get("last_outcome"), payload.get("quarantine")
     refusals = payload.get("command_refusals")
     restore = payload.get("last_restore")
+    progress = payload.get("run_progress")
     return ServiceState(kind, reason, updated_at, interval, _text(payload.get("session_id")),
                         _text(payload.get("farmer_phase")), _number(payload.get("last_heartbeat")),
                         outcome if isinstance(outcome, dict) else None,
@@ -117,7 +121,9 @@ def read_state(os_: Platform) -> ServiceState:
                         tuple(row for row in refusals if isinstance(row, dict)) if isinstance(refusals, list) else (),
                         _text(payload.get("refusals_superseded_through")) or "",
                         _text(payload.get("game_update_classification")),
-                        restore if isinstance(restore, dict) else None, payload.get("keep_official") is True)
+                        restore if isinstance(restore, dict) else None, payload.get("keep_official") is True,
+                        progress if isinstance(progress, dict) else None,
+                        _number(payload.get("heartbeat_stale_after")))
 
 
 def _quarantine(record: dict[str, Any]) -> dict[str, Any]:
@@ -183,12 +189,12 @@ class StateReporter:
                 self._state = updated
                 self._publish()
 
-    def observe_farmer(self, status: dict[str, Any]) -> None:
+    def observe_farmer(self, status: dict[str, Any], *, run_progress: dict[str, Any] | None = None) -> None:
         phase = _text(status.get("phase"))
         heartbeat = _number(status.get("heartbeat"))
         with self._lock:
             phase_changed = phase != self._state.farmer_phase
-            self._state = replace(self._state, farmer_phase=phase,
+            self._state = replace(self._state, farmer_phase=phase, run_progress=run_progress,
                                   last_heartbeat=heartbeat if heartbeat is not None else self._state.last_heartbeat)
             if phase_changed:
                 self._publish()

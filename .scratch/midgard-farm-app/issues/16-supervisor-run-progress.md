@@ -6,9 +6,15 @@ Background: on 2026-11-19 a run sat at t=640 with no enemies for 6.5 h. The farm
 
 **Blocked by:** 04.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] A fake game with a fresh heartbeat and frozen `game.time` in phase `run` ends the attempt as `run_stalled` after the stall window, at the service seam.
-- [ ] Pauses, settle/keep/maint, raids and endless boss fights with advancing time never trigger it.
-- [ ] `run_stalled` counts towards the crash-loop quarantine like other attempt failures.
-- [ ] `midgard_farm.health` and the supervisor agree on what "stalled" means (one shared definition).
+- [x] A fake game with a fresh heartbeat and frozen `game.time` in phase `run` ends the attempt as `run_stalled` after the stall window, at the service seam.
+- [x] Pauses, settle/keep/maint, raids within their own window and endless boss fights with advancing time never trigger it.
+- [x] `run_stalled` counts towards the crash-loop quarantine like other attempt failures.
+- [x] `midgard_farm.health` and the supervisor agree on what "stalled" means (one shared definition).
+
+## Comments
+
+- 2026-11-20 — Implemented the shared run-progress watch, a longer raid window, crash-policy recovery and quarantine, and reason display in the window and history. Health uses the live supervisor timing when available and labels its fallback observations unconfirmed. Verified with fake games and both platform type checks. No real-machine check is required to close the ticket; the provisional 20-minute raid window has not been calibrated against a real raid.
+- Full offscreen suite timed out before summary; its only visible failure mapped to the onedir aliased-extraction smoke test, outside this ticket's scope.
+- 2026-11-20 — Review follow-up: health now uses same-boot monotonic progress timing and the supervisor's configured heartbeat timeout. Unmatched clock observations are unconfirmed.

@@ -210,6 +210,10 @@ def _history_view(rows: list[dict[str, Any]]) -> HistoryView:
                            for key, label in (("runs", "runs"), ("wins", "wins"), ("zeny", "zeny"))]
                 if reason := _label(row.get("reason")):
                     summary.append(reason)
+                if isinstance(failures := row.get("attempt_failures"), list):
+                    for failure in failures:
+                        if (label := _label(failure)) and label not in summary:
+                            summary.append(label)
                 entries.append(HistoryRow(date, f"AFK session · {_label(row.get('outcome')) or _DASH}",
                                           " · ".join(summary), session))
             case "game_update":

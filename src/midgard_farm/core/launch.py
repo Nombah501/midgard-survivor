@@ -16,6 +16,7 @@ from ..platform import LockHeld, NetworkIsolationError, Platform
 from .backup import backup_directory, publish_known_good, snapshot_profile
 from .commands import Character
 from .preflight import check_prerequisites, preflight
+from .run_progress import RUN_STALLED
 
 SHUTDOWN_GRACE_SECONDS = 45  # Match the legacy supervisor's stop_grace.
 _SETTLED_REASONS = frozenset({"finish", "stop", "max_runs", "wins", "goal", "no_target"})
@@ -192,13 +193,15 @@ def run_attempt(
                                 forced_reason = watch(status)
                             elif timeout == 0:
                                 forced_reason = "operator_timeout"
-                            if watch is not None and forced_reason in ("heartbeat_stale", "no_heartbeat"):
+                            if watch is not None and forced_reason in ("heartbeat_stale", "no_heartbeat", RUN_STALLED):
                                 # A status replacement or process exit can race the timed wait and read.
                                 status = _read_status(os_, profile, expected_session,
-                                                      retry_missing=forced_reason == "heartbeat_stale")
+                                                      retry_missing=forced_reason != "no_heartbeat")
                                 if status is not None:
                                     last_status = status
                                     forced_reason = watch(status)
+                                elif forced_reason == RUN_STALLED:
+                                    forced_reason = None
                                 if forced_reason is None:
                                     continue
                                 try:

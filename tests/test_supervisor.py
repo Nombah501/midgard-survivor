@@ -268,16 +268,19 @@ def test_operator_terminal_command_notifies_stop_without_restart(farm, command):
 
 def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm):
     plan_game(farm, "commands", "crash")
-    with farm.service():
+    with farm.service(run_stall_window=0.75):
         farm.start()
         running = farm.status("run")
         farm.send("pause")
         paused = farm.status("paused")
         wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
-            d["phase"] == "paused" and d["heartbeat_seq"] >= paused["heartbeat_seq"] + 12
+            d["phase"] == "paused" and d["heartbeat"] - paused["heartbeat"] >= 0.9
         ))
         farm.send("resume")
         resumed = farm.status("run")
+        wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
+            d["phase"] == "run" and d["pid"] == running["pid"] and d["heartbeat_seq"] >= resumed["heartbeat_seq"] + 3
+        ))
         farm.send("finish")
         outcome, _ = farm.outcome()
     assert running["pid"] == paused["pid"] == resumed["pid"]
@@ -365,7 +368,7 @@ def test_stale_verdict_is_checked_against_current_status_and_exit(tmp_path, monk
     monkeypatch.setattr(launch, "preflight", lambda *_: SimpleNamespace(argv=[tmp_path / "game"], config=None))
     reads = polls = 0
     killed = False
-    monkeypatch.setattr(supervisor, "time", SimpleNamespace(monotonic=lambda: float(polls * 2)))
+    monkeypatch.setattr(supervisor, "time", SimpleNamespace(monotonic=lambda: float(polls * 2), time=time.time))
 
     class Tree(platform.ProcessTree):
         def wait(self, timeout=None):
@@ -404,7 +407,7 @@ def test_stale_verdict_is_checked_against_current_status_and_exit(tmp_path, monk
     monkeypatch.setattr(os_, "spawn_tree", lambda *_, **__: Tree())
     monkeypatch.setattr(os_, "read_shared", read)
     watcher = supervisor.Supervisor(os_, tmp_path, supervisor.Policy(heartbeat_interval=0.5),
-                                    lambda: None, lambda *_: None, state=SimpleNamespace(observe_farmer=lambda _: None))
+                                    lambda: None, lambda *_: None, state=SimpleNamespace(observe_farmer=lambda *_, **__: None))
     result = launch.run_attempt(os_, tmp_path, None, session, watch=watcher._watcher())
     assert result.forced_reason == reason
     if next_phase == "failed":
@@ -412,6 +415,60 @@ def test_stale_verdict_is_checked_against_current_status_and_exit(tmp_path, monk
         assert result.status["finish_reason"] == "settle_timeout"
     elif reason is None:
         assert result.clean(os_)
+
+
+@pytest.mark.parametrize("before_kill", ["settle", "exit", "advanced", "missing"])
+def test_run_stall_is_rechecked_before_killing(tmp_path, monkeypatch, before_kill):
+    session = "afk-" + uuid.uuid4().hex
+    status_path = tmp_path / "farmer_status.json"
+    os_ = platform.current()
+    monkeypatch.setattr(os_, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(os_, "game_running", lambda: False)
+    monkeypatch.setattr(os_, "check_network_isolation", lambda: "")
+    monkeypatch.setenv("FARMER_BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.setattr(launch, "check_prerequisites", lambda *_: (tmp_path / "game", None))
+    monkeypatch.setattr(launch, "preflight", lambda *_: SimpleNamespace(argv=[tmp_path / "game"], config=None))
+    reads = polls = 0
+    finished = killed = False
+    monkeypatch.setattr(supervisor, "time", SimpleNamespace(monotonic=lambda: float(polls), time=time.time))
+
+    class Tree(platform.ProcessTree):
+        def wait(self, timeout=None):
+            nonlocal polls, finished
+            if killed:
+                return 9
+            if (timeout == 0 and before_kill == "exit") or (timeout and polls >= 2 and reads >= 3):
+                finished = True
+                return 0
+            if timeout:
+                polls += 1
+            raise subprocess.TimeoutExpired("fake game", timeout)
+
+        def kill(self):
+            nonlocal killed
+            killed = not finished
+
+    def read(path, *, retry_missing=False):
+        nonlocal reads
+        if path != status_path:
+            return path.read_bytes()
+        reads += 1
+        if before_kill == "missing" and reads == 3:
+            assert retry_missing
+            raise FileNotFoundError(path)
+        phase = "done" if finished else "settle" if before_kill == "settle" and reads == 3 else "run"
+        game_time = 641 if before_kill == "advanced" and reads >= 3 else 640
+        return json.dumps({"session": session, "phase": phase, "heartbeat_seq": reads,
+                           "game": {"time": game_time}, "terminal": finished}).encode()
+
+    monkeypatch.setattr(os_, "spawn_tree", lambda *_, **__: Tree())
+    monkeypatch.setattr(os_, "read_shared", read)
+    watcher = supervisor.Supervisor(os_, tmp_path, supervisor.Policy(run_stall_window=1.0),
+                                    lambda: None, lambda *_: None, state=SimpleNamespace(observe_farmer=lambda *_, **__: None))
+    result = launch.run_attempt(os_, tmp_path, None, session, watch=watcher._watcher())
+    assert polls == 2  # The third read happened before the next regular poll.
+    assert not killed
+    assert result.clean(os_)
 
 
 def test_crash_restarts_with_exponential_backoff_and_same_session_id(farm):
@@ -430,6 +487,79 @@ def test_crash_restarts_with_exponential_backoff_and_same_session_id(farm):
     assert all(json.loads(path.read_bytes())["session"] == outcome["session"]
                for path in (logs / "attempt-01.status.json", logs / "attempt-02.status.json"))
     assert farm.status("done")["session"] == outcome["session"]
+
+
+def test_frozen_run_with_fresh_heartbeat_restarts_and_records_stall(farm):
+    plan_game(farm, "commands:timed-stall", "clean:max_runs")
+    with farm.service(run_stall_window=0.6, heartbeat_interval=4.0):
+        farm.start()
+        state = wait_for(lambda: read_state(farm.os_), lambda saved: bool(saved.run_progress))
+        assert state.run_progress["game_time"] == 640
+        assert state.run_progress["window"] == 0.6
+        assert state.run_progress["in_raid"] is False
+        assert state.heartbeat_stale_after == 12.0
+        assert state.run_progress["at_monotonic"] <= time.monotonic()
+        outcome, directory = farm.outcome()
+        rows = wait_for(lambda: read_history(farm.os_))
+
+    assert (outcome["kind"], outcome["reason"]) == ("finished", "max_runs")
+    assert [(attempt["outcome"], attempt["reason"]) for attempt in outcome["attempts"]] == [
+        ("failed", "run_stalled"), ("finished", "max_runs"),
+    ]
+    saved = json.loads((directory / "attempt-01.status.json").read_bytes())
+    assert saved["phase"] == "run" and saved["game"]["time"] == 640
+    assert saved["heartbeat_seq"] > 5
+    assert saved["session"] == farm.status("done")["session"] == outcome["session"]
+    assert rows[0]["reason"] == "max_runs"
+    assert rows[0]["attempt_failures"] == ["run_stalled"]
+
+
+@pytest.mark.parametrize(("mode", "phase"), [
+    ("phase-settle", "settle"), ("phase-keep", "keep"), ("phase-maint", "maint"),
+    ("phase-idle", "idle"), ("endless", "run"), ("clock-reset", "run"), ("raid", "run"),
+])
+def test_other_phases_progress_and_short_raids_do_not_trigger_run_stall(farm, mode, phase):
+    plan_game(farm, f"commands:{mode}")
+    with farm.service(run_stall_window=0.45, raid_stall_window=10):
+        farm.start()
+        initial = farm.status(phase)
+        wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
+            d["phase"] == phase and d["heartbeat"] - initial["heartbeat"] >= 0.7
+        ))
+        farm.send("finish")
+        outcome, _ = farm.outcome()
+    assert [(attempt["outcome"], attempt["reason"]) for attempt in outcome["attempts"]] == [
+        ("finished", "finish"),
+    ]
+
+
+def test_frozen_raid_restarts_after_the_raid_window(farm):
+    plan_game(farm, "commands:raid", "clean:max_runs")
+    with farm.service(run_stall_window=0.2, raid_stall_window=0.8):
+        farm.start()
+        outcome, directory = farm.outcome()
+    failed, finished = outcome["attempts"]
+    assert (failed["outcome"], failed["reason"]) == ("failed", "run_stalled")
+    assert "in a raid" in failed["detail"] and "0.8 s" in failed["detail"]
+    saved = json.loads((directory / "attempt-01.status.json").read_bytes())
+    assert saved["game"]["in_raid"] is True
+    assert saved["heartbeat_seq"] >= 12  # The shorter normal window would kill sooner.
+    assert finished["outcome"] == "finished"
+
+
+def test_repeated_run_stalls_quarantine(farm):
+    plan_game(farm, "commands")
+    with farm.service(run_stall_window=0.55):
+        farm.start()
+        outcome, directory = farm.outcome()
+        state = wait_for(lambda: read_state(farm.os_), lambda saved: bool(saved.quarantine))
+    assert outcome["kind"] == "quarantined"
+    assert [attempt["reason"] for attempt in outcome["attempts"]] == ["run_stalled"] * 3
+    assert farm.notifications() == ["fail", "fail", "quarantine"]
+    report = json.loads((directory / "quarantine.json").read_bytes())
+    assert report["last_failure"] == "run_stalled"
+    assert "Run stalled" in state.quarantine["detail"]
+    assert read_history(farm.os_)[0]["attempt_failures"] == ["run_stalled"]
 
 
 @pytest.mark.parametrize("old_status", [False, True])

@@ -15,6 +15,16 @@ from .commands import Start
 from .history import append_event, read_history, session_totals
 from .launch import SHUTDOWN_GRACE_SECONDS, GameBusy, request_finish, run_attempt
 from .preflight import PreflightError
+from .run_progress import (
+    HEARTBEAT_INTERVAL,
+    RAID_STALL_WINDOW,
+    RUN_STALL_WINDOW,
+    RUN_STALLED,
+    STALE_HEARTBEAT_INTERVALS,
+    Progress,
+    RunProgress,
+    in_raid,
+)
 from .state import StateKind, StateReporter, read_state
 
 FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt"}
@@ -66,8 +76,8 @@ def refuse_command(os_: Platform, state: StateReporter, path: Path, command: str
 
 @dataclass(frozen=True)
 class Policy:
-    heartbeat_interval: float = 5.0
-    stale_intervals: int = 3
+    heartbeat_interval: float = HEARTBEAT_INTERVAL
+    stale_intervals: int = STALE_HEARTBEAT_INTERVALS
     startup_grace: float = 180.0
     backoff_base: float = 15.0
     backoff_max: float = 600.0
@@ -75,6 +85,12 @@ class Policy:
     failure_window: float = 3600.0
     kill_grace: float = 20.0
     stop_grace: float = SHUTDOWN_GRACE_SECONDS
+    run_stall_window: float = RUN_STALL_WINDOW
+    raid_stall_window: float = RAID_STALL_WINDOW
+
+    @property
+    def heartbeat_stale_after(self) -> float:
+        return self.heartbeat_interval * self.stale_intervals
 
 
 @dataclass(frozen=True)
@@ -344,7 +360,8 @@ class Supervisor:
         if self._update_quarantine is None:
             self._quarantine_path.unlink(missing_ok=True)
         self.state.set(StateKind.ACTIVE, "AFK session in progress", session_id=session_id, quarantine=None,
-                       last_heartbeat=None, farmer_phase=None, refusals_superseded_through=request)
+                       last_heartbeat=None, farmer_phase=None, refusals_superseded_through=request,
+                       heartbeat_stale_after=self.policy.heartbeat_stale_after)
         self._last_totals = {}
         try:
             status = json.loads(self.os.read_shared(self.profile / "farmer_status.json"))
@@ -362,7 +379,10 @@ class Supervisor:
         while self.stop_requested_at() is None:
             if delay:
                 log(f"restart in {delay:.1f}s")
-                self.state.set(StateKind.ACTIVE, f"Restarting in {delay:.1f}s", farmer_phase=None)
+                restart = f"Restarting in {delay:.1f}s"
+                if attempts[-1].reason == RUN_STALLED:
+                    restart = f"Run stalled · {restart}"
+                self.state.set(StateKind.ACTIVE, restart, farmer_phase=None)
                 if stopped := self._backoff(delay):
                     reason = stopped
                     break
@@ -452,8 +472,12 @@ class Supervisor:
             if "totals" not in outcome:  # An outcome written before history was introduced.
                 outcome["totals"] = session_totals(self.os, self.profile, outcome["session"], {})
             timing = {"timestamp": outcome["ended_at"]} if "ended_at" in outcome else {}
+            failures = dict.fromkeys(attempt["reason"] for attempt in outcome["attempts"]
+                                     if isinstance(attempt, dict) and attempt.get("outcome") == "failed"
+                                     and isinstance(attempt.get("reason"), str))
             append_event(self.os, "session", session_id=outcome["session"], outcome=outcome["kind"],
                          reason=outcome["reason"], totals=outcome["totals"],
+                         attempt_failures=list(failures),
                          diagnostics=log_dir.relative_to(self.session_path.parent).as_posix(), **timing)
         except (OSError, ValueError) as exc:
             log(f"could not record AFK session {outcome['session']} in history: {exc}")
@@ -530,6 +554,10 @@ class Supervisor:
             if result.forced_reason:
                 kind = "stopped" if result.forced_reason == "operator_timeout" else "failed"
                 reason = result.forced_reason
+                if reason == RUN_STALLED:
+                    raid = in_raid(status.get("game"))
+                    window = self.policy.raid_stall_window if raid else self.policy.run_stall_window
+                    detail = f"Run stalled{' in a raid' if raid else ''}: game time did not advance for {window:g} s."
             elif result.clean(self.os):
                 kind, reason = "finished", reason or "done"
             elif result.code == 78 and (self.os.game_exit_status_reliable or status.get("terminal") is not True):
@@ -557,6 +585,7 @@ class Supervisor:
         last_seq = last_change = terminal_at = None
         finish_sent = finish_before_boot = False
         closing = False
+        run_progress = RunProgress(self.policy.run_stall_window, self.policy.raid_stall_window)
 
         def watch(status: dict | None) -> str | None:
             nonlocal last_seq, last_change, terminal_at, finish_sent, finish_before_boot
@@ -564,11 +593,12 @@ class Supervisor:
             now = time.monotonic()
             if last_change is None:
                 last_change = now
+            progress = run_progress.observe(status, now)
             if status is not None:
                 seq = status.get("heartbeat_seq")
                 if type(seq) is int and seq != last_seq:
                     last_seq, last_change = seq, now
-                    self.state.observe_farmer(status)
+                    self.state.observe_farmer(status, run_progress=run_progress.snapshot(now, time.time()))
                     self._remember_totals(status)
                 if status.get("terminal") is True and terminal_at is None:
                     terminal_at = now
@@ -603,8 +633,10 @@ class Supervisor:
             elif requested_at is None:
                 if last_seq is None and now - last_change > self.policy.startup_grace:
                     return "no_heartbeat"
-                if last_seq is not None and now - last_change > self.policy.heartbeat_interval * self.policy.stale_intervals:
+                if last_seq is not None and now - last_change > self.policy.heartbeat_stale_after:
                     return "heartbeat_stale"
+                if last_seq is not None and progress is Progress.STALLED:
+                    return RUN_STALLED
             return None
 
         return watch
