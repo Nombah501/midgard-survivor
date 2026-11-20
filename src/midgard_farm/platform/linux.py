@@ -79,14 +79,20 @@ class LinuxPlatform(Platform):
         return render_unit(argv)
 
     def register_service(self, argv: Sequence[str]) -> None:
-        rendered = self.render_service(argv)
+        rendered = self.render_service(argv).encode("utf-8")
         unit = self._unit_path()
         unit.parent.mkdir(parents=True, exist_ok=True)
-        self.write_atomic(unit, rendered.encode("utf-8"))
+        if not unit.is_file() or unit.read_bytes() != rendered:
+            self.write_atomic(unit, rendered)
         self._systemctl("daemon-reload")
+        self._systemctl("enable", UNIT_NAME)
 
     def unregister_service(self) -> None:
-        self._unit_path().unlink(missing_ok=True)
+        unit = self._unit_path()
+        if not unit.exists():
+            return
+        self._systemctl("disable", "--now", UNIT_NAME, timeout=95)
+        unit.unlink(missing_ok=True)
         self._systemctl("daemon-reload")
 
     @staticmethod
@@ -94,12 +100,22 @@ class LinuxPlatform(Platform):
         return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user" / UNIT_NAME
 
     @staticmethod
-    def _systemctl(*args: str) -> None:
+    def _systemctl(*args: str, timeout: float = 5) -> None:
         subprocess.run(["systemctl", "--user", *args],
-                       check=True, capture_output=True, text=True, errors="replace", timeout=5)
+                       check=True, capture_output=True, text=True, errors="replace", timeout=timeout)
 
     def start_service(self) -> None:
         self._systemctl("start", UNIT_NAME)
+
+    def run_service_binary(self, argv: Sequence[str]) -> Never:
+        command = check_argv(argv)
+        env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+        # The new bootloader must use its own bundled libraries, not the launcher's.
+        if "LD_LIBRARY_PATH_ORIG" in env:
+            env["LD_LIBRARY_PATH"] = env.pop("LD_LIBRARY_PATH_ORIG")
+        elif getattr(sys, "frozen", False):
+            env.pop("LD_LIBRARY_PATH", None)
+        os.execve(command[0], command, env)
 
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
         urgency = "critical" if priority == "high" else priority

@@ -1,4 +1,34 @@
-# Windows
+# Midgard Farm
+
+## Install from a release
+
+Download and unpack the private release archive for your OS. Open a normal terminal (no `sudo` or Administrator) in the unpacked `midgard-farm` folder and run setup:
+
+| Linux | Windows PowerShell |
+| --- | --- |
+| `./midgard-farm-setup` | `.\midgard-farm-setup.exe` |
+
+Enter a fine-grained GitHub token with **Contents: Read-only** for the private release repository. Setup hides what you type and stores the token in your app data directory, not in the archive or logs. Rerunning setup reuses the stored token.
+
+Setup installs the app under `versions/<release>/` in `$XDG_DATA_HOME/midgard-farm` (default `~/.local/share/midgard-farm`) or `%LOCALAPPDATA%\MidgardFarm` and prints the installed window's path. It registers a systemd user unit on Linux and a hidden, least-privilege logon task on Windows. Both run the stable launcher in `bin/`, which reads `current` on every start. Only rerunning setup refreshes the launcher; stop the service first if setup needs to replace it.
+
+To inspect the service definition without installing or registering it, run setup with `--print-registration`.
+
+Open the installed `midgard-farm` window and use **Start service** for the first session; setup does not start it. On Windows, sign in and keep the machine awake. Setup only reads the auto-logon setting and checks Windows Update active hours against 22:00–06:00 local time; it does not change either setting or guarantee against restarts.
+
+If the legacy checkout mounted the farmer patch on Linux, restore the official patch with the legacy `uninstall.sh` before starting the new service. The new app expects its own `patches/official-state.json` in the game profile and will not guess from legacy backups.
+
+## Uninstall
+
+Finish any AFK session, close the game and window, and run setup with `--uninstall` from the installed version or the unpacked archive:
+
+| Linux | Windows PowerShell |
+| --- | --- |
+| `./midgard-farm-setup --uninstall` | `.\midgard-farm-setup.exe --uninstall` |
+
+This stops and removes the service and restores the official patch without deleting the game profile, logs or history. If it reports a missing official patch, open the game and accept its update, close it, and rerun uninstall. To also remove the installed app files and credential after successful uninstall, delete `bin/`, `versions/`, `current` and `release-token` from the app data directory; leave the rest in place to keep your data.
+
+## Windows development checkout
 
 Run from a checkout with Python 3.13. No app installer, bash, or administrator rights are needed. In an **unelevated** PowerShell at the checkout root:
 
@@ -18,7 +48,7 @@ With the service running, start `MidgardSurvivors.exe` manually once, accept any
 
 **Windows v1 does not isolate the game from the network.** An official updater prompt can stall an unattended session. On a CloudSave-linked profile, a cloud pull can restart the game or a conflict dialog can block it. The Linux profile is CloudSave-linked; check whether gpu-pc uses the same cloud account before farming on both machines. Do not run simultaneous farms against the same cloud profile.
 
-## Verify on gpu-pc
+### Verify on gpu-pc
 
 1. **Compare builds.** On both machines, use the same checkout revision and a copied profile with the same official patch and bridge. If a farmer patch is mounted, the copy must also have its `patches/official-state.json`. Use matching base packs if extraction falls back to the base. Never run this against the live Linux profile. Save the following as `parity.py` in the checkout's `src` directory on each machine. From `src`, run it with the checkout's Python 3.13 and the arguments `parity.py "<copied profile>" "<game directory>"`:
 

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import winreg
 from collections.abc import Sequence
 from ctypes import wintypes
 from pathlib import Path
@@ -23,6 +24,11 @@ _GODOT_DATA_HOME = "APPDATA"
 _GODOT_USER_DATA = Path("Godot", "app_userdata")
 
 SERVICE_TASK_NAME = "Midgard Farm"
+
+_WINLOGON = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+_UPDATE_POLICY = r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+_UPDATE_SETTINGS = r"SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
+SCHED_E_TASK_NOT_RUNNING = 0x8004130B
 
 _TASK_XML = """\
 <?xml version="1.0"?>
@@ -163,6 +169,12 @@ _UnlockFileEx.argtypes = [
 _UnlockFileEx.restype = wintypes.BOOL
 _MoveFileExW = _kernel32.MoveFileExW
 _MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+_SetDllDirectoryW = _kernel32.SetDllDirectoryW
+_SetDllDirectoryW.argtypes = [wintypes.LPCWSTR]
+_SetDllDirectoryW.restype = wintypes.BOOL
+_GetStdHandle = _kernel32.GetStdHandle
+_GetStdHandle.argtypes = [wintypes.DWORD]
+_GetStdHandle.restype = wintypes.HANDLE
 _MoveFileExW.restype = wintypes.BOOL
 _CreateJobObjectW = _kernel32.CreateJobObjectW
 _CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
@@ -221,6 +233,27 @@ def _system_tool(tool: str, *args: str) -> str:
     command = _env_dir("SystemRoot") / "System32" / tool
     return subprocess.run([str(command), *args], creationflags=CREATE_NO_WINDOW,
                           check=True, capture_output=True, text=True, errors="replace", timeout=15).stdout
+
+
+def _scheduler_error(exc: subprocess.CalledProcessError, code: int) -> bool:
+    message = ctypes.FormatError(code).strip().casefold()
+    return exc.returncode == 1 and bool(message) and (exc.stderr or "").strip().casefold().endswith(message)
+
+
+def _registry_value(path: str, name: str) -> object:
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, access=winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return value
+    except OSError:
+        return None
+
+
+def _covers_night(start: object, end: object) -> bool:
+    if not isinstance(start, int) or not isinstance(end, int) or not (0 <= start < 24 and 0 <= end < 24):
+        return False
+    duration = (end - start) % 24
+    return 0 < duration <= 18 and (22 - start) % 24 + 8 <= duration
 
 
 def _process_image(pid: int) -> Path | None:
@@ -282,6 +315,7 @@ class _JobTree(ProcessTree):
 
 class WindowsPlatform(Platform):
     release_os = "windows"
+    executable_suffix = ".exe"
     game_exe_name = "MidgardSurvivors.exe"
     game_exit_status_reliable = False
 
@@ -360,15 +394,53 @@ class WindowsPlatform(Platform):
 
     def unregister_service(self) -> None:
         try:
+            _system_tool("schtasks.exe", "/End", "/TN", SERVICE_TASK_NAME)
+        except subprocess.CalledProcessError as exc:
+            if _scheduler_error(exc, ERROR_FILE_NOT_FOUND):
+                return
+            if not _scheduler_error(exc, SCHED_E_TASK_NOT_RUNNING):
+                raise
+        try:
             _system_tool("schtasks.exe", "/Delete", "/TN", SERVICE_TASK_NAME, "/F")
         except subprocess.CalledProcessError as exc:
-            # schtasks reports several errors as exit 1; use the system's localized message.
-            missing = ctypes.FormatError(ERROR_FILE_NOT_FOUND).strip().casefold()
-            if exc.returncode != 1 or not missing or not (exc.stderr or "").strip().casefold().endswith(missing):
+            if not _scheduler_error(exc, ERROR_FILE_NOT_FOUND):
                 raise
 
     def start_service(self) -> None:
         _system_tool("schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME)
+
+    def setup_warnings(self) -> tuple[str, ...]:
+        warnings = []
+        if _registry_value(_WINLOGON, "AutoAdminLogon") != "1":
+            warnings.append("Windows auto-logon is off or could not be verified; sign in again after a reboot.")
+        source = _UPDATE_POLICY if _registry_value(_UPDATE_POLICY, "SetActiveHours") == 1 else _UPDATE_SETTINGS
+        start = _registry_value(source, "ActiveHoursStart")
+        end = _registry_value(source, "ActiveHoursEnd")
+        if not _covers_night(start, end):
+            warnings.append("Windows Update active hours do not cover 22:00–06:00 or could not be verified; "
+                            "check Settings > Windows Update > Advanced options > Active hours.")
+        return tuple(warnings)
+
+    def run_service_binary(self, argv: Sequence[str]) -> int:
+        # The child bootloader must load its own DLLs, not those of this launcher.
+        _check(_SetDllDirectoryW(None))
+        env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+        with self.spawn_tree(argv, env=env, creationflags=CREATE_NO_WINDOW) as service:
+            return service.wait()
+
+    def report_launcher_error(self, message: str) -> None:
+        if sys.stderr is not None:
+            super().report_launcher_error(message)
+            return
+        # A scheduled (windowless) process has no Python stderr. Honor a pipe
+        # supplied by a caller or attach to the caller's console if there is one.
+        handle = _GetStdHandle(-12)  # STD_ERROR_HANDLE
+        if not handle or handle == INVALID_HANDLE_VALUE:
+            _kernel32.AttachConsole(wintypes.DWORD(-1))  # ATTACH_PARENT_PROCESS
+            handle = _GetStdHandle(-12)
+        if handle and handle != INVALID_HANDLE_VALUE:
+            with open(msvcrt.open_osfhandle(handle, os.O_WRONLY), "w", encoding="utf-8") as stderr:
+                print(message, file=stderr)
 
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
         audio = '<audio silent="true"/>' if priority == "low" else ""

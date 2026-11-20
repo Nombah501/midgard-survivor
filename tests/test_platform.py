@@ -438,7 +438,14 @@ def test_service_registration_writes_and_removes_the_user_unit(tmp_path, monkeyp
     assert unit.read_text(encoding="utf-8") == rendered
     OS.unregister_service()
     assert not unit.exists()
-    assert calls == [["systemctl", "--user", "daemon-reload"]] * 2
+    assert calls == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "midgard-farm.service"],
+        ["systemctl", "--user", "disable", "--now", "midgard-farm.service"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+    OS.unregister_service()
+    assert len(calls) == 4
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows Task Scheduler")
@@ -491,7 +498,11 @@ def test_windows_task_xml_and_registration_commands(tmp_path, monkeypatch):
     assert calls[0][:4] == ["/Create", "/TN", "Midgard Farm", "/XML"]
     assert calls[0][5:] == ["/F"]
     assert not Path(calls[0][4]).exists()
-    assert calls[1:] == [["/Run", "/TN", "Midgard Farm"], ["/Delete", "/TN", "Midgard Farm", "/F"]]
+    assert calls[1:] == [
+        ["/Run", "/TN", "Midgard Farm"],
+        ["/End", "/TN", "Midgard Farm"],
+        ["/Delete", "/TN", "Midgard Farm", "/F"],
+    ]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows Task Scheduler")
@@ -500,7 +511,7 @@ def test_windows_unregister_ignores_only_missing_tasks(monkeypatch, winerror):
     import ctypes
 
     def run(argv, **kwargs):
-        assert argv[1:] == ["/Delete", "/TN", "Midgard Farm", "/F"]
+        assert argv[1:] == ["/End", "/TN", "Midgard Farm"]
         raise subprocess.CalledProcessError(1, argv, stderr=f"ERROR: {ctypes.FormatError(winerror)}\r\n")
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -509,6 +520,72 @@ def test_windows_unregister_ignores_only_missing_tasks(monkeypatch, winerror):
     else:
         with pytest.raises(subprocess.CalledProcessError):
             OS.unregister_service()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows setup checks")
+@pytest.mark.parametrize(
+    "auto_logon, local_hours, policy_hours, expected",
+    [
+        ("0", (8, 17), None, ("auto-logon", "22:00–06:00")),
+        ("1", (22, 6), None, ()),
+        ("1", (8, 17), (20, 7), ()),
+        ("1", (22, 6), (23, 7), ("22:00–06:00",)),
+        ("1", (22, 5), None, ("22:00–06:00",)),
+        (None, None, None, ("auto-logon", "22:00–06:00")),
+    ],
+)
+def test_windows_setup_warnings_only_query_settings(monkeypatch, auto_logon, local_hours, policy_hours, expected):
+    import winreg
+
+    winlogon = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+    policy = r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+    settings = r"SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
+    values = {(winlogon, "AutoAdminLogon"): auto_logon}
+    if local_hours:
+        values[(settings, "ActiveHoursStart")], values[(settings, "ActiveHoursEnd")] = local_hours
+    if policy_hours:
+        values[(policy, "ActiveHoursStart")], values[(policy, "ActiveHoursEnd")] = policy_hours
+        values[(policy, "SetActiveHours")] = 1
+    read = []
+
+    class Key:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self.path
+
+        def __exit__(self, *_):
+            pass
+
+    def open_key(hive, path, reserved=0, access=winreg.KEY_READ):
+        assert hive == winreg.HKEY_LOCAL_MACHINE
+        assert access == winreg.KEY_READ
+        return Key(path)
+
+    def query(path, name):
+        assert (path, name) in {
+            (winlogon, "AutoAdminLogon"), (policy, "SetActiveHours"),
+            (policy, "ActiveHoursStart"), (policy, "ActiveHoursEnd"),
+            (settings, "ActiveHoursStart"), (settings, "ActiveHoursEnd"),
+        }
+        read.append((path, name))
+        value = values.get((path, name))
+        if value is None:
+            raise FileNotFoundError(name)
+        return value, winreg.REG_SZ if isinstance(value, str) else winreg.REG_DWORD
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("setup warnings must not write to the registry")
+
+    monkeypatch.setattr(winreg, "OpenKey", open_key)
+    monkeypatch.setattr(winreg, "QueryValueEx", query)
+    for name in ("CreateKey", "CreateKeyEx", "SetValue", "SetValueEx", "DeleteKey", "DeleteKeyEx", "DeleteValue"):
+        monkeypatch.setattr(winreg, name, unexpected_write)
+    warnings = OS.setup_warnings()
+    assert (winlogon, "AutoAdminLogon") in read
+    assert len(warnings) == len(expected)
+    assert all(text in warning for text, warning in zip(expected, warnings, strict=True))
 
 
 @pytest.mark.skipif(not WINDOWS_CI, reason="real Task Scheduler round trip on Windows CI only")

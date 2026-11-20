@@ -109,20 +109,40 @@ def test_onedir_smoke_accepts_an_aliased_extraction_path(tmp_path, monkeypatch):
         (impl / "qmldir").touch()
         (impl / f"libqtquickcontrols2{style.lower()}styleimplplugin.so").touch()
         (libs / f"libQt6QuickControls2{style}StyleImpl.so.6").touch()
+    (onedir / "midgard-farm-setup").touch()
+    (onedir / "launcher" / "_internal").mkdir(parents=True)
+    (onedir / "launcher" / "midgard-farm-launcher").touch()
     alias = tmp_path / "MIDGAR~1"
     alias.symlink_to(extracted, target_is_directory=True)
 
+    def run_command(argv, *, cwd, **kwargs):
+        if argv[-1] == "--help":
+            assert argv[0] == onedir / "midgard-farm-setup"
+            return subprocess.CompletedProcess(argv, 0, stdout="--uninstall")
+        data = cwd / "data" / "midgard-farm"
+        if argv[-1] == "--print-registration":
+            assert argv == [onedir / "midgard-farm-setup", "--print-registration"]
+            return subprocess.CompletedProcess(argv, 0, stdout=f'ExecStart="{data / "bin" / "midgard-farm-launcher"}"\n')
+        assert argv == [data / "bin" / "midgard-farm-launcher"]
+        assert argv[0].is_file() and not (data / "current").exists()
+        return subprocess.CompletedProcess(argv, 1, stderr="cannot read current release pointer")
+
     def run_role(executable, flag, home, env):
         if flag == "--self-check":
-            return {"version": assets.version(), "inputs": str(inputs.resolve()),
-                    "farmer_hash": farmer_hash(inputs), "registration": ""}
+            data = home / "data" / "midgard-farm"
+            version = (data / "current").read_text(encoding="utf-8").strip()
+            selected = data / "versions" / version / inputs.relative_to(onedir)
+            assert executable == data / "bin" / "midgard-farm-launcher"
+            return {"version": version, "inputs": str(selected),
+                    "farmer_hash": farmer_hash(selected), "registration": ""}
         targets = json.loads((inputs / "targets.json").read_bytes())
         return {"version": assets.version(), "loaded": True, "messages": [],
                 "presets": sorted(path.name for path in (inputs / "presets").glob("*.json")),
                 "characters": [row["label"] for row in targets["characters"].values()]}
 
+    monkeypatch.setattr(check_onedir.subprocess, "run", run_command)
     monkeypatch.setattr(check_onedir, "run_role", run_role)
-    monkeypatch.setattr(check_onedir, "check_registration", lambda *args: None)
+    # The fixture's self-check has no registration; setup must provide it.
     check_onedir.check(alias / "midgard-farm")
 
 

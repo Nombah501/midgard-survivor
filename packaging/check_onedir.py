@@ -28,9 +28,9 @@ def run_role(executable: Path, flag: str, home: Path, env: dict[str, str]) -> di
     return json.loads(output)
 
 
-def check_registration(executable: Path, definition: str, env: dict[str, str], home: Path) -> None:
+def check_registration(launcher: Path, definition: str) -> None:
     if os.name == "nt":
-        with executable.open("rb") as file:
+        with launcher.open("rb") as file:
             file.seek(0x3C)
             pe_offset, = struct.unpack("<I", file.read(4))
             file.seek(pe_offset + 4 + 20 + 68)  # PE signature, COFF header, then Subsystem field.
@@ -39,14 +39,11 @@ def check_registration(executable: Path, definition: str, env: dict[str, str], h
         task = ElementTree.fromstring(definition)
         action = task.find(".//{*}Exec")
         assert action is not None
-        assert action.findtext("{*}Command") == str(executable), definition
-        assert action.findtext("{*}WorkingDirectory") == str(executable.parent), definition
+        assert action.findtext("{*}Command") == str(launcher), definition
+        assert action.findtext("{*}WorkingDirectory") == str(launcher.parent), definition
         assert action.find("{*}Arguments") is None, definition
     else:
-        printed = subprocess.run([executable, "--print-unit"], cwd=home, env=env, timeout=60,
-                                 check=True, capture_output=True, text=True).stdout
-        assert printed == definition
-        escaped = str(executable).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+        escaped = str(launcher).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
         assert f'ExecStart="{escaped}"' in definition.splitlines(), definition
 
 
@@ -103,7 +100,7 @@ def check(onedir: Path) -> None:
     suffix = ".exe" if os.name == "nt" else ""
 
     with tempfile.TemporaryDirectory(prefix="midgard farm smoke ") as directory:
-        home = Path(directory)
+        home = Path(directory).resolve()
         empty = home / "empty-path"
         empty.mkdir()
         env = os.environ.copy()
@@ -117,27 +114,43 @@ def check(onedir: Path) -> None:
         if os.name == "nt":
             env["QT_QPA_FONTDIR"] = str(Path(os.environ["SystemRoot"]) / "Fonts")
         assert not any(shutil.which(name, path=env["PATH"]) for name in ("python", "python3", "py"))
+        setup = onedir / f"midgard-farm-setup{suffix}"
+        help_result = subprocess.run([setup, "--help"], cwd=home, env=env, timeout=60,
+                                     capture_output=True, text=True, check=True)
+        assert "--uninstall" in help_result.stdout, help_result
 
-        service = onedir / f"midgard-farm-service{suffix}"
-        service_report = run_role(service, "--self-check", home, env)
+        # Exercise the archived launcher in its installed layout without registering anything.
+        data = home / "local" / "MidgardFarm" if suffix else home / "data" / "midgard-farm"
+        installed = data / "versions" / version
+        shutil.copytree(onedir, installed, symlinks=True)
+        shutil.copytree(onedir / "launcher", data / "bin", symlinks=True)
+        launcher = data / "bin" / f"midgard-farm-launcher{suffix}"
+        no_pointer = subprocess.run([launcher], cwd=home, env=env, timeout=60,
+                                    capture_output=True, encoding="utf-8", errors="replace")
+        assert no_pointer.returncode == 1 and "current release pointer" in no_pointer.stderr, no_pointer
+        (data / "current").write_text(version + "\n", encoding="utf-8")
+
+        registration = subprocess.run([setup, "--print-registration"], cwd=home, env=env, timeout=60,
+                                      capture_output=True, text=True, check=True).stdout
+        check_registration(launcher, registration)
+        service_report = run_role(launcher, "--self-check", home, env)
         assert service_report["version"] == version, service_report
         assert service_report["farmer_hash"] == expected_hash, service_report
         inputs = Path(service_report["inputs"]).resolve(strict=True)
-        assert inputs.is_relative_to(onedir), inputs
+        assert inputs.is_relative_to(installed.resolve()), inputs
         expected = {source.relative_to(checkout): source.read_bytes() for source in expected_assets}
         actual = {path.relative_to(inputs): path.read_bytes() for path in inputs.rglob("*") if path.is_file()}
         assert actual.keys() == expected.keys(), actual.keys() ^ expected.keys()
         differing = [name for name in expected if expected[name] != actual[name]]
         assert not differing, differing
-        check_registration(service, service_report["registration"], env, home)
 
         window = run_role(onedir / f"midgard-farm{suffix}", "--smoke-test", home, env)
         assert window["loaded"] and not window["messages"], window
         assert window["version"] == version, window
         assert window["presets"] == [path.name for path in presets], window
         assert expected_characters <= set(window["characters"]), window
-    print(f"{version}: {size_mib:.1f} MiB onedir; service, registration command and offscreen QML passed; "
-          f"Farmer hash {expected_hash}")
+    print(f"{version}: {size_mib:.1f} MiB onedir; setup, launcher, service, registration command and "
+          f"offscreen QML passed; Farmer hash {expected_hash}")
 
 
 if __name__ == "__main__":

@@ -21,3 +21,4 @@
   - The version at runtime is `midgard_farm.assets.version()`.
   - The service's self-check is `midgard-farm-service --self-check <out.json>` (`packaging/service_entry.py`); use it, or the readiness marker, for the 60 s ready check.
   - First real release: v0.1.0 (`b91de77`).
+- 2026-11-20 (from ticket 12): New archives also contain console `midgard-farm-setup[.exe]` and a standalone onedir at `launcher/midgard-farm-launcher[.exe]`. Setup copies the latter to `<app-data>/bin/` and registers it once; do not update it as part of automatic App updates. The stable launcher reads `<app-data>/current` (UTF-8 `<version>\n`) on startup and runs the service under `<app-data>/versions/<version>/`. The fine-grained read-only token is stored in `<app-data>/release-token`.

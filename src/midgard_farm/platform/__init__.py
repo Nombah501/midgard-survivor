@@ -68,6 +68,8 @@ class Platform(abc.ABC):
     game_exit_status_reliable: bool
     """Whether the game exit code can veto an otherwise clean terminal status."""
 
+    executable_suffix = ""
+
     game_exe_name: str
     """File name of the game executable on this OS."""
 
@@ -129,11 +131,22 @@ class Platform(abc.ABC):
 
     @abc.abstractmethod
     def unregister_service(self) -> None:
-        """Remove the background service registration."""
+        """Stop and remove the background service registration."""
 
     @abc.abstractmethod
     def start_service(self) -> None:
         """Ask the OS to start the registered Midgard Farm background service."""
+
+    @abc.abstractmethod
+    def run_service_binary(self, argv: Sequence[str]) -> int:
+        """Run the selected service under the registered launcher."""
+
+    def setup_warnings(self) -> tuple[str, ...]:
+        """Read settings that may prevent an unattended night."""
+        return ()
+
+    def report_launcher_error(self, message: str) -> None:
+        print(message, file=sys.stderr)
 
     @abc.abstractmethod
     def notify_desktop(self, title: str, message: str, priority: NotificationPriority) -> None:
