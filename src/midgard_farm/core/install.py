@@ -107,6 +107,14 @@ def install(os_: Platform, source: Path, version: str, prompt_token: Callable[[]
     if target != source and target.is_relative_to(source):
         raise SetupError("unpack the release outside the app's data directory")
     data.mkdir(parents=True, exist_ok=True)
+    with os_.acquire_lock(data / "app-update.lock"):
+        return _install_locked(os_, source, target, version, prompt_token)
+
+
+def _install_locked(os_: Platform, source: Path, target: Path, version: str,
+                    prompt_token: Callable[[], str]) -> Path:
+    data = os_.app_data_dir().resolve()
+    suffix = os_.executable_suffix
     token_file = data / _TOKEN
     if token_file.is_symlink():
         raise SetupError("the release-token must be a regular file in the app's data directory")
@@ -142,6 +150,7 @@ def install(os_: Platform, source: Path, version: str, prompt_token: Callable[[]
         previous = None
     if previous != selected:
         os_.write_atomic(pointer, selected)
+        (data / "app-update-pending.json").unlink(missing_ok=True)
     os_.register_service(service_registration_command(os_))
     return target
 

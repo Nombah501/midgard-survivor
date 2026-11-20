@@ -24,6 +24,7 @@ _GODOT_DATA_HOME = "APPDATA"
 _GODOT_USER_DATA = Path("Godot", "app_userdata")
 
 SERVICE_TASK_NAME = "Midgard Farm"
+_UPDATE_TASK_NAME = "Midgard Farm App Update"
 
 _WINLOGON = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 _UPDATE_POLICY = r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
@@ -33,12 +34,7 @@ SCHED_E_TASK_NOT_RUNNING = 0x8004130B
 _TASK_XML = """\
 <?xml version="1.0"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers>
-    <LogonTrigger>
-      <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-      <UserId>{sid}</UserId>
-    </LogonTrigger>
-  </Triggers>
+{triggers}
   <Principals>
     <Principal id="Operator">
       <UserId>{sid}</UserId>
@@ -51,12 +47,8 @@ _TASK_XML = """\
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <Hidden>true</Hidden>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>
-      <Count>3</Count>
-    </RestartOnFailure>
-  </Settings>
+    <ExecutionTimeLimit>{time_limit}</ExecutionTimeLimit>
+{restart}
   <Actions Context="Operator">
     <Exec>
       <Command>{command}</Command>
@@ -65,6 +57,19 @@ _TASK_XML = """\
   </Actions>
 </Task>
 """
+
+_TASK_LOGON = """\
+  <Triggers>
+    <LogonTrigger>
+      <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+      <UserId>{sid}</UserId>
+    </LogonTrigger>
+  </Triggers>"""
+_TASK_RESTART = """\
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>"""
 
 ERROR_FILE_NOT_FOUND = 2
 ERROR_ACCESS_DENIED = 5
@@ -372,6 +377,9 @@ class WindowsPlatform(Platform):
         return None
 
     def render_service(self, argv: Sequence[str]) -> str:
+        return self._render_task(argv, watchdog=False)
+
+    def _render_task(self, argv: Sequence[str], *, watchdog: bool) -> str:
         command, *args = check_argv(argv)
         # Use the actual caller's SID, not a possibly ambiguous environment username.
         rows = csv.reader(_system_tool("whoami.exe", "/User", "/FO", "CSV", "/NH").splitlines())
@@ -379,18 +387,22 @@ class WindowsPlatform(Platform):
         if len(identity) != 2 or not identity[1].startswith("S-1-"):
             raise RuntimeError("could not identify the current Windows user")
         root = checkout_root()
-        directory = root / "src" if root is not None else Path(command).parent
+        directory = root / "src" if root is not None and not watchdog else Path(command).parent
         arguments = f"      <Arguments>{escape(subprocess.list2cmdline(args))}</Arguments>\n" if args else ""
-        return _TASK_XML.format(sid=escape(identity[1]), command=escape(command),
-                                arguments=arguments, directory=escape(str(directory)))
+        sid = escape(identity[1])
+        return _TASK_XML.format(sid=sid, command=escape(command), arguments=arguments, directory=escape(str(directory)),
+                                triggers="" if watchdog else _TASK_LOGON.format(sid=sid),
+                                time_limit="PT120S" if watchdog else "PT0S", restart="" if watchdog else _TASK_RESTART)
 
     def register_service(self, argv: Sequence[str]) -> None:
-        xml = self.render_service(argv)
+        self._register_task(SERVICE_TASK_NAME, self.render_service(argv))
+
+    def _register_task(self, name: str, xml: str) -> None:
         with tempfile.TemporaryDirectory(prefix="midgard-farm-task-") as temporary:
             path = Path(temporary) / "task.xml"
             # schtasks accepts UTF-16LE with a BOM, including non-ASCII paths.
             path.write_text(xml, encoding="utf-16")
-            _system_tool("schtasks.exe", "/Create", "/TN", SERVICE_TASK_NAME, "/XML", str(path), "/F")
+            _system_tool("schtasks.exe", "/Create", "/TN", name, "/XML", str(path), "/F")
 
     def unregister_service(self) -> None:
         try:
@@ -408,6 +420,25 @@ class WindowsPlatform(Platform):
 
     def start_service(self) -> None:
         _system_tool("schtasks.exe", "/Run", "/TN", SERVICE_TASK_NAME)
+
+    def queue_update_watchdog(self, argv: Sequence[str]) -> None:
+        self._register_task(_UPDATE_TASK_NAME, self._render_task(argv, watchdog=True))
+        _system_tool("schtasks.exe", "/Run", "/TN", _UPDATE_TASK_NAME)
+
+    def restart_service(self) -> None:
+        try:
+            _system_tool("schtasks.exe", "/End", "/TN", SERVICE_TASK_NAME)
+        except subprocess.CalledProcessError as exc:
+            if not _scheduler_error(exc, SCHED_E_TASK_NOT_RUNNING):
+                raise
+        self.start_service()
+
+    def clear_update_watchdog(self) -> None:
+        try:
+            _system_tool("schtasks.exe", "/Delete", "/TN", _UPDATE_TASK_NAME, "/F")
+        except subprocess.CalledProcessError as exc:
+            if not _scheduler_error(exc, ERROR_FILE_NOT_FOUND):
+                raise
 
     def setup_warnings(self) -> tuple[str, ...]:
         warnings = []

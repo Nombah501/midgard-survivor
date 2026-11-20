@@ -100,12 +100,33 @@ class LinuxPlatform(Platform):
         return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user" / UNIT_NAME
 
     @staticmethod
-    def _systemctl(*args: str, timeout: float = 5) -> None:
-        subprocess.run(["systemctl", "--user", *args],
-                       check=True, capture_output=True, text=True, errors="replace", timeout=timeout)
+    def _systemctl(*args: str, timeout: float = 5) -> str:
+        return subprocess.run(["systemctl", "--user", *args],
+                              check=True, capture_output=True, text=True, errors="replace", timeout=timeout).stdout
 
     def start_service(self) -> None:
         self._systemctl("start", UNIT_NAME)
+
+    def queue_update_watchdog(self, argv: Sequence[str]) -> None:
+        settings = [f"--setenv={key}={os.environ[key]}" for key in ("XDG_DATA_HOME", "XDG_CONFIG_HOME")
+                    if key in os.environ]
+        subprocess.run(["systemd-run", "--user", "--no-block", "--collect", "--unit=midgard-farm-update",
+                        "--property=RuntimeMaxSec=120s", *settings, "--", *check_argv(argv)],
+                       check=True, capture_output=True, text=True, errors="replace", timeout=5)
+
+    def restart_service(self) -> None:
+        try:
+            self._systemctl("reset-failed", UNIT_NAME)
+        except subprocess.CalledProcessError:
+            # A cleanly stopped unit may already be unloaded and have no counters to reset.
+            pass
+        self._systemctl("restart", "--no-block", UNIT_NAME)
+
+    def service_start_refused(self) -> bool:
+        output = self._systemctl("show", "--property=Result", "--property=ActiveState", "--property=NRestarts", UNIT_NAME)
+        properties = set(output.splitlines())
+        # A restart loop can also end in start-limit-hit; that isn't a refused first launch.
+        return {"Result=start-limit-hit", "ActiveState=failed", "NRestarts=0"} <= properties
 
     def run_service_binary(self, argv: Sequence[str]) -> Never:
         command = check_argv(argv)

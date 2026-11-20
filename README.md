@@ -18,6 +18,16 @@ Open the installed `midgard-farm` window and use **Start service** for the first
 
 If the legacy checkout mounted the farmer patch on Linux, restore the official patch with the legacy `uninstall.sh` before starting the new service. The new app expects its own `patches/official-state.json` in the game profile and will not guess from legacy backups.
 
+## App updates
+
+The background service checks the private releases at startup and every 24 hours. It downloads the newest stable release, verifies its SHA-256 sidecar, and waits for the AFK session to reach its terminal outcome and the game to close. The app then switches `current` and restarts the service. If the selected service does not report ready within 60 seconds, an independent watchdog from the previous release restores it and excludes the failed version from future checks.
+
+If systemd confirms that it refused the first start and the new service never ran, the watchdog restores the previous release without blacklisting the candidate. Windows Task Scheduler errors reported directly at restart are handled the same way. After Windows accepts a restart request, a missing readiness marker still counts as a failed release: the task's last-run result alone does not identify this handoff reliably.
+
+The **Updates** screen shows the selected version, release check status and **Roll back to …** when a previous release is available. You can also run `midgard-farm-service rollback-app` (`midgard-farm-service.exe rollback-app` on Windows) to queue the same request. Start the window from the selected version's folder after an update. The game preparation pipeline rebuilds the farmer patch if the selected version's Farmer hash differs.
+
+If the release token is rejected, delete only `release-token` from the app data directory, then rerun setup from the selected version's folder to enter a replacement. If an update is still pending, restart the service to let it resume. If both the watchdog crashed and the selected service cannot start at all, run setup from the **previous** release's folder under `versions/` (or unpack its archive and run setup from there). This selects the previous release again without deleting your profile or history. Then use **Start service** from the window.
+
 ## Uninstall
 
 Finish any AFK session, close the game and window, and run setup with `--uninstall` from the installed version or the unpacked archive:

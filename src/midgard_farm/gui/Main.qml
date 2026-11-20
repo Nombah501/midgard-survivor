@@ -500,7 +500,23 @@ ApplicationWindow {
                             value: shell.updates.app_version
                             valueObjectName: "installedAppVersion"
                         }
-                        Caption { objectName: "appUpdateCheck"; text: qsTr("No update check yet.") }
+                        Caption {
+                            objectName: "appUpdateCheck"
+                            text: shell.updates.app_check
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                        }
+                        ActionButton {
+                            objectName: "rollbackAppButton"
+                            visible: Boolean(shell.updates.previous_app_version)
+                            enabled: shell.updates.can_rollback
+                            text: qsTr("Roll back to %1").arg(shell.updates.previous_app_version)
+                            onClicked: shell.backend.rollbackApp()
+                        }
+                        BodyText {
+                            text: shell.updates.rollback_feedback
+                            visible: text.length > 0
+                        }
                     }
                 }
 

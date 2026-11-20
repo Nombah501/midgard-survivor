@@ -18,7 +18,7 @@ def config_path(os_: Platform) -> Path:
     return os_.app_data_dir() / "config.json"
 
 
-def read_config(os_: Platform) -> Config:
+def read_config(os_: Platform, *, strict: bool = False) -> Config:
     try:
         payload = json.loads(os_.read_shared(config_path(os_)))
         if not isinstance(payload, dict):
@@ -26,18 +26,24 @@ def read_config(os_: Platform) -> Config:
     except FileNotFoundError:
         return Config()
     except (OSError, ValueError):
+        if strict:
+            raise ValueError("invalid or unreadable config.json") from None
         print("supervisor: invalid or unreadable config.json; ignoring it", flush=True)
         return Config()
 
     try:
         url = _ntfy_url(payload.get("ntfy_url", ""))
     except ValueError:
+        if strict:
+            raise ValueError("invalid ntfy_url in config.json") from None
         print("supervisor: invalid ntfy_url in config.json; ntfy disabled", flush=True)
         url = ""
 
     value = payload.get("game_dir")
     game_dir = Path(value) if isinstance(value, str) and "\0" not in value else None
     if value is not None and (game_dir is None or not game_dir.is_absolute()):
+        if strict:
+            raise ValueError("game_dir in config.json must be an absolute path")
         print("supervisor: game_dir in config.json must be an absolute path; ignoring it", flush=True)
         game_dir = None
     return Config(ntfy_url=url, game_dir=game_dir)

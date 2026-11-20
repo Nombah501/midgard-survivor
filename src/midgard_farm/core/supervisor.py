@@ -129,7 +129,8 @@ class Supervisor:
 
     def __init__(self, os_: Platform, profile: Path, policy: Policy,
                  stop_requested_at: Callable[[], float | None], notify: Callable[[str, str], None],
-                 *, state: StateReporter, session_prefix: Literal["afk", "verify"] = "afk"):
+                 *, state: StateReporter, session_prefix: Literal["afk", "verify"] = "afk",
+                 before_start: Callable[[], bool] = lambda: False):
         self.os = os_
         self.profile = profile
         self.policy = policy
@@ -137,6 +138,7 @@ class Supervisor:
         self.notify = notify
         self.state = state
         self.session_prefix = session_prefix
+        self._before_start = before_start
         self._last_totals: dict = {}
         self.session_path = os_.app_data_dir() / "session.json"
         self.queue = commands.directory(os_)
@@ -193,10 +195,14 @@ class Supervisor:
             log(f"continuing unfinished session {session_id}")
             self._run_session(session_id, start, request, recovered_session=True)
         elif self.stop_requested_at() is None:
+            if self._before_start():
+                return
             self._idle_update()
 
         next_check = time.monotonic() + UPDATE_POLL
         while self.stop_requested_at() is None:
+            if self._before_start():
+                return
             for path, command in self._pending():
                 if command == "restore_official":
                     self._restore_official(path)
@@ -221,6 +227,8 @@ class Supervisor:
                 if isinstance(gate, game_update.Wait) and self._update_quarantine is not None:
                     refuse_command(self.os, self.state, path, "start", self._update_quarantine["reason"])
                     continue
+                if self._before_start():
+                    return
                 session_id = f"{self.session_prefix}-{uuid.uuid4().hex}"
                 self._write(self.session_path, {"id": session_id, "start": command.payload(),
                                                 "profile": str(self.profile.absolute()), "request": path.name})
@@ -314,7 +322,7 @@ class Supervisor:
                 "log_path": str(result.log_path) if result.log_path else None}
 
     def _pending(self) -> Iterator[tuple[Path, commands.Command]]:
-        return pending_commands(self.os)
+        return ((path, command) for path, command in pending_commands(self.os) if command != "rollback_app")
 
     def _refuse_start(self, path: Path) -> None:
         refuse_command(self.os, self.state, path, "start", "AFK session already active")

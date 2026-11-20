@@ -122,6 +122,10 @@ class _Backend(QObject):
             self._enqueue(partial(self._model.patch_command, cast(PatchCommand, action)))
 
     @Slot()
+    def rollbackApp(self) -> None:
+        self._enqueue(self._model.rollback_app)
+
+    @Slot()
     def startService(self) -> None:
         self._enqueue(self._model.start_service)
 

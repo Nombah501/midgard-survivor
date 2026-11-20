@@ -27,6 +27,7 @@ class Notifier:
     def __init__(self, os_: Platform, ntfy_url: str = ""):
         self._os = os_
         self._url = ntfy_url
+        self._lock = threading.Lock()
         self._pending: list[threading.Thread] = []
 
     def notify(self, event: str, message: str) -> None:
@@ -34,10 +35,11 @@ class Notifier:
         print(f"supervisor: notify {event}: {message}", flush=True)
         priority = _EVENT_PRIORITY.get(event, "normal")
         title = f"Midgard farmer: {event}"
-        self._pending = [thread for thread in self._pending if thread.is_alive()]
-        self._start("desktop", self._os.notify_desktop, title, message, priority)
-        if self._url:
-            self._start("ntfy", self._send_ntfy, title, message, priority)
+        with self._lock:
+            self._pending = [thread for thread in self._pending if thread.is_alive()]
+            self._start("desktop", self._os.notify_desktop, title, message, priority)
+            if self._url:
+                self._start("ntfy", self._send_ntfy, title, message, priority)
 
     def _start(self, transport: str, send: Callable[[str, str, NotificationPriority], None],
                title: str, message: str, priority: NotificationPriority) -> None:
@@ -65,5 +67,7 @@ class Notifier:
     def drain(self, timeout: float = 25.0) -> None:
         """Give all sends a shared shutdown budget, never waiting on them during recovery."""
         deadline = time.monotonic() + timeout
-        for thread in self._pending:
+        with self._lock:
+            pending = tuple(self._pending)
+        for thread in pending:
             thread.join(max(0.0, deadline - time.monotonic()))

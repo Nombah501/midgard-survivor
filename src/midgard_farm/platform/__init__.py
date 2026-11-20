@@ -138,6 +138,21 @@ class Platform(abc.ABC):
         """Ask the OS to start the registered Midgard Farm background service."""
 
     @abc.abstractmethod
+    def queue_update_watchdog(self, argv: Sequence[str]) -> None:
+        """Queue an on-demand process independent of the running service's lifetime."""
+
+    @abc.abstractmethod
+    def restart_service(self) -> None:
+        """Ask the registered launcher to restart, from the independent watchdog."""
+
+    def service_start_refused(self) -> bool:
+        """Whether the scheduler definitively refused startup, not a service exit."""
+        return False
+
+    def clear_update_watchdog(self) -> None:
+        """Remove any registration left behind by the one-shot watchdog."""
+
+    @abc.abstractmethod
     def run_service_binary(self, argv: Sequence[str]) -> int:
         """Run the selected service under the registered launcher."""
 

@@ -7,10 +7,12 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
-from . import platform
-from .core.commands import Start
+from . import assets, platform
+from .core import app_update
+from .core.commands import Start, submit
 from .core.config import read_config
 from .core.game_update import START_GAME_AND_UPDATE
 from .core.launch import GameBusy, run_attempt, shutdown_request
@@ -75,7 +77,30 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
         return EX_TEMPFAIL
     except OSError as exc:
         return _startup_quarantine(os_, data, notifier, "app_data_unusable", "app data directory unusable", exc)
-    with lock, shutdown_request() as requested_at, StateReporter(os_) as state:
+    updater = app_update.AppUpdater(os_, assets.version(), notifier.notify)
+    with lock, shutdown_request() as requested_at, StateReporter(os_) as state, updater:
+        try:
+            if app_update.recover_on_start(os_, updater.version):
+                return 0
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            log("could not resume pending App update watchdog")
+            return 1
+
+        def before_start() -> bool:
+            for path, command in pending_commands(os_):
+                if command != "rollback_app":
+                    continue
+                queued, reason = updater.begin(manual=True)
+                if queued:
+                    path.unlink()
+                    state.set(StateKind.UPDATING, "Rolling back the app")
+                    return True
+                if reason:
+                    refuse_command(os_, state, path, "rollback_app", reason)
+            queued, _ = updater.begin(manual=False)
+            if queued:
+                state.set(StateKind.UPDATING, "Installing an App update")
+            return queued
         last_missing = ""
         while requested_at() is None:
             try:
@@ -91,7 +116,7 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
                 for path, command in pending_commands(os_):
                     if isinstance(command, Start):
                         refuse_command(os_, state, path, "start", guidance)
-                    elif command in ("check_again", "restore_official"):
+                    elif command in ("check_again", "restore_official", "rollback_app"):
                         refuse_command(os_, state, path, command, guidance)
                     else:
                         path.unlink()
@@ -113,8 +138,17 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
             return _startup_quarantine(os_, data, notifier, "profile_unusable", "profile directory unusable", exc,
                                        state=state)
         with profile_lock:
+            try:
+                if not app_update.report_ready(os_, updater.version, lambda: requested_at() is not None):
+                    return 0
+            except (OSError, RuntimeError, ValueError) as exc:
+                log(f"App update startup checks failed: {type(exc).__name__}")
+                return 1
+            app_update.flush_history(os_)
+            updater.start()
             log(f"profile: {profile}")
-            supervisor = Supervisor(os_, profile, policy, requested_at, notifier.notify, state=state)
+            supervisor = Supervisor(os_, profile, policy, requested_at, notifier.notify, state=state,
+                                    before_start=before_start)
             try:
                 supervisor.run()
             except InvalidSavedSession as exc:
@@ -127,7 +161,7 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
     return 0
 
 
-def main(*, policy: Policy = Policy()) -> int:
+def main(argv: Sequence[str] | None = None, *, policy: Policy = Policy()) -> int:
     platform.run_isolation_helper()
     # Redirected output on Windows defaults to the ANSI code page, which
     # cannot encode every profile path.
@@ -141,14 +175,17 @@ def main(*, policy: Policy = Policy()) -> int:
     registration.add_argument("--unregister", action="store_true", help="remove the service registration")
     registration.add_argument("--print-unit", action="store_true", help="render the systemd user unit")
     registration.add_argument("--print-task", action="store_true", help="render the Windows Task Scheduler XML")
+    registration.add_argument("--app-update-handoff", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="render the service definition without registering it")
     subcommands = parser.add_subparsers(dest="command")
     launch = subcommands.add_parser("launch", help="launch one attempt with the installed farmer patch")
     launch.add_argument("preset", nargs="?", type=Path, help="JSON preset; defaults to the profile's farmer.cfg")
     launch.add_argument("--session-id", default=os.environ.get("FARMER_SESSION_ID"),
                         help="run a supervised attempt (defaults to FARMER_SESSION_ID)")
-    args = parser.parse_args()
-    if args.command and any((args.register, args.unregister, args.print_unit, args.print_task, args.dry_run)):
+    subcommands.add_parser("rollback-app", help="request rollback to the previous app version")
+    args = parser.parse_args(argv)
+    if args.command and any((args.register, args.unregister, args.print_unit, args.print_task, args.dry_run,
+                             args.app_update_handoff)):
         parser.error("service registration options cannot be combined with launch")
     if args.dry_run and args.unregister:
         parser.error("--dry-run cannot be combined with --unregister")
@@ -173,6 +210,13 @@ def main(*, policy: Policy = Policy()) -> int:
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             detail = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else None
             print(f"midgard-farm-service: {str(detail or exc).strip()}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "rollback-app":
+        try:
+            submit(os_, "rollback_app")
+        except OSError as exc:
+            print(f"midgard-farm-service: could not queue App rollback: {exc}", file=sys.stderr)
             return 1
         return 0
     if args.command == "launch":
@@ -204,6 +248,12 @@ def main(*, policy: Policy = Policy()) -> int:
 
     notifier = Notifier(os_, read_config(os_).ntfy_url)
     try:
+        if args.app_update_handoff:
+            def deliver_update_notification(event: str, message: str) -> None:
+                notifier.notify(event, message)
+                notifier.drain(timeout=10)
+
+            return app_update.run_watchdog(os_, args.app_update_handoff, deliver_update_notification)
         return _serve(os_, policy, notifier)
     finally:
         notifier.drain()

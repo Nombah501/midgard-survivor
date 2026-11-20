@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import assets
-from ..core import commands, game_update
+from ..core import app_update, commands, game_update
 from ..core.history import read_history
 from ..core.profile import ProfileNotFound, find_profile
 from ..core.state import ServiceState, StateKind, read_state
@@ -178,6 +178,10 @@ class UpdatesView:
     feedback: str = ""
     app_version: str = _DASH
     check_again_feedback: str = ""
+    app_check: str = "No update check yet."
+    previous_app_version: str = ""
+    can_rollback: bool = False
+    rollback_feedback: str = ""
 
 
 @dataclass(frozen=True)
@@ -296,6 +300,7 @@ class SessionModel:
         self._action_error = ""
         self._patch_request: tuple[commands.PatchCommand, Path] | None = None
         self._app_version = assets.version()
+        self._rollback_request: Path | None = None
         self._history_rows: list[dict[str, Any]] = []
         self._history = HistoryView()
         self._last_update: tuple[str, str] = ("No outcome yet", "")
@@ -480,8 +485,35 @@ class SessionModel:
             if ((outcome == "restored" and state.keep_official)
                     or (outcome == "restore_failed" and restore_requested_here)):
                 feedback = _text(restore.get("reason"))
+        app = app_update.read_update_status(self._os)
+        check = "No update check yet."
+        if app.reason:
+            if app.last_checked is None:
+                check = f"No successful update check yet ({app.reason})."
+            else:
+                days = max(0, int((time.time() - app.last_checked) // 86400))
+                check = f"Updates not checked for {days} {'day' if days == 1 else 'days'} ({app.reason})."
+        elif app.last_checked is not None:
+            when = datetime.fromtimestamp(app.last_checked).strftime("%Y-%m-%d %H:%M")
+            check = f"Last checked: {when}."
+        if app.switch_overdue:
+            check = "App update did not finish. Restart the service; if it cannot start, rerun the previous setup."
+        elif app.switching:
+            check = "App update is waiting for the service to restart."
+        elif app.staged and app.staged != app.version and not app.reason:
+            check = f"Version {app.staged} downloaded; it will install after the AFK session and game close."
+        rollback_feedback = ""
+        if self._rollback_request is not None:
+            name = self._rollback_request.name
+            if refusal := next((row for row in state.command_refusals if row.get("request") == name), None):
+                rollback_feedback = f"Rollback refused: {_text(refusal.get('reason'))}"
+            elif self._rollback_request.exists():
+                rollback_feedback = "Rollback queued; it will run when the game is closed."
         return UpdatesView(title, detail, activity, activity_detail, *self._last_update, blocker, feedback,
-                           self._app_version, check_again_feedback)
+                           app.version or self._app_version, check_again_feedback, check, app.previous or "",
+                           bool(app.previous and not blocker and not app.switching
+                                and not (self._rollback_request and self._rollback_request.exists())),
+                           rollback_feedback)
 
     def _start_refusal(self, state: ServiceState) -> str:
         if self._last_start is not None:
@@ -567,6 +599,12 @@ class SessionModel:
         if request is not None:
             self._patch_request = command, request
         return request
+
+    def rollback_app(self) -> Path | None:
+        if not self.poll().updates.can_rollback:
+            return None
+        self._rollback_request = self._submit("rollback_app")
+        return self._rollback_request
 
     def start_service(self) -> bool:
         if read_state(self._os).kind is not StateKind.STALE:
