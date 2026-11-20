@@ -21,8 +21,6 @@ _ORIGINAL_SAVE = '{"zeny":100}'
 
 
 class FakeGamePlatform(type(platform.current())):
-    # Give the fixture its own name so the operator's real game is untouched.
-    game_exe_name = "midgard-smoke-fixture.exe" if sys.platform == "win32" else "midgard-smoke-fixture"
     use_real_isolation = False
 
     def spawn_tree(self, argv, *, isolate_network=False, **kwargs):
@@ -34,13 +32,14 @@ class FakeGamePlatform(type(platform.current())):
 
 
 @pytest.fixture
-def setup_smoke(tmp_path, monkeypatch):
+def setup_smoke(tmp_path, monkeypatch, fake_game_name):
     home = tmp_path / "real data"
     for name in ("XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"):
         monkeypatch.setenv(name, str(home))
     monkeypatch.setenv("FARMER_DISPLAY", "1")  # Never overrides the smoke preset.
     monkeypatch.setenv("GAME_DIR", str(tmp_path / "fake game install"))
     os_ = FakeGamePlatform()
+    os_.game_exe_name = fake_game_name
     exe = os_.game_executable()
     exe.parent.mkdir()
     exe.touch()

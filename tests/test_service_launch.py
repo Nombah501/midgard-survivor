@@ -31,7 +31,6 @@ class Launcher:
     os_: platform.Platform
     profile: Path
     game: Path
-    prefix: list[str]
 
     @property
     def data(self):
@@ -39,7 +38,7 @@ class Launcher:
 
     @property
     def command(self):
-        return [*self.prefix, sys.executable, "-m", "midgard_farm.service", "launch"]
+        return [sys.executable, "-m", "midgard_farm.service", "launch"]
 
     def run(self, code=0, *args, mode="done", **kwargs):
         proc = subprocess.run(
@@ -54,7 +53,8 @@ class Launcher:
 
 
 @pytest.fixture
-def launcher(tmp_path, monkeypatch):
+def launcher(tmp_path, monkeypatch, service_game_platform):
+    os_, _ = service_game_platform
     home = tmp_path / "xdg"
     game_dir = tmp_path / "game install"
     for name in ("FARMER_SESSION_ID", "FARMER_BACKUP_DIR", "FARMER_DISPLAY", "FARMER_MIN_FREE_MB",
@@ -62,7 +62,6 @@ def launcher(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("XDG_DATA_HOME", str(home))
     monkeypatch.setenv("GAME_DIR", str(game_dir))
-    os_ = platform.current()
     profile = make_profile(godot_root(home), "Renamed Midgard Survivors")
     monkeypatch.setenv("FAKE_GAME_PROFILE", str(profile))
     (profile / "profile.json").write_bytes(PROFILE)
@@ -81,19 +80,7 @@ def launcher(tmp_path, monkeypatch):
     game = os_.game_executable()
     game.write_bytes(f"#!{sys.executable}\n".encode() + Path(__file__).with_name("fake_launch_game.py").read_bytes())
     game.chmod(0o755)
-    # If the operator's real game is open, don't hide it from production code
-    # or interfere with it; give just the test subprocess its own process table.
-    prefix = []
-    if os_.game_running():
-        unshare = shutil.which("unshare")
-        if unshare is None:
-            pytest.skip("cannot isolate fake game from an already-running real game")
-        prefix = [unshare, "--user", "--map-current-user", "--mount", "--pid", "--fork", "--mount-proc",
-                  "--kill-child", "--"]
-        probe = subprocess.run([*prefix, "true"], capture_output=True, text=True)
-        if probe.returncode:
-            pytest.skip(f"cannot isolate fake game from a live game: {probe.stderr.strip()}")
-    return Launcher(os_, profile, game, prefix)
+    return Launcher(os_, profile, game)
 
 
 def test_manual_launch_uses_preset_keeps_network_and_preserves_spaced_paths(launcher, monkeypatch):
@@ -119,7 +106,7 @@ def test_manual_launch_uses_preset_keeps_network_and_preserves_spaced_paths(laun
 def supervised(launcher, monkeypatch):
     if shutil.which("unshare") is None:
         pytest.skip("util-linux unshare is unavailable")
-    probe = subprocess.run([*launcher.prefix, "unshare", "-cn", "--", "true"], capture_output=True, text=True)
+    probe = subprocess.run(["unshare", "-cn", "--", "true"], capture_output=True, text=True)
     if probe.returncode:
         pytest.skip(f"cannot create a real user+network namespace: {probe.stderr.strip()}")
     monkeypatch.setenv("FARMER_SESSION_ID", "acceptance-afk-session")
@@ -161,7 +148,7 @@ def test_isolation_failure_is_fatal_before_game_exec(launcher, monkeypatch, tmp_
         real_unshare = shutil.which("unshare")
         if real_unshare is None:
             pytest.skip("util-linux unshare is unavailable")
-        probe = subprocess.run([*launcher.prefix, real_unshare, "-cn", "--", "true"], capture_output=True)
+        probe = subprocess.run([real_unshare, "-cn", "--", "true"], capture_output=True)
         if probe.returncode:
             pytest.skip(f"cannot create a real user+network namespace: {probe.stderr!r}")
         wrapper = bin_dir / "unshare"
@@ -335,11 +322,13 @@ def test_broken_output_pipe_is_transient(launcher):
         assert b"Broken pipe" in service.stderr.read()
 
 
-def test_running_game_is_transient_busy_without_touching_the_profile(launcher, tmp_path):
-    game_path = tmp_path / launcher.game.name
+@pytest.mark.parametrize("same_worker", [True, False], ids=["same-worker", "other-worker"])
+def test_only_a_game_with_the_workers_executable_name_blocks_launch(launcher, tmp_path, same_worker):
+    name = launcher.game.name if same_worker else f"other-{launcher.game.name}"
+    game_path = tmp_path / name
     game_path.symlink_to(os.path.realpath(sys.executable))
     command = [
-        *launcher.prefix, sys.executable, "-c",
+        sys.executable, "-c",
         "import subprocess, sys\n"
         "with subprocess.Popen([sys.argv[1], '-c', 'import time; time.sleep(60)']) as game:\n"
         "    try:\n"
@@ -350,10 +339,13 @@ def test_running_game_is_transient_busy_without_touching_the_profile(launcher, t
         str(game_path),
     ]
     proc = subprocess.run(command, capture_output=True, encoding="utf-8", timeout=10)
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "game is already running" in proc.stderr
-    assert not (launcher.profile / "fake-game.json").exists()
-    assert not (launcher.data / "backups").exists()
+    assert proc.returncode == int(same_worker), proc.stdout + proc.stderr
+    if same_worker:
+        assert "game is already running" in proc.stderr
+        assert not (launcher.profile / "fake-game.json").exists()
+        assert not (launcher.data / "backups").exists()
+    else:
+        assert launcher.record()["cwd"] == str(launcher.game.parent)
 
 
 @pytest.mark.parametrize(("mode", "code"), [("fail", 1), ("done-9", 9), ("kill", 137), ("done-137", 0)])
@@ -369,7 +361,7 @@ def send_signal_during_game(launcher, signum, mode, code, *, grace=None):
     command = launcher.command
     if grace is not None:
         command = [
-            *launcher.prefix, sys.executable, "-c",
+            sys.executable, "-c",
             "from midgard_farm.core import launch\n"
             f"launch.SHUTDOWN_GRACE_SECONDS = {grace}\n"
             "from midgard_farm.service import main\n"
@@ -391,7 +383,7 @@ def send_signal_during_game(launcher, signum, mode, code, *, grace=None):
             child, = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
             return int(child)
 
-        service_pid = child_pid(proc.pid) if launcher.prefix else proc.pid
+        service_pid = proc.pid
         game_pid = child_pid(service_pid)
         game_fd = os.pidfd_open(game_pid)
         started = time.monotonic()

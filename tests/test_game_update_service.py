@@ -1,6 +1,7 @@
 """Drive update recovery through real service commands, state and history files."""
 
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -36,7 +37,7 @@ def update_service(tmp_path, monkeypatch):
     for name, path in (("FAKE_GAME_PROFILE", profile), ("FAKE_SUPERVISED_PLAN", plan),
                        ("FAKE_FARMER_SOURCES", sources), ("FAKE_DESKTOP_TRACE", desktop)):
         monkeypatch.setenv(name, str(path))
-    return Farm(update.os, profile, preset, plan, []), update, sources, desktop
+    return Farm(update.os, profile, preset, plan), update, sources, desktop
 
 
 def test_game_update_night_waits_rebuilds_and_runs_one_attempt(update_service):
@@ -351,7 +352,7 @@ def test_service_stop_cancels_smoke_and_can_resume_without_rebuilding(update_ser
     original = (update.patches / "state.json").read_bytes()
     with farm.service(runner=RUNNER) as proc:
         wait_for(lambda: (update.records / "grandchild.ready").exists())
-        farm.stop(proc)
+        proc.send_signal(signal.SIGTERM)
         assert proc.wait(timeout=5) == 0
         assert lock_freed_within(update.records / "grandchild.lock", 5)
     assert (update.patches / "state.json").read_bytes() == original and not read_history(farm.os_)

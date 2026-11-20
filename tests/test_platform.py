@@ -301,12 +301,15 @@ def fake_game(tmp_path: Path) -> list[str]:
     return [str(exe), "-c", "import time; time.sleep(60)"]
 
 
+@pytest.mark.usefixtures("game_platform")
 def test_game_pids_see_the_game_by_executable_name(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     def unexpected_spawn(*args, **kwargs):
         pytest.fail("Windows process discovery must not start a subprocess")
 
-    # Check our fake's PID: the operator's real game may be running on this machine.
+    # Also check that a process with a different name is not reported as this game.
+    other = platform.current()
+    other.game_exe_name = f"other-{OS.game_exe_name}"
     with OS.spawn_tree(fake_game(tmp_path), stdout=subprocess.DEVNULL) as game:
         if sys.platform == "win32":
             monkeypatch.setattr(subprocess, "run", unexpected_spawn)
@@ -316,6 +319,7 @@ def test_game_pids_see_the_game_by_executable_name(tmp_path, monkeypatch):
             assert time.monotonic() < deadline, "running game not seen"
             time.sleep(0.05)
         assert OS.game_running()
+        assert game.popen.pid not in other.game_pids()
         game.kill()
         assert game.popen.pid not in OS.game_pids()
 
@@ -339,6 +343,7 @@ def test_windows_preflight_explains_an_unknown_game_location(tmp_path, monkeypat
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows game discovery")
+@pytest.mark.usefixtures("game_platform")
 def test_windows_remembers_the_running_executable_across_service_restarts(tmp_path, monkeypatch):
     monkeypatch.delenv("GAME_DIR", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
@@ -397,11 +402,8 @@ def test_soak_platform_metrics_use_allocated_blocks_and_resident_memory(tmp_path
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfd sandbox fault")
-def test_sandbox_kill_pins_a_child_and_checks_its_home_and_session(tmp_path):
-    class TestPlatform(type(OS)):
-        game_exe_name = "midgard-verify-process-fixture"
-
-    os_ = TestPlatform()
+def test_sandbox_kill_pins_a_child_and_checks_its_home_and_session(tmp_path, game_platform):
+    os_ = game_platform
     exe = tmp_path / os_.game_exe_name
     exe.symlink_to(Path(sys.executable).resolve())
     env = os_.app_sandbox_environment(tmp_path)

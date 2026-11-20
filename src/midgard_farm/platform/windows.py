@@ -49,6 +49,7 @@ _TASK_XML = """\
     <Hidden>true</Hidden>
     <ExecutionTimeLimit>{time_limit}</ExecutionTimeLimit>
 {restart}
+  </Settings>
   <Actions Context="Operator">
     <Exec>
       <Command>{command}</Command>
@@ -241,7 +242,8 @@ def _system_tool(tool: str, *args: str) -> str:
 
 
 def _scheduler_error(exc: subprocess.CalledProcessError, code: int) -> bool:
-    message = ctypes.FormatError(code).strip().casefold()
+    # FormatError takes a signed 32-bit DWORD; HRESULTs such as 0x8004130B overflow it unsigned.
+    message = ctypes.FormatError(code - (1 << 32) if code >= 1 << 31 else code).strip().casefold()
     return exc.returncode == 1 and bool(message) and (exc.stderr or "").strip().casefold().endswith(message)
 
 

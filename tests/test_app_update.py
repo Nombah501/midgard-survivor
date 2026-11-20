@@ -192,7 +192,7 @@ def test_awaits_closed_game_then_commits_after_selected_service_is_ready(install
         applying = worker.submit(watchdog, os_)
         wait_for(lambda: os_.restarts == ["2.0.0"])
         data = os_.app_data_dir()
-        switch = json.loads((data / "app-update-pending.json").read_bytes())
+        switch = json.loads(os_.read_shared(data / "app-update-pending.json"))
         stale_instance = "f" * 32
         os_.write_atomic(data / "app-update-ready.json", json.dumps({
             "id": switch["id"], "version": "2.0.0", "pid": 99999999, "instance": stale_instance, "at": time.time(),
@@ -200,7 +200,7 @@ def test_awaits_closed_game_then_commits_after_selected_service_is_ready(install
         monkeypatch.setattr(assets, "version", lambda: "2.0.0")
         with running_service(monkeypatch):
             assert applying.result(timeout=5) == 0
-            marker = json.loads((data / "app-update-ready.json").read_bytes())
+            marker = json.loads(os_.read_shared(data / "app-update-ready.json"))
             assert marker["instance"] != stale_instance
             assert current(os_) == "2.0.0"
             assert sorted(p.name for p in bundle_path(os_, "1.0.0").parent.iterdir()) == ["1.0.0", "2.0.0"]

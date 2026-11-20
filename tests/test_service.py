@@ -231,12 +231,12 @@ def test_windowless_service_can_start_with_no_standard_streams(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows game discovery before the profile exists")
-def test_windows_service_learns_the_game_while_waiting_for_a_profile(tmp_path, monkeypatch):
+def test_windows_service_learns_the_game_while_waiting_for_a_profile(tmp_path, monkeypatch, service_game_platform):
     from test_platform import fake_game
 
     monkeypatch.delenv("GAME_DIR", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    os_ = platform.current()
+    os_, _ = service_game_platform
     argv = fake_game(tmp_path)
     learned = os_.app_data_dir() / "game-executable.txt"
     script = (

@@ -55,7 +55,6 @@ class Farm:
     profile: Path
     preset: Path
     plan: Path
-    prefix: list[str]
 
     @property
     def data(self):
@@ -93,13 +92,12 @@ class Farm:
         timing = dict(heartbeat_interval=0.5, startup_grace=3.0, backoff_base=0.05,
                       backoff_max=0.2, max_failures=3, failure_window=60.0,
                       kill_grace=0.5, stop_grace=0.85) | policy
-        command = [*self.prefix, *runner]
         stop = self.plan.with_suffix(".service-stop")
         stop.unlink(missing_ok=True)
         env = {**os.environ, "FAKE_SERVICE_POLICY": json.dumps(timing), "FAKE_SERVICE_STOP": str(stop)}
         output = self.plan.with_suffix(".output")
         with output.open("wb") as log:
-            proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
+            proc = subprocess.Popen(runner, stdout=log, stderr=subprocess.STDOUT, env=env)
             try:
                 yield proc
             except BaseException as exc:
@@ -117,37 +115,13 @@ class Farm:
                         proc.wait(timeout=5)
                         raise
 
-    def stop(self, proc):
-        if self.prefix:
-            children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
-            child, = wait_for(lambda: children.read_text().split())
-            os.kill(int(child), signal.SIGTERM)
-        else:
-            proc.send_signal(signal.SIGTERM)
-
-    def host_pid(self, proc, game_pid):
-        if not self.prefix:
-            return game_pid
-
-        def find(parent):
-            for child in Path(f"/proc/{parent}/task/{parent}/children").read_text().split():
-                pid = int(child)
-                for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-                    if line.startswith("NSpid:") and int(line.split()[-1]) == game_pid:
-                        return pid
-                if match := find(pid):
-                    return match
-            return None
-
-        return wait_for(lambda: find(proc.pid))
-
     def notifications(self):
         return [line.split()[2].rstrip(":") for line in self.plan.with_suffix(".output").read_text(
             encoding="utf-8").splitlines() if line.startswith("supervisor: notify ")]
 
 
 @pytest.fixture
-def farm(tmp_path, monkeypatch):
+def farm(tmp_path, monkeypatch, service_game_platform):
     # Use real process, lock and atomic-write implementations. Only the game is fake.
     home = tmp_path / "home data"
     game_dir = tmp_path / "game install"
@@ -158,7 +132,7 @@ def farm(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(home))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     monkeypatch.setenv("GAME_DIR", str(game_dir))
-    os_ = platform.current()
+    os_, startup = service_game_platform
     profile = make_profile(godot_root(home), "Renamed Midgard Survivors")
     monkeypatch.setenv("FAKE_GAME_PROFILE", str(profile))
     plan = tmp_path / "plan.txt"
@@ -177,7 +151,6 @@ def farm(tmp_path, monkeypatch):
     ))
     preset = tmp_path / "farmer preset.json"
     game = os_.game_executable()
-    prefix = []
     if sys.platform == "win32":
         # A real PE image lets the test exercise the Job Object. The copied
         # interpreter runs the game via sitecustomize, with no Godot flags.
@@ -187,39 +160,30 @@ def farm(tmp_path, monkeypatch):
         monkeypatch.setenv("PYTHONHOME", sys.base_prefix)
         monkeypatch.setenv("PATH", str(Path(sys.base_prefix)) + os.pathsep + os.environ["PATH"])
         package_root = str(Path(platform.__file__).resolve().parents[2])
-        pythonpath = (str(game_dir), package_root, os.environ.get("PYTHONPATH", ""))
-        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, pythonpath)))
-        (game_dir / "sitecustomize.py").write_text(
-            "import os, sys, traceback\nfrom pathlib import Path\n"
-            f"if Path(sys.executable).name.lower() == {game.name.lower()!r}:\n"
-            "    try:\n"
-            f"        exec(compile(Path({str(FAKE)!r}).read_bytes(), {str(FAKE)!r}, 'exec'))\n"
-            "    except Exception:\n"
-            "        traceback.print_exc()\n"
-            "        os._exit(1)\n"
-        )
+        monkeypatch.setenv("PYTHONPATH", os.environ["PYTHONPATH"] + os.pathsep + package_root)
+        with startup.open("a", encoding="utf-8") as script:
+            script.write(
+                "import os, sys, traceback\nfrom pathlib import Path\n"
+                f"if Path(sys.executable).name.lower() == {game.name.lower()!r}:\n"
+                "    try:\n"
+                f"        exec(compile(Path({str(FAKE)!r}).read_bytes(), {str(FAKE)!r}, 'exec'))\n"
+                "    except Exception:\n"
+                "        traceback.print_exc()\n"
+                "        os._exit(1)\n"
+            )
     else:
         game.write_bytes(f"#!{sys.executable}\n".encode() + FAKE.read_bytes())
         game.chmod(0o755)
-        # Never signal or mask the operator's game; isolate the fake service.
-        if os_.game_running():
-            unshare = shutil.which("unshare")
-            if unshare is None:
-                pytest.skip("cannot isolate the fake service from the live game")
-            prefix = [unshare, "--user", "--map-current-user", "--mount", "--pid", "--fork", "--mount-proc",
-                      "--kill-child", "--"]
-            if subprocess.run([*prefix, "true"], capture_output=True).returncode:
-                pytest.skip("cannot isolate the fake service from the live game")
     preset.write_text(json.dumps({"stage": "payon", "danger": 12, "class": "thief",
                                   "display": sys.platform == "win32", "builds": {"class": "mage",
                                   "archer": {"job_path": 0, "skills": ["agi"]}}}))
-    return Farm(os_, profile, preset, plan, prefix)
+    return Farm(os_, profile, preset, plan)
 
 
 def plan_game(farm, *steps):
     if sys.platform == "linux":
         unshare = shutil.which("unshare")
-        if unshare is None or subprocess.run([*farm.prefix, unshare, "-cn", "--", "true"], capture_output=True).returncode:
+        if unshare is None or subprocess.run([unshare, "-cn", "--", "true"], capture_output=True).returncode:
             pytest.skip("real network namespace unavailable")
     farm.plan.write_text("\n".join(steps))
 
@@ -299,7 +263,7 @@ def test_supervisor_stop_requests_finish_before_signalling_child(farm, step):
             assert not farm.status_path.exists()
         else:
             farm.status("run")
-        farm.stop(proc)
+        proc.send_signal(signal.SIGTERM)
         outcome, _ = farm.outcome()
         assert proc.wait(timeout=5) == 0
     if step.endswith("no-exit"):
@@ -591,11 +555,10 @@ def test_stale_heartbeat_kills_the_whole_group_and_restarts(farm):
     plan_game(farm, "hang", "clean:stop")
     # A long startup grace keeps "stale heartbeat" (3 x 0.5 s) clearly apart from
     # "no heartbeat yet"; time the outcome itself, not the fixture's shutdown.
-    with farm.service(startup_grace=10.0) as proc:
+    with farm.service(startup_grace=10.0):
         started = time.monotonic()
         farm.start()
-        pid = int(wait_for(lambda: farm.plan.with_suffix(".grandchild").read_text()))
-        grandchild = farm.host_pid(proc, pid)
+        grandchild = int(wait_for(lambda: farm.plan.with_suffix(".grandchild").read_text()))
         outcome, _ = farm.outcome()
         elapsed = time.monotonic() - started
     assert outcome["attempts"][0]["reason"] == "heartbeat_stale"
@@ -608,9 +571,9 @@ def test_stale_heartbeat_kills_the_whole_group_and_restarts(farm):
 @POSIX
 def test_sigstopped_farmer_is_a_stale_heartbeat_and_restarts(farm):
     plan_game(farm, "commands", "clean:stop")
-    with farm.service() as proc:
+    with farm.service():
         farm.start()
-        running = farm.host_pid(proc, farm.status("run")["pid"])
+        running = farm.status("run")["pid"]
         os.kill(running, signal.SIGSTOP)
         outcome, _ = farm.outcome()
     assert outcome["attempts"][0]["reason"] == "heartbeat_stale"
@@ -677,7 +640,7 @@ def test_second_supervisor_leaves_the_running_session_alone(farm, legacy_lock):
     session.write_text("afk-first")
     lock_path = farm.profile / "farmer_supervisor.lock" if legacy_lock else farm.data / "service.lock"
     with farm.os_.acquire_lock(lock_path):
-        second = subprocess.run([*farm.prefix, *SERVICE], capture_output=True,
+        second = subprocess.run(SERVICE, capture_output=True,
                                 encoding="utf-8", timeout=5)
     assert second.returncode == 75, second.stdout + second.stderr
     assert "another supervisor" in second.stderr
@@ -692,7 +655,7 @@ def test_unwritable_profile_quarantines_the_supervisor_itself(farm):
         pytest.skip("root can write a read-only directory")
     farm.profile.chmod(0o555)
     try:
-        result = subprocess.run([*farm.prefix, *SERVICE], capture_output=True,
+        result = subprocess.run(SERVICE, capture_output=True,
                                 encoding="utf-8", timeout=5)
     finally:
         farm.profile.chmod(0o755)
@@ -796,10 +759,9 @@ def test_supervised_forced_stop_kills_the_group_without_replacing_known_good(far
     (farm.profile / "profile.json").write_text("changed before stop")
     with farm.service(stale_intervals=30) as proc:
         farm.start()
-        pid = int(wait_for(lambda: farm.plan.with_suffix(".grandchild").read_text()))
-        grandchild = farm.host_pid(proc, pid)
+        grandchild = int(wait_for(lambda: farm.plan.with_suffix(".grandchild").read_text()))
         started = time.monotonic()
-        farm.stop(proc)
+        proc.send_signal(signal.SIGTERM)
         outcome, _ = farm.outcome()
         assert proc.wait(timeout=5) == 0
     assert time.monotonic() - started >= 0.85
@@ -819,7 +781,7 @@ def test_operator_stop_during_backoff_does_not_restart(farm):
         farm.start()
         wait_for(farm.notifications, lambda events: events == ["fail"])
         started = time.monotonic()
-        farm.stop(proc)
+        proc.send_signal(signal.SIGTERM)
         outcome, _ = farm.outcome()
         assert proc.wait(timeout=5) == 0
     assert time.monotonic() - started < 5
@@ -873,13 +835,13 @@ def test_printed_systemd_unit_starts_the_service_with_a_shutdown_budget(farm, tm
     fake_notify.write_text("#!/bin/sh\nexit 0\n")
     fake_notify.chmod(0o755)
     env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}
-    with subprocess.Popen([*farm.prefix, *command], stdout=subprocess.DEVNULL, env=env) as proc:
+    with subprocess.Popen(command, stdout=subprocess.DEVNULL, env=env) as proc:
         try:
             farm.start()
             outcome, _ = farm.outcome()
             assert outcome["reason"] == "preflight_failed"
         finally:
-            farm.stop(proc)
+            proc.send_signal(signal.SIGTERM)
             assert proc.wait(timeout=5) == 0
 
 
