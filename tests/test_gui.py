@@ -628,6 +628,7 @@ def test_afk_location_picker_skips_locked_locations_on_keyboard(open_dashboard, 
     assert "locked" in locked.property("text")
     QTest.keyClick(window, Qt.Key.Key_Escape)
 
+    wait_until(lambda: location.property("count") > 1)
     location.forceActiveFocus()
     QTest.keyClick(window, Qt.Key.Key_Down)
     wait_until(lambda: location.property("currentIndex") == 1)
@@ -707,6 +708,8 @@ def test_oath_panel_enables_only_at_fixed_30_and_shows_catalog_ranks(open_dashbo
     panel = qml_item(window, "oathPanel")
     assert not panel.property("enabled")
     location = qml_item(window, "locationPicker")
+    # The catalog-backed snapshot can publish after the window opens.
+    wait_until(lambda: location.property("count") > 1)
     location.forceActiveFocus()
     QTest.keyClick(window, Qt.Key.Key_Down)
     difficulty = qml_item(window, "difficultyPicker")
