@@ -22,8 +22,8 @@ ALL = (
     "one-run", "catalog", "preparation-unchanged", "wishlist-keep", "run-choice", "run-choice-resume",
     "location-rotation", "location-rotation-resume",
     "oaths", "oaths-disabled", "invalid-oath", "invalid-oath-rank", "invalid-oath-difficulty", "invalid-location",
-    "invalid-difficulty", "invalid-rotation-difficulty", "stop", "endless", "flush-fail", "crash-run", "crash-settled",
-    "crash-journaled",
+    "invalid-difficulty", "invalid-rotation-difficulty", "stop", "endless", "hell-rotation", "blocked-portal", "flush-fail",
+    "crash-run", "crash-settled", "crash-journaled",
     "cmd-finish", "cmd-abort", "cmd-abort-settled", "cmd-pause-resume", "cmd-legacy", "checkpoint-corrupt",
     "supervised-kill-run", "supervised-crash-settled", "run-stall",
 )
@@ -129,6 +129,20 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
         assert len(list(logdir.glob("attempt-*.log"))) == 2
 
 
+@pytest.mark.parametrize(("fault", "reason"), [
+    ("no-victory", "PLAYER_DIED t=1842.0 by=Orc Warrior what=Bash"),
+    ("no-finale", "final boss"),
+    ("forced-finale", "run_timeout"),
+    ("paid-finale-keep", "three free keep slots"),
+    ("wrong-oath-journal-points", "oath points"),
+    ("wrong-run-journal-target", "location or difficulty"),
+])
+def test_hell_rotation_requires_a_real_finale_win(verification, monkeypatch, fault, reason):
+    monkeypatch.setenv("FAKE_VERIFY_FAULT", fault)
+    row = execute(verification, "hell-rotation")
+    assert row["verdict"] == "FAIL" and reason in row["reason"], row
+
+
 @pytest.mark.parametrize(("name", "fault", "reason"), [
     ("one-run", "no-transition", "last_transition empty"),
     ("one-run", "no-victory", "last run was not a victory"),
@@ -145,6 +159,7 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
     ("invalid-location", "no-choice-diagnostic", "failure detail did not name the invalid field and value"),
     ("stop", "script-error", "script error"),
     ("endless", "no-mvp", "endless_mvps == 0"),
+    ("blocked-portal", "portal-not-entered", "BLOCKED_PORTAL entered"),
     ("crash-settled", "unbanked-zeny", "profile zeny moved"),
     ("supervised-crash-settled", "duplicate-journal", "duplicate journal run_id"),
     ("cmd-pause-resume", "pause-starts-run", "paused farmer started another run"),
@@ -187,9 +202,9 @@ def fake_cli(verification, tmp_path):
     env.update(PYTHONPATH=os.pathsep.join((str(harness), str(Path(__file__).resolve().parent))),
                HOME=str(tmp_path), USERPROFILE=str(tmp_path), FAKE_VERIFY_SOURCE=str(profile))
 
-    def invoke(*args, **overrides):
+    def invoke(*args, timeout=60, **overrides):
         invocation = [sys.executable, "-B", "-m", "midgard_farm.verify", *args]
-        return subprocess.run(invocation, env=env | overrides, cwd=tmp_path, capture_output=True, text=True, timeout=60)
+        return subprocess.run(invocation, env=env | overrides, cwd=tmp_path, capture_output=True, text=True, timeout=timeout)
 
     return os_, real, profile, candidate, work, invoke
 
@@ -211,7 +226,7 @@ def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(fake_cli,
 
 def test_cli_all_runs_supported_scenarios_and_reports_windows_skip(fake_cli, tmp_path):
     _, _, _, candidate, _, invoke = fake_cli
-    result = invoke("--all", "--candidate-dir", str(candidate), FAKE_VERIFY_RELEASE_OS="windows")
+    result = invoke("--all", "--candidate-dir", str(candidate), timeout=120, FAKE_VERIFY_RELEASE_OS="windows")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "supervised-kill-run is Linux only (unsupported on this OS)" in result.stdout
     out, = (tmp_path / ".sandbox").glob("verify-*")

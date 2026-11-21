@@ -233,6 +233,7 @@ cd ../gui
 | `presets/steady.json` | сбалансированный фарм, автоматическая сложность до 20 |
 | `presets/zeny.json` | цель — зеньги; авто-подбор сложности по измеренной доходности |
 | `presets/crumbs.json` | цель — Star Crumb, endless до 6 минут / 8 MVP |
+| `presets/hell-rotation.json` | цель — Star Crumb, endless до финального босса без лимита MVP; страховочный лимит 50 игровых минут |
 | `presets/progress.json` | продвижение на максимальной открытой сложности |
 | `presets/night.json` | ночной сбалансированный фарм, 8 часов, короткий endless |
 

@@ -202,10 +202,16 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     farm.state()
     model = SessionModel(farm.platform)
     view = model.poll()
-    assert view.presets == ["crumbs.json", "night.json", "progress.json", "steady.json", "zeny.json"]
+    assert view.presets == ["crumbs.json", "hell-rotation.json", "night.json", "progress.json", "steady.json", "zeny.json"]
     assert "Balanced" in view.preset_description
     assert "ceiling: 20" in view.preset_description
     assert "480 min" in view.preset_description
+    model.select_preset(view.presets.index("hell-rotation.json"))
+    description = model.poll().preset_description
+    assert "Objective: Crumbs" in description
+    assert "Endless until the final boss" in description
+    assert "50 min per run" in description
+    model.select_preset(view.preset_index)
     assert [row["label"] for row in view.locations] == ["Automatic"]
     assert view.difficulties == ["Automatic"]
 

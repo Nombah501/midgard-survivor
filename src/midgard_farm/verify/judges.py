@@ -202,6 +202,39 @@ def location_rotation(run: Run, driven: Driven, status: dict, count: int) -> Non
     need((game.get("stage"), game.get("danger")) == expected[-1], "the game ended at the wrong location or difficulty")
 
 
+def hell_rotation(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    totals = status["totals"]
+    need(totals["started"] == totals["runs"] == 1, "expected one completed run")
+    rows = _journal(run.artifact("journal.jsonl"))
+    need(len(rows) == 1 and rows[0].get("run_id") == f"{run.session}-r1", "expected one run in the journal")
+    first = _unlocked_locations(run)[0]["id"]
+    for result in (status.get("last") or {}, rows[0]):
+        need((result.get("stage"), result.get("danger")) == (first, 30), "wrong location or difficulty")
+        need(result.get("oath_points") == 37, "wrong oath points")
+        need(not result.get("forced") and not result.get("force_reason"),
+             f"run was forced: {result.get('force_reason') or 'unknown reason'}")
+        if result.get("died"):
+            log = run.artifact("farmer.log").read_text(encoding="utf-8")
+            cause = next((line for line in reversed(log.splitlines()) if "PLAYER_DIED " in line), "")
+            detail = cause or f"t={result.get('game_s')} s; no death cause logged"
+            raise VerificationFailure(f"run ended in defeat: {detail}")
+        need(result.get("job") == "assassin_cross", "wrong job: expected Assassin Cross")
+        need(result.get("endless") and result.get("finale_won"), "did not defeat the final boss in endless")
+        need(result.get("victory") is True, "victory missing")
+    need(totals.get("wins") == 1, "victory missing from totals")
+    need(re.search(r"KEEP_DONE .*victory=true free=true slots=3$", run.artifact("farmer.log").read_text(
+        encoding="utf-8"), re.MULTILINE), "expected three free keep slots after victory")
+
+
+def blocked_portal(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    _marker(run, "BLOCKED_PORTAL seeded")
+    _marker(run, "BLOCKED_PORTAL entered")
+
+
 def location_rotation_resume(run: Run, driven: Driven, status: dict) -> None:
     locations = _unlocked_locations(run)
     expected = (("prontera", 1), *((row["id"], row["min_difficulty"]) for row in locations[:2]))

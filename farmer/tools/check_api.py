@@ -30,7 +30,7 @@ TARGETS = {
     "Potential": "potential.gd",
 }
 
-ENGINE = {"has_method", "get", "set", "call", "get_meta", "set_meta", "remove_meta", "connect", "disconnect"}
+ENGINE = {"has_method", "get", "set", "call", "has_meta", "get_meta", "set_meta", "remove_meta", "connect", "disconnect"}
 
 WHITELIST = {
     "Save": set(ENGINE),

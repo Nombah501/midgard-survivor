@@ -24,6 +24,7 @@ class Scenario:
     driver: Callable[[drive.Run, float], drive.Driven]
     judge: Callable[[drive.Run, drive.Driven, dict], None]
     linux_only: bool = False
+    preset: str | None = None
 
 
 _SHORT: dict[str, object] = {"run_minutes": 0.2, "stall_seconds": 10.0}
@@ -83,6 +84,13 @@ SCENARIOS = {
                      drive.direct, judges.stop),
     # Done + terminal metadata, endless victory with an MVP and kills, ENDLESS_DONE.
     "endless": Scenario(360, {"endless": True, "endless_minutes": 1.0, "endless_mvps": 2}, drive.direct, judges.endless),
+    "hell-rotation": Scenario(1800, {
+        "class": "thief", "job_paths": {"thief": 0}, "stage": _ROTATION, "danger": 30, "max_runs": 1,
+        "oaths": {"tough": 3, "hunt": 3, "kyrie": 3, "elite": 3, "mvp_fury": 2,
+                  "hellfire": 3, "lex": 2, "curse": 2, "unlucky": 2},
+    }, drive.direct, judges.hell_rotation, preset="hell-rotation.json"),
+    "blocked-portal": Scenario(45, {"class": "thief", "danger": 30, "run_minutes": 0.1},
+                               partial(drive.direct, FARMER_TEST_BLOCKED_PORTAL="1"), judges.blocked_portal),
     # Exit 1 + failed terminal status, flush_failed + nonzero status code, FAIL flush_failed.
     "flush-fail": Scenario(180, _SHORT | {"max_minutes": 0.5}, partial(drive.direct, FARMER_TEST_FLUSH_FAIL="1"),
                            partial(judges.failed, reason="flush_failed")),
@@ -173,7 +181,8 @@ def run_scenario(os_: Platform, source: Path, candidate: Path, work: Path, out: 
         config = preset | {"max_minutes": hours * 60, "max_runs": 0, "hard_exit": True, "display": False}
         timeout = int(hours * 3600) + scenario.timeout
     else:
-        config = smoke.one_run_config() | scenario.cfg
+        strategy = json.loads((presets_dir() / scenario.preset).read_bytes()) if scenario.preset else {}
+        config = smoke.one_run_config() | strategy | scenario.cfg
         timeout = scenario.timeout
 
     work, out, source = work.resolve(strict=True), out.resolve(strict=True), source.absolute()

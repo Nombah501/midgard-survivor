@@ -62,6 +62,8 @@ def _catalog(os_: Platform) -> tuple[dict[commands.Character, str], list[_Preset
         description = " · ".join((f"Objective: {objective}",
                                   f"Automatic difficulty ceiling: {data.get('danger_ceiling', 30)}",
                                   ", ".join(limits) if limits else "No run limits"))
+        if data.get("endless") is True and data.get("endless_minutes") == data.get("endless_mvps") == 0:
+            description += " · Endless until the final boss"
         presets.append(_Preset(path, description))
     return characters, presets, stages
 

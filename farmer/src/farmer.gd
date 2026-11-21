@@ -30,6 +30,7 @@ const TICK_MS := 100
 const VICTORY_PULL_MS := 1500
 const SETTLE_WAIT_MS := 25000
 const MAX_DRAFT_PER_TICK := 32
+const DIRECT_STALL_MS := 750
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -96,9 +97,19 @@ var _test_wishlist_ids: Array[String] = []
 var _test_wishlist_runs: Array = []
 var _test_verify_wishlist := false
 var _test_freeze_run_time := false
+var _test_blocked_portal := false
+var _test_portal_seeded := false
 
 var _potential_script = null
 var _vanilla_input_seen := false
+
+var _direct_map_id := 0
+var _direct_tile := Vector2i.ZERO
+var _direct_progress_ms := -1
+var _direct_best_dist := INF
+var _direct_grid: AStarGrid2D
+var _direct_path: Array[Vector2i] = []
+var _direct_step := 1
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -124,6 +135,7 @@ func _ready() -> void:
 		session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
 	_test_wait_at_keep = _test_env("WAIT_AT_KEEP") == "1"
 	_test_freeze_run_time = _test_env("FREEZE_RUN_TIME") == "1"
+	_test_blocked_portal = _test_env("BLOCKED_PORTAL") == "1"
 	_test_verify_wishlist = _test_env("WISHLIST") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
@@ -247,7 +259,7 @@ func _replace_player_input() -> void:
 	var p = world.player
 	if p == null or not is_instance_valid(p):
 		return
-	if p.input is FarmerInput:
+	if p.input is FarmerInput and p.input.brain == self:
 		return
 	var inp = FarmerInput.new()
 	inp.brain = self
@@ -310,6 +322,8 @@ func _prepare_run() -> void:
 	_stall_tries = 0
 	_paused_since_ms = 0
 	_pause_tries = 0
+	_direct_progress_ms = -1
+	_direct_grid = null
 	_set_autopilot_flags(true)
 	world.set_stage(active_stage)
 	world.danger = active_danger
@@ -318,6 +332,11 @@ func _prepare_run() -> void:
 	Save.set_setting("endless_auto_pick", false)
 	# The game consumes even an empty override; never inherit the saved set.
 	world.oaths_next = cfg["oaths"] if active_danger == GameData.DANGER_MAX else {}
+	# 0.2.5 suppresses the finale on autopilot unless this meta is set.
+	if _want_endless() and not GameData.has_meta("finale_at"):
+		GameData.set_meta("finale_at", GameData.MORROC_FINALE.at)
+	if _test_blocked_portal:
+		GameData.set_meta("mvp_at", 2.0)
 	world.start_run(active_class)
 	active_oath_points = int(world.oath_points())
 	_replace_player_input()
@@ -349,11 +368,14 @@ func _set_autopilot_flags(on: bool) -> void:
 # ---------------------------------------------------------------------------
 
 func _tick_run(now: int) -> void:
+	if _test_blocked_portal and _test_tick_blocked_portal():
+		return
 	_apply_autopilot()
 	_replace_player_input()
 	_handle_job_change(world.player)
 	_draft_player()
-	_handle_victory(now)
+	if world.running:
+		_handle_victory(now)
 	if world == null or not is_instance_valid(world):
 		return
 	if world.running:
@@ -371,9 +393,11 @@ func _tick_run(now: int) -> void:
 func _handle_victory(now: int) -> void:
 	if world == null or not is_instance_valid(world):
 		return
+	# Morroc ends the run itself once the finale's loot has been collected.
+	if world.morroc.finale_won():
+		return
 	var new_win := false
-	# A new MVP kill is the only reliable per-run victory token: raid.state
-	# stays "won" after leave(), and a defeated MVP in the field has no raid.
+	# Count field and arena MVPs alike; raid.state stays "won" after leave().
 	var mvps := int(world.run_mvps)
 	var last_mvps := int(run_state.get("last_run_mvps", 0))
 	var mode := ""
@@ -477,14 +501,18 @@ func _begin_settle(now: int) -> void:
 		if p != null and is_instance_valid(p):
 			died = bool(p.fell)
 		run_state["died"] = run_state.get("died", false) or died
-		var victory := bool(run_state.get("boss_won", false))
-		if bool(world.endless) and bool(run_state.get("died", false)):
-			victory = true
-		if bool(run_state.get("forced", false)):
-			victory = false
+		# The native end resets Morroc's event; the finale kill increments this
+		# stat before settlement, independently of the regular MVP counter.
+		var finale_won := Save.stat("morroc_finale") > float(run_state["morroc_finale_before"])
+		run_state["finale_won"] = finale_won
+		var victory := not bool(run_state["died"]) and not bool(run_state["forced"]) \
+			and (finale_won or bool(run_state["victory"]) or bool(run_state["boss_won"]))
 		run_state["victory"] = victory
-		_log("SETTLE victory=%s died=%s endless=%s t=%.1f" % [
-			str(victory), str(bool(run_state.get("died", false))), str(bool(world.endless)), float(world.time)])
+		if bool(run_state["died"]) and p != null and is_instance_valid(p):
+			_log("PLAYER_DIED t=%.1f by=%s what=%s" % [
+				float(world.time), str(p.death_by.get("by", "")), str(p.death_by.get("what", ""))])
+		_log("SETTLE victory=%s died=%s endless=%s t=%.1f finale_won=%s" % [
+			str(victory), str(bool(run_state["died"])), str(bool(world.endless)), float(world.time), str(finale_won)])
 	phase = "settle"
 	_mark_transition("settle")
 	_check_settle()
@@ -505,7 +533,7 @@ func _check_settle() -> void:
 			phase = "keep"
 			_write_status()
 			return
-		if mode == "victory":
+		if mode == "victory" and not bool(run_state["died"]):
 			# We expected to settle but a victory choice is still open.
 			if _want_endless() and not _endless_exhausted():
 				run_state["endless_mvps"] = int(run_state.get("endless_mvps", 0)) + 1
@@ -583,7 +611,9 @@ func _check_watchdog(now: int) -> void:
 	if _clock_last < 0.0 or not is_equal_approx(clock, _clock_last):
 		_clock_last = clock
 		_clock_change_ms = now
-	if _time_last < 0.0 or not is_equal_approx(t, _time_last):
+	# Only the in-game watchdog gives Morroc a pass. The supervisor still
+	# compares the published game time and enforces its finite stall deadline.
+	if _time_last < 0.0 or not is_equal_approx(t, _time_last) or bool(world.morroc.freezes_time()):
 		_time_last = t
 		_time_change_ms = now
 	var stall_s := float(cfg.get("stall_seconds", 45.0))
@@ -880,24 +910,113 @@ func steer(hero) -> Vector2:
 		return Vector2.ZERO
 	var goal: Vector3 = _steer_goal(hero)
 	if goal != Vector3.INF:
-		var to: Vector3 = goal - hero.position
+		var at: Vector3 = hero.position
+		var to := goal - at
 		to.y = 0.0
-		if to.length() < 0.45:
+		if to.length_squared() < 0.45 * 0.45:
+			_direct_progress_ms = -1
 			return Vector2.ZERO
-		if _direct_goal(goal):
-			var v := to.normalized()
-			return Vector2(v.x, v.z)
+		if _direct_goal():
+			return _steer_direct(at, goal, to)
+	_direct_progress_ms = -1
 	return Bot.steer(world, goal, hero)
 
 
-func _direct_goal(goal: Vector3) -> bool:
+func _direct_goal() -> bool:
 	# Raid mechanics need precise positioning; loot/altars are fine with steering.
 	var raid = world.raid
 	if raid != null and is_instance_valid(raid):
 		var st := str(raid.state)
 		if st == "fight" or st == "portal" or st == "intro":
 			return true
+	if world.morroc.active():
+		return true
 	return false
+
+
+func _steer_direct(at: Vector3, goal: Vector3, direct: Vector3) -> Vector2:
+	var map: RoMap = world.map
+	var map_id := map.get_instance_id()
+	var tile := map.tile_of(goal)
+	var now := _now()
+	if map_id != _direct_map_id:
+		_direct_map_id = map_id
+		_direct_grid = null
+		_direct_progress_ms = -1
+	if _direct_progress_ms < 0 or tile != _direct_tile:
+		_direct_tile = tile
+		_direct_path.clear()
+		_direct_best_dist = INF
+	var to := direct
+	var detouring := _direct_step < _direct_path.size() - 1
+	if detouring:
+		var cell := _direct_path[_direct_step]
+		to = map.cell_center(cell.x, cell.y) - at
+		to.y = 0.0
+		if to.length_squared() < 0.35 * 0.35:
+			_direct_step += 1
+			_direct_best_dist = INF
+			detouring = _direct_step < _direct_path.size() - 1
+			to = direct
+			if detouring:
+				cell = _direct_path[_direct_step]
+				to = map.cell_center(cell.x, cell.y) - at
+				to.y = 0.0
+	var distance := to.length()
+	if distance <= _direct_best_dist - 0.25:
+		_direct_best_dist = distance
+		_direct_progress_ms = now
+	elif now - _direct_progress_ms >= DIRECT_STALL_MS:
+		_direct_best_dist = INF
+		var from := map.tile_of(at)
+		if detouring or _direct_line_blocked(map, at, direct, from, tile):
+			_direct_path = _direct_tile_path(map, from, tile)
+			_direct_step = 1
+			if _direct_path.size() > 2:
+				_log("DIRECT_DETOUR tiles=%d" % _direct_path.size())
+	# Slow down at intermediate tile centers so a fast hero can turn there.
+	return Vector2(to.x, to.z) / distance * (minf(1.0, distance * 2.0) if detouring else 1.0)
+
+
+func _direct_line_blocked(map: RoMap, at: Vector3, to: Vector3, cell: Vector2i, end: Vector2i) -> bool:
+	# Visit the exact tiles crossed by the flat segment, not a sampled ray.
+	var center := map.cell_center(cell.x, cell.y)
+	var sx := int(signf(to.x))
+	var sy := -int(signf(to.z))
+	var dx := 1.0 / absf(to.x) if sx != 0 else INF
+	var dy := 1.0 / absf(to.z) if sy != 0 else INF
+	var x := (0.5 + (center.x - at.x) * sx) * dx if cell.x != end.x else INF
+	var y := (0.5 - (center.z - at.z) * sy) * dy if cell.y != end.y else INF
+	while cell != end:
+		if x <= y:
+			cell.x += sx
+			x = x + dx if cell.x != end.x else INF
+		else:
+			cell.y += sy
+			y = y + dy if cell.y != end.y else INF
+		if not map.cell_walkable(cell.x, cell.y):
+			return true
+	return false
+
+
+func _direct_tile_path(map: RoMap, from: Vector2i, to: Vector2i) -> Array[Vector2i]:
+	var bounds := Rect2i(1, 1, map.width - 2, map.height - 2)
+	if not bounds.has_point(from) or not bounds.has_point(to):
+		return []
+	# Native steering has no waypoint route; use the same walkability as Player.
+	if _direct_grid == null:
+		_direct_grid = AStarGrid2D.new()
+		_direct_grid.region = bounds
+		_direct_grid.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_NEVER
+		_direct_grid.default_estimate_heuristic = AStarGrid2D.HEURISTIC_MANHATTAN
+		_direct_grid.update()
+		for y in range(1, map.height - 1):
+			for x in range(1, map.width - 1):
+				if not map.cell_walkable(x, y):
+					_direct_grid.set_point_solid(Vector2i(x, y))
+	if _direct_grid.is_point_solid(from) or _direct_grid.is_point_solid(to):
+		return []
+	return _direct_grid.get_id_path(from, to)
 
 
 func _steer_goal(hero) -> Vector3:
@@ -908,6 +1027,9 @@ func _steer_goal(hero) -> Vector3:
 			var g: Vector3 = raid.autopilot_goal(hero)
 			if g != Vector3.INF:
 				return g
+	var morroc_goal: Vector3 = world.morroc.autopilot_goal()
+	if morroc_goal != Vector3.INF:
+		return morroc_goal
 	var runner = world.runner
 	if runner != null and is_instance_valid(runner) and not bool(runner.dead):
 		var rp: Vector3 = runner.position
@@ -1119,7 +1241,8 @@ func _do_keep() -> void:
 	run_state["kept"] = kept
 	run_state["keep_skipped"] = skipped
 	run_state["settled"] = _reward_snapshot()
-	_log("KEEP_DONE kept=%d offer=%d victory=%s" % [kept.size(), offer.size(), str(victory)])
+	_log("KEEP_DONE kept=%d offer=%d victory=%s free=%s slots=%d" % [
+		kept.size(), offer.size(), str(victory), str(free), slots])
 	# The profile is flushed: the run is settled. A crash from here on must
 	# account this result once, never lose or repeat it. A crash between the
 	# flush and this write loses the run's accounting (ADR 0001), never
@@ -1965,6 +2088,7 @@ func _snapshot_run_state() -> Dictionary:
 		"materials": Save.materials().duplicate(true),
 		"coins": int(Save.coins()) if Save.has_method("coins") else 0,
 		"ymir": int(Save.ymir_fragments()) if Save.has_method("ymir_fragments") else 0,
+		"morroc_finale_before": Save.stat("morroc_finale"),
 		"cards": _total_card_copies(),
 		"pets": int((Save.data.get("pets", {}) as Dictionary).size()),
 		"storage": int(Save.storage().size()),
@@ -2160,6 +2284,29 @@ func _test_env(name: String) -> String:
 	return OS.get_environment("FARMER_TEST_" + name)
 
 
+func _test_tick_blocked_portal() -> bool:
+	var state := str(world.raid.state)
+	if not _test_portal_seeded and state == "portal":
+		# Prontera Field: an intervening tile is blocked, but the portal is
+		# reachable around it. Keep the native portal entry and collision.
+		var start := Vector3(-98.5, 0.0, 135.5)
+		var goal := Vector3(-90.5, 0.0, 135.5)
+		if not world.map.is_walkable(start) or not world.map.is_walkable(goal) \
+				or world.map.is_walkable(start + Vector3.RIGHT) or world.raid.portal_sealed:
+			_fail_session("invalid_blocked_portal_fixture")
+			return true
+		world.player.position = Vector3(start.x, world.map.height_at(start), start.z)
+		world.raid.portal_pos = goal
+		_test_portal_seeded = true
+		_log("BLOCKED_PORTAL seeded")
+	elif _test_portal_seeded and (state == "intro" or state == "fight"):
+		_log("BLOCKED_PORTAL entered")
+		_test_blocked_portal = false
+		_end_run_safe(false)
+		return true
+	return false
+
+
 func _test_seed_wishlist_offer() -> void:
 	# Avoid random drops; the game's own end screen still builds the keep offer.
 	if _test_wishlist_ids.is_empty():
@@ -2287,6 +2434,7 @@ func _build_result() -> Dictionary:
 		"danger": active_danger,
 		"oath_points": active_oath_points,
 		"victory": bool(run_state.get("victory", false)),
+		"finale_won": bool(run_state.get("finale_won", false)),
 		"died": bool(run_state.get("died", false)),
 		"forced": bool(run_state.get("forced", false)),
 		"force_reason": str(run_state.get("force_reason", "")),

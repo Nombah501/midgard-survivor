@@ -33,7 +33,9 @@ catalog_evidence = {}
 verify_oaths = os.environ.get("FARMER_TEST_OATHS") == "1"
 verify_wishlist = os.environ.get("FARMER_TEST_WISHLIST") == "1"
 wishlist_evidence = []
-oath_costs = {"tough": [1, 2, 4], "elite": [2, 4, 6], "hunt": [1, 2, 3], "mvp_fury": [2, 4]}
+oath_costs = {"tough": [1, 2, 4], "elite": [2, 4, 6], "hunt": [1, 2, 3], "kyrie": [1, 2, 3],
+              "mvp_fury": [2, 4], "hellfire": [1, 2, 3], "lex": [2, 4], "curse": [2, 4], "unlucky": [3, 6]}
+hell_rotation = cfg.get("run_minutes") == 50
 rotation_offset = 0
 rotation_locations = [
     {"id": "prontera", "name": "Prontera Field", "unlocked": True, "min_difficulty": 1, "max_difficulty": 30},
@@ -186,6 +188,13 @@ def settle(force, *, wait_at_keep=False):
            "endless": cfg.get("endless"), "endless_mvps": 3, "kept": [], "force_reason": force,
            "forced": os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1" and fault != "unforced-stall"}
     row.update(stage=location(), danger=difficulty(), oath_points=oath_points())
+    if hell_rotation:
+        assert cfg["objective"] == "crumbs" and cfg["class"] == "thief" and cfg["job_paths"] == {"thief": 0}
+        assert rotating() and cfg["danger"] == 30
+        assert cfg["endless"] and cfg["endless_minutes"] == cfg["endless_mvps"] == 0
+        row.update(game_s=2451, job="assassin_cross", finale_won=fault not in {"no-victory", "no-finale"})
+        if fault == "forced-finale":
+            row.update(forced=True, force_reason="run_timeout")
     if fault == "wrong-oath-journal-points":
         row["oath_points"] = 0
     if fault == "wrong-run-journal-target":
@@ -194,6 +203,9 @@ def settle(force, *, wait_at_keep=False):
         row["stage"] = "payon"
     if fault == "no-victory":
         row["victory"] = False
+        if hell_rotation:
+            row.update(died=True, game_s=1842)
+            log("PLAYER_DIED t=1842.0 by=Orc Warrior what=Bash")
     if fault == "no-mvp":
         row["endless_mvps"] = 0
     if not (fault == "unbanked-zeny" and started == 2):
@@ -211,7 +223,11 @@ def settle(force, *, wait_at_keep=False):
             time.sleep(0.025)
     if verify_wishlist:
         settle_wishlist(row)
-    log("KEEP_DONE kept=0")
+    if hell_rotation:
+        keep = "free=false slots=1" if fault == "paid-finale-keep" else "free=true slots=3"
+        log(f"KEEP_DONE kept=0 offer=0 victory={str(row['victory']).lower()} {keep}")
+    else:
+        log("KEEP_DONE kept=0")
     checkpoint("settled", row)
     crash("settled")
     log("MAINT done")
@@ -339,6 +355,10 @@ if started == 1:
             time.sleep(0.07)
             settle("run_timeout", wait_at_keep=True)
         time.sleep(0.02)
+if os.environ.get("FARMER_TEST_BLOCKED_PORTAL") == "1":
+    log("BLOCKED_PORTAL seeded")
+    if fault != "portal-not-entered":
+        log("BLOCKED_PORTAL entered")
 if os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1":
     for tries in (1, 2, 3):
         log(f"RUN_STALL clock={tries * 5.0:.1f} t=12.0 tries={tries}")
@@ -346,7 +366,7 @@ if os.environ.get("FARMER_TEST_FLUSH_FAIL") == "1":
     log("FAIL flush_failed")
     status("failed", "flush_failed", 1)
     sys.exit(1)
-settle("run_timeout")
+settle("" if hell_rotation else "run_timeout")
 if verify_wishlist:
     started += 1
     run_id = f"{session}-r{started}"
@@ -355,7 +375,7 @@ while rotating() and runs < cfg["max_runs"]:
     started += 1
     run_id = f"{session}-r{started}"
     settle("run_timeout")
-if cfg.get("endless"):
+if cfg.get("endless") and not hell_rotation:
     log("ENDLESS_DONE goal")
 if cfg.get("class") == "thief":
     log("STOP max_minutes")
