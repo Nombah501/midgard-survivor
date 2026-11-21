@@ -114,6 +114,11 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
     assert row["verdict"] == "PASS", row
     assert json.loads((out / f"{name}.result.json").read_text()) == row
     assert (out / f"{name}.run.log").exists()
+    config = json.loads((out / f"{name}.json").read_text()) if name in {"hell-rotation", "one-run"} else {}
+    if name == "hell-rotation":
+        assert (config["altar_policy"], config["karma_route"]) == ("map-wide", "valhalla")
+    elif name == "one-run":
+        assert "altar_policy" not in config and "karma_route" not in config
     if name == "catalog":
         assert (out / "catalog.catalog.json").is_file()
     assert (root / source.name / "patches" / "official.pck").samefile(source / "patches/official.pck")
@@ -136,6 +141,12 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
     ("paid-finale-keep", "three free keep slots"),
     ("wrong-oath-journal-points", "oath points"),
     ("wrong-run-journal-target", "location or difficulty"),
+    ("no-altars", "no map-wide altar taken"),
+    ("took-hel", "took an altar not allowed"),
+    ("no-second-route", "no Valhalla route after MVP 3"),
+    ("no-second-valkyrie", "no Valkyrie kill before endless continued after MVP 3"),
+    ("late-valkyrie", "no Valkyrie kill before endless continued after MVP 3"),
+    ("missing-mvp-log", "MVP count does not match"),
 ])
 def test_hell_rotation_requires_a_real_finale_win(verification, monkeypatch, fault, reason):
     monkeypatch.setenv("FAKE_VERIFY_FAULT", fault)

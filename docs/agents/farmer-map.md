@@ -19,6 +19,7 @@ Cross-cutting:
 - Checkpoint and crash recovery: `_write_checkpoint`, `_restore_checkpoint`, `_journal_has`; session identity from `FARMER_SESSION_ID`.
 - Operator commands and limits: `_check_command` (claims `user://farmer_command`; legacy `farmer_stop` = finish), `_check_limits` (`max_minutes`, `max_runs`, `stop_after_wins`), both ending in `_request_finish`.
 - Movement: `_steer_goal` selects the game's raid/Morroc target. In 0.2.5 both native autopilot and click-to-move aim directly, and the enemy flow field supplies only local direction hints. `_steer_direct` preserves direct movement until progress stops at blocked terrain, then follows a tile route using the player's own map walkability.
+- Hell strategy (`hell-rotation` only): `altar_policy: "map-wide"` uses the configured altar order across the field, holds position through the native channel, and logs `ALTAR_TAKE` or `ALTAR_SKIP`. `karma_route: "valhalla"` sets the run's route side, steers to the native karma portal after each regular MVP, and waits for `VALKYRIE_KILLED` before continuing endless. Refused routes log `KARMA_ROUTE_SKIP`; the profile is not used to choose the side.
 
 ## Around the game
 

@@ -28,6 +28,7 @@ const RESULT_BOSS_WON := "boss_won"
 const STATUS_EVERY_MS := 5000
 const TICK_MS := 100
 const VICTORY_PULL_MS := 1500
+const KARMA_PORTAL_WAIT_MS := 20000
 const SETTLE_WAIT_MS := 25000
 const MAX_DRAFT_PER_TICK := 32
 const DIRECT_STALL_MS := 750
@@ -76,6 +77,10 @@ var run_state: Dictionary = {}
 var last_run: Dictionary = {}
 var arms: Dictionary = {}
 var last_maint: Dictionary = {}
+
+var _altar_seen: Dictionary = {}
+var _altar_channel: Dictionary = {}
+var _altar_direct := false
 
 var _time_last := -1.0
 var _time_change_ms := 0
@@ -315,6 +320,10 @@ func _prepare_run() -> void:
 	run_state["run_zeny"] = 0
 	run_state["run_mvps"] = 0
 	run_state["route_entered"] = false
+	_altar_seen.clear()
+	_altar_channel = {}
+	if cfg["karma_route"] == "valhalla":
+		run_state["reginleif_cards"] = int(Save.data.get("cards", {}).get("reginleif_card", 0))
 	_time_last = -1.0
 	_time_change_ms = _now()
 	_clock_last = -1.0
@@ -338,6 +347,8 @@ func _prepare_run() -> void:
 	if _test_blocked_portal:
 		GameData.set_meta("mvp_at", 2.0)
 	world.start_run(active_class)
+	if cfg["karma_route"] == "valhalla" and is_instance_valid(world.karma):
+		world.karma.path = "light"
 	active_oath_points = int(world.oath_points())
 	_replace_player_input()
 	_apply_autopilot()
@@ -374,6 +385,8 @@ func _tick_run(now: int) -> void:
 	_replace_player_input()
 	_handle_job_change(world.player)
 	_draft_player()
+	if cfg["altar_policy"] == "map-wide":
+		_observe_altars()
 	if world.running:
 		_handle_victory(now)
 	if world == null or not is_instance_valid(world):
@@ -395,6 +408,9 @@ func _handle_victory(now: int) -> void:
 		return
 	# Morroc ends the run itself once the finale's loot has been collected.
 	if world.morroc.finale_won():
+		return
+	var valhalla: bool = cfg["karma_route"] == "valhalla"
+	if valhalla and _wait_for_valhalla(now):
 		return
 	var new_win := false
 	# Count field and arena MVPs alike; raid.state stays "won" after leave().
@@ -420,6 +436,8 @@ func _handle_victory(now: int) -> void:
 		if int(run_state.get("won_at", 0)) == 0:
 			run_state["won_at"] = now
 			_log("BOSS_WON t=%.1f mvps=%d wall_ms=%d" % [float(world.time), mvps, now])
+			if valhalla:
+				run_state["regular_mvp"] = mvps
 	# A pending victory must survive frames where `new_win` is false (the MVP
 	# counter does not grow every frame and the arena exit has no menu).
 	if int(run_state.get("won_at", 0)) == 0:
@@ -427,11 +445,17 @@ func _handle_victory(now: int) -> void:
 	world._pull_prizes()
 	if now - int(run_state.get("won_at", now)) < VICTORY_PULL_MS:
 		return
-	# After the MVP the arena opens a karma portal: Valhalla -> Valkyrie
-	# Reginleif, Niflheim -> Randgris. Entering it before endless grants the
-	# route boon (+1 revive and +15% XP for Valhalla), which makes the endless
-	# run last longer. Without a chosen karma side there is no portal.
-	if world.karma != null and is_instance_valid(world.karma) \
+	if valhalla:
+		var regular := int(run_state.get("regular_mvp", 0))
+		if regular > int(run_state.get("valhalla_for", 0)):
+			run_state["valhalla_for"] = regular
+			run_state["valhalla_until"] = now + KARMA_PORTAL_WAIT_MS
+			run_state["valhalla_entered"] = false
+			var karma = world.karma
+			run_state["valhalla_boons"] = int(karma.boons) if is_instance_valid(karma) else 0
+			if _wait_for_valhalla(now):
+				return
+	elif world.karma != null and is_instance_valid(world.karma) \
 			and world.karma.has_method("can_route") and bool(world.karma.can_route()) \
 			and not bool(run_state.get("route_entered", false)):
 		run_state["route_entered"] = true
@@ -460,6 +484,57 @@ func _handle_victory(now: int) -> void:
 			_apply_autopilot()
 	else:
 		_end_run_safe(true)
+
+
+# True while the regular MVP's route is pending or its Valkyrie is alive.
+func _wait_for_valhalla(now: int) -> bool:
+	var until := int(run_state.get("valhalla_until", 0))
+	if until == 0:
+		return false
+	var regular := int(run_state["valhalla_for"])
+	var karma = world.karma
+	var raid = world.raid
+	var has_karma := is_instance_valid(karma)
+	var valkyrie := is_instance_valid(raid) and str(raid.mvp) == "reginleif"
+	var won: bool = has_karma and valkyrie and raid.state == "won" and karma.route == "" \
+			and bool(karma.won_here) and karma.boon == "valhalla" and int(karma.boons) > int(run_state["valhalla_boons"])
+	if won or (has_karma and valkyrie and karma.route == "light"):
+		if not bool(run_state["valhalla_entered"]):
+			run_state["valhalla_entered"] = true
+			_log("KARMA_ROUTE side=light mvp=reginleif after_mvp=%d t=%.1f" % [regular, float(world.time)])
+		if not won:
+			return true
+		run_state["valhalla_until"] = 0
+		run_state["last_run_mvps"] = int(world.run_mvps)
+		run_state["won_at"] = now
+		run_state["valkyrie_kills"] = int(run_state.get("valkyrie_kills", 0)) + 1
+		_log("VALKYRIE_KILLED mvp=reginleif after_mvp=%d boons=%d t=%.1f" % [regular, int(karma.boons), float(world.time)])
+		return false
+	if bool(run_state["valhalla_entered"]):
+		return true
+	var reason := ""
+	if not has_karma or not karma.can_route() or karma.route_side() != "light":
+		reason = "cannot_route"
+	elif not is_instance_valid(raid):
+		reason = "no_raid"
+	elif not raid.in_arena():
+		# A field MVP has no exit portals to approach.
+		world.menus.close()
+		get_tree().paused = false
+		karma.enter_route()
+		if karma.route == "light":
+			return true
+		reason = "entry_refused"
+	elif now >= until:
+		reason = "portal_timeout"
+	elif world.menus._mode == "victory":
+		reason = "return_portal_entered"
+	if reason.is_empty():
+		world._pull_prizes()
+		return true
+	run_state["valhalla_until"] = 0
+	_log("KARMA_ROUTE_SKIP side=light after_mvp=%d reason=%s t=%.1f" % [regular, reason, float(world.time)])
+	return false
 
 
 func _want_endless() -> bool:
@@ -908,6 +983,7 @@ func steer(hero) -> Vector2:
 		return Vector2.ZERO
 	if get_tree().paused:
 		return Vector2.ZERO
+	_altar_direct = false
 	var goal: Vector3 = _steer_goal(hero)
 	if goal != Vector3.INF:
 		var at: Vector3 = hero.position
@@ -916,7 +992,7 @@ func steer(hero) -> Vector2:
 		if to.length_squared() < 0.45 * 0.45:
 			_direct_progress_ms = -1
 			return Vector2.ZERO
-		if _direct_goal():
+		if _altar_direct or _direct_goal():
 			return _steer_direct(at, goal, to)
 	_direct_progress_ms = -1
 	return Bot.steer(world, goal, hero)
@@ -928,6 +1004,8 @@ func _direct_goal() -> bool:
 	if raid != null and is_instance_valid(raid):
 		var st := str(raid.state)
 		if st == "fight" or st == "portal" or st == "intro":
+			return true
+		if st == "won" and cfg["karma_route"] == "valhalla" and int(run_state.get("valhalla_until", 0)) > 0:
 			return true
 	if world.morroc.active():
 		return true
@@ -1003,6 +1081,10 @@ func _direct_tile_path(map: RoMap, from: Vector2i, to: Vector2i) -> Array[Vector
 	var bounds := Rect2i(1, 1, map.width - 2, map.height - 2)
 	if not bounds.has_point(from) or not bounds.has_point(to):
 		return []
+	if map.get_instance_id() != _direct_map_id:
+		_direct_map_id = map.get_instance_id()
+		_direct_grid = null
+		_direct_progress_ms = -1
 	# Native steering has no waypoint route; use the same walkability as Player.
 	if _direct_grid == null:
 		_direct_grid = AStarGrid2D.new()
@@ -1023,10 +1105,19 @@ func _steer_goal(hero) -> Vector3:
 	var raid = world.raid
 	if raid != null and is_instance_valid(raid):
 		var st := str(raid.state)
+		if st == "won" and cfg["karma_route"] == "valhalla" and raid._kportal_pos != Vector3.INF:
+			if int(run_state.get("valhalla_until", 0)) > 0:
+				return _karma_portal_goal(hero, raid)
+			return hero.position
 		if st == "fight" or st == "portal" or st == "intro" or st == "loading":
 			var g: Vector3 = raid.autopilot_goal(hero)
 			if g != Vector3.INF:
 				return g
+	var map_wide: bool = cfg["altar_policy"] == "map-wide" and not (raid != null and raid.in_arena())
+	if map_wide:
+		var hold := _altar_hold_goal(hero)
+		if hold != Vector3.INF:
+			return hold
 	var morroc_goal: Vector3 = world.morroc.autopilot_goal()
 	if morroc_goal != Vector3.INF:
 		return morroc_goal
@@ -1035,12 +1126,20 @@ func _steer_goal(hero) -> Vector3:
 		var rp: Vector3 = runner.position
 		if Vector2(rp.x - hero.position.x, rp.z - hero.position.z).length() <= 40.0:
 			return rp
+	if map_wide:
+		var close_pick := _best_pickup(hero, GameData.ALTAR_RADIUS)
+		if close_pick != Vector3.INF:
+			return close_pick
+		var altar := _map_altar_goal(hero)
+		if altar != Vector3.INF:
+			return altar
 	var pick := _best_pickup(hero)
 	if pick != Vector3.INF:
 		return pick
-	var altar := _best_altar(hero)
-	if altar != Vector3.INF:
-		return altar
+	if cfg["altar_policy"] != "map-wide":
+		var altar := _best_altar(hero)
+		if altar != Vector3.INF:
+			return altar
 	if world.quest != null and is_instance_valid(world.quest):
 		var qg: Vector3 = world.quest.autopilot_goal()
 		if qg != Vector3.INF:
@@ -1053,7 +1152,7 @@ func _steer_goal(hero) -> Vector3:
 	return Vector3.INF
 
 
-func _best_pickup(hero) -> Vector3:
+func _best_pickup(hero, max_dist := INF) -> Vector3:
 	var best := Vector3.INF
 	var best_score := -1.0e30
 	var pickups: Array = world.pickups
@@ -1076,7 +1175,7 @@ func _best_pickup(hero) -> Vector3:
 			limit = 22.0
 		elif kind == "ore":
 			limit = 14.0
-		if dist > limit:
+		if dist > minf(limit, max_dist):
 			continue
 		var score := prio - dist * 2.0
 		if kind == "chest":
@@ -1141,6 +1240,123 @@ func _best_altar(hero) -> Vector3:
 			best_dist = dist
 			best = pos
 	return best
+
+
+func _karma_portal_goal(hero, raid) -> Vector3:
+	var goal: Vector3 = raid._kportal_pos
+	var normal: Vector3 = raid.portal_pos
+	var start: Vector3 = hero.position
+	normal.y = 0.0
+	start.y = 0.0
+	var end := Vector3(goal.x, 0.0, goal.z)
+	var closest := Geometry3D.get_closest_point_to_segment(normal, start, end)
+	if closest.distance_squared_to(normal) < 1.4 * 1.4:
+		# The game tests the return portal first; steer around its trigger.
+		var side := (end - normal).cross(Vector3.UP).normalized() * 1.8
+		var pass_at := normal + (start - normal).normalized() * 1.4
+		return pass_at + (side if (start - normal).dot(side) >= 0.0 else -side)
+	return goal
+
+
+func _altar_skip(entry: Dictionary, reason: String) -> void:
+	if entry.has("skip"):
+		return
+	entry["skip"] = reason
+	_log("ALTAR_SKIP id=%s reason=%s t=%.1f" % [str(entry.altar.id), reason, float(world.time)])
+
+
+func _altar_rejection(id: String) -> String:
+	if id == "hel":
+		return "hel"
+	var priority: Array = cfg["altar_priority"]
+	return "" if priority.has(id) and GameData.ALTARS.has(id) and not GameData.ALTARS[id].has("npc") else "not_priority"
+
+
+func _observe_altars() -> void:
+	# Keep the game's dictionary: removal with a full channel is acceptance,
+	# including Baldur, which isn't counted in world.altars.taken.
+	var waiting: Array = world.altars.waiting
+	var hero = world.player
+	for a in waiting:
+		var key: int = a.node.get_instance_id()
+		if _altar_seen.has(key):
+			continue
+		var entry := {"altar": a, "dist": _flat_distance(hero.position, a.pos)}
+		_altar_seen[key] = entry
+		var reason := _altar_rejection(str(a.id))
+		if reason != "":
+			_altar_skip(entry, reason)
+	for key in _altar_seen.keys():
+		var entry: Dictionary = _altar_seen[key]
+		var a: Dictionary = entry.altar
+		if waiting.has(a):
+			continue
+		if float(a.fill) >= GameData.ALTAR_CHANNEL:
+			var nearby: int = world.enemies_in_radius(a.pos, 5.0).size()
+			_log("ALTAR_TAKE id=%s from=%.1f nearby=%d t=%.1f" % [str(a.id), float(entry.dist), nearby, float(world.time)])
+		else:
+			_altar_skip(entry, "expired" if float(a.life) <= 0.0 else "removed")
+		_altar_seen.erase(key)
+
+
+func _altar_hold_goal(hero) -> Vector3:
+	for a in world.altars.waiting:
+		if _altar_rejection(str(a.id)) != "" and _flat_distance(hero.position, a.pos) < GameData.ALTAR_RADIUS:
+			# Proximity alone channels altars, even if they aren't a goal.
+			var away: Vector3 = hero.position - a.pos
+			away.y = 0.0
+			return a.pos + (away.normalized() if away != Vector3.ZERO else Vector3.RIGHT) * (GameData.ALTAR_RADIUS + 1.0)
+	if not _altar_channel.is_empty():
+		if world.altars.waiting.has(_altar_channel):
+			return _channel_altar_at(hero, _altar_channel.pos)
+		_altar_channel = {}
+	return Vector3.INF
+
+
+func _channel_altar_at(hero, pos: Vector3) -> Vector3:
+	_altar_direct = true
+	return hero.position if _flat_distance(hero.position, pos) < GameData.ALTAR_RADIUS else pos
+
+
+func _map_altar_goal(hero) -> Vector3:
+	var priority: Array = cfg["altar_priority"]
+	var map: RoMap = world.map
+	var from := map.tile_of(hero.position)
+	var best: Dictionary = {}
+	var best_rank := priority.size()
+	var best_dist := INF
+	for a in world.altars.waiting:
+		var aid := str(a.id)
+		if _altar_rejection(aid) != "":
+			continue
+		var rank := priority.find(aid)
+		var pos: Vector3 = a.pos
+		var dist := _flat_distance(hero.position, pos)
+		if rank > best_rank or (rank == best_rank and dist >= best_dist):
+			continue
+		var key: int = a.node.get_instance_id()
+		var entry: Dictionary = _altar_seen.get(key, {})
+		if entry.get("skip") == "unreachable":
+			continue
+		if dist >= GameData.ALTAR_RADIUS and not entry.get("reachable", false):
+			var tile := map.tile_of(pos)
+			if _direct_line_blocked(map, hero.position, pos - hero.position, from, tile) \
+					and _direct_tile_path(map, from, tile).is_empty():
+				_altar_skip(entry if not entry.is_empty() else {"altar": a}, "unreachable")
+				continue
+			entry["reachable"] = true
+		best = a
+		best_rank = rank
+		best_dist = dist
+	if best.is_empty():
+		return Vector3.INF
+	if best_dist < GameData.ALTAR_RADIUS:
+		_altar_channel = best
+	return _channel_altar_at(hero, best.pos)
+
+
+func _flat_distance(a: Vector3, b: Vector3) -> float:
+	return Vector2(a.x - b.x, a.z - b.z).length()
 
 
 func _retreat_point(hero) -> Vector3:
@@ -2464,6 +2680,10 @@ func _build_result() -> Dictionary:
 		"value": 0.0,
 		"rate": 0.0,
 	}
+	if cfg["karma_route"] == "valhalla":
+		result["valkyrie_kills"] = int(run_state.get("valkyrie_kills", 0))
+		result["reginleif_cards_gain"] = int(Save.data.get("cards", {}).get("reginleif_card", 0)) \
+				- int(run_state.get("reginleif_cards", 0))
 	result["value"] = _run_value(result)
 	result["rate"] = float(result["value"]) / maxf(1.0, wall)
 	return result
@@ -2569,6 +2789,7 @@ func _load_cfg() -> bool:
 		"auto_storage_prune": false,
 		"altar_priority": ["freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "odin", "emperium"],
 		"altar_range": 12.0,
+		"altar_policy": "cautious", "karma_route": "natural",
 		"junk_skills": ["throw_stone", "steal"],
 		"goals": {}, "goal_stop": false,
 	}
@@ -2592,6 +2813,10 @@ func _load_cfg() -> bool:
 		errors.append("builds must be an object")
 	if not (cfg.get("goals") is Dictionary):
 		errors.append("goals must be an object")
+	if cfg["altar_policy"] not in ["cautious", "map-wide"]:
+		errors.append("altar_policy must be cautious or map-wide")
+	if cfg["karma_route"] not in ["natural", "valhalla"]:
+		errors.append("karma_route must be natural or valhalla")
 	if not (cfg["wishlist"] is Array):
 		errors.append("wishlist must be an array of item ids")
 	else:

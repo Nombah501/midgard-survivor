@@ -18,6 +18,8 @@ session = os.environ["FARMER_SESSION_ID"]
 assert session.startswith("verify-")
 cfg = json.loads((profile / "farmer.cfg").read_bytes())
 assert not cfg["display"]
+if cfg.get("run_minutes") != 50:
+    assert "altar_policy" not in cfg and "karma_route" not in cfg
 checkpoint_path = profile / "farmer_session.json"
 journal_path = profile / "farmer_runs.jsonl"
 save = profile / "profile.json"
@@ -183,6 +185,28 @@ def settle_wishlist(row):
     })
 
 
+def hell_evidence(row):
+    row.update(run_mvps=4, endless_mvps=2, valkyrie_kills=2, reginleif_cards_gain=1)
+    if fault != "no-altars":
+        log("ALTAR_TAKE id=freyja from=26.5 nearby=12 t=90.0")
+    if fault == "took-hel":
+        log("ALTAR_TAKE id=hel from=25.0 nearby=11 t=120.0")
+    else:
+        log("ALTAR_SKIP id=hel reason=hel t=120.0")
+    for n, mvp in enumerate((1, 3), 1):
+        if n == 2 and fault == "missing-mvp-log":
+            break
+        log(f"BOSS_WON t={n * 480:.1f} mvps={mvp} wall_ms=10")
+        if not (n == 2 and fault == "no-second-route"):
+            log(f"KARMA_ROUTE side=light mvp=reginleif after_mvp={mvp} t={n * 480:.1f}")
+        kill = f"VALKYRIE_KILLED mvp=reginleif after_mvp={mvp} boons={n} t={n * 480:.1f}"
+        if n == 1 or fault not in {"no-second-valkyrie", "late-valkyrie"}:
+            log(kill)
+        log(f"ENDLESS_START time={n * 480:.1f} n={n}")
+        if n == 2 and fault == "late-valkyrie":
+            log(kill)
+
+
 def settle(force, *, wait_at_keep=False):
     row = {"session": session, "run_id": run_id, "zeny_gain": 20, "kills": 15, "game_s": 7, "victory": True,
            "endless": cfg.get("endless"), "endless_mvps": 3, "kept": [], "force_reason": force,
@@ -192,6 +216,8 @@ def settle(force, *, wait_at_keep=False):
         assert cfg["objective"] == "crumbs" and cfg["class"] == "thief" and cfg["job_paths"] == {"thief": 0}
         assert rotating() and cfg["danger"] == 30
         assert cfg["endless"] and cfg["endless_minutes"] == cfg["endless_mvps"] == 0
+        assert cfg["altar_policy"] == "map-wide" and cfg["karma_route"] == "valhalla"
+        hell_evidence(row)
         row.update(game_s=2451, job="assassin_cross", finale_won=fault not in {"no-victory", "no-finale"})
         if fault == "forced-finale":
             row.update(forced=True, force_reason="run_timeout")

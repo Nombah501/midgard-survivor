@@ -9,6 +9,8 @@
   "endless": true,
   "endless_minutes": 0,
   "endless_mvps": 0,
+  "altar_policy": "map-wide",
+  "karma_route": "valhalla",
   "max_runs": 0,
   "restart_seconds": 2,
   "upgrade_reserve": 200000,

@@ -224,8 +224,34 @@ def hell_rotation(run: Run, driven: Driven, status: dict) -> None:
         need(result.get("endless") and result.get("finale_won"), "did not defeat the final boss in endless")
         need(result.get("victory") is True, "victory missing")
     need(totals.get("wins") == 1, "victory missing from totals")
-    need(re.search(r"KEEP_DONE .*victory=true free=true slots=3$", run.artifact("farmer.log").read_text(
-        encoding="utf-8"), re.MULTILINE), "expected three free keep slots after victory")
+    log = run.artifact("farmer.log").read_text(encoding="utf-8")
+    need(re.search(r"KEEP_DONE .*victory=true free=true slots=3$", log, re.MULTILINE),
+         "expected three free keep slots after victory")
+    altars = re.findall(r"^FARMER \S+ ALTAR_TAKE id=(\w+) from=([\d.]+) nearby=\d+ ", log, re.MULTILINE)
+    need(any(float(distance) > 12 for _, distance in altars), "no map-wide altar taken")
+    priority = {"freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "odin", "emperium"}
+    need(all(altar in priority for altar, _ in altars), "took an altar not allowed by Hell policy")
+
+    mvps = list(re.finditer(r"^FARMER \S+ BOSS_WON .* mvps=(\d+) ", log, re.MULTILINE))
+    routes = list(re.finditer(r"^FARMER \S+ KARMA_ROUTE side=light mvp=reginleif after_mvp=(\d+) ", log, re.MULTILINE))
+    kills = list(re.finditer(r"^FARMER \S+ VALKYRIE_KILLED mvp=reginleif after_mvp=(\d+) boons=(\d+) ",
+                            log, re.MULTILINE))
+    endless = list(re.finditer(r"^FARMER \S+ ENDLESS_START .* n=(\d+)$", log, re.MULTILINE))
+    count = len(mvps)
+    need(count > 0 and all(row.get("run_mvps") == count * 2 for row in (status["last"], rows[0])),
+         "MVP count does not match the run journal")
+    need(len(endless) == count, "expected endless to continue once per regular MVP")
+    for n, (mvp, continuation) in enumerate(zip(mvps, endless, strict=True), 1):
+        mvp_id = str(2 * n - 1)
+        need(mvp[1] == mvp_id and continuation[1] == str(n)
+             and (n == 1 or endless[n - 2].end() < mvp.start()), "unexpected regular MVP sequence")
+        need(n <= len(routes) and routes[n - 1][1] == mvp_id and mvp.end() < routes[n - 1].start(),
+             f"no Valhalla route after MVP {mvp_id}")
+        need(n <= len(kills) and kills[n - 1].groups() == (mvp_id, str(n))
+             and routes[n - 1].end() < kills[n - 1].start() < continuation.start(),
+             f"no Valkyrie kill before endless continued after MVP {mvp_id}")
+    need(len(routes) == len(kills) == count and rows[0].get("valkyrie_kills") == count,
+         "Valkyrie kill count does not match the run journal")
 
 
 def blocked_portal(run: Run, driven: Driven, status: dict) -> None:
