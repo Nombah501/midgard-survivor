@@ -34,6 +34,9 @@ _OATH_TARGETS = (("prontera", 30), ("prontera", 30))
 _resume_settings = partial(SessionSettings, upgrades=False, card_fusion=False)
 _ROTATION: LocationRotation = {"mode": "rotation"}
 _ROTATION_RUNS = 24  # Patch 0.2.5 has 23 catalog locations; include wraparound.
+_HELL_OATHS = {"tough": 3, "hunt": 3, "kyrie": 3, "elite": 3, "mvp_fury": 2,
+               "hellfire": 3, "lex": 2, "curse": 2, "unlucky": 2}
+_VALKYRIE_RUNS = 19  # One of each ability, plus nine more Caída waves.
 # Bounded scenarios inherit the shared one-run config, including speed 10,
 # hard exit and display false. All check exits, evidence and script errors.
 SCENARIOS = {
@@ -86,9 +89,13 @@ SCENARIOS = {
     "endless": Scenario(360, {"endless": True, "endless_minutes": 1.0, "endless_mvps": 2}, drive.direct, judges.endless),
     "hell-rotation": Scenario(1800, {
         "class": "thief", "job_paths": {"thief": 0}, "stage": _ROTATION, "danger": 30, "max_runs": 1,
-        "oaths": {"tough": 3, "hunt": 3, "kyrie": 3, "elite": 3, "mvp_fury": 2,
-                  "hellfire": 3, "lex": 2, "curse": 2, "unlucky": 2},
+        "oaths": _HELL_OATHS,
     }, drive.direct, judges.hell_rotation, preset="hell-rotation.json"),
+    "valkyrie-drill": Scenario(180, {
+        "class": "thief", "stage": "prontera", "danger": 30, "oaths": _HELL_OATHS,
+        "max_runs": _VALKYRIE_RUNS, "restart_seconds": 0, "endless": False,
+    }, partial(drive.direct, FARMER_TEST_VALKYRIE="1"),
+       partial(judges.valkyrie_drill, count=_VALKYRIE_RUNS), preset="hell-rotation.json"),
     "blocked-portal": Scenario(45, {"class": "thief", "danger": 30, "run_minutes": 0.1},
                                partial(drive.direct, FARMER_TEST_BLOCKED_PORTAL="1"), judges.blocked_portal),
     # Exit 1 + failed terminal status, flush_failed + nonzero status code, FAIL flush_failed.

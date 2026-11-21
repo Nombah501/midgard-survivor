@@ -2,9 +2,8 @@ extends Node
 ## Midgard Survivors autonomous farmer (v3).
 ##
 ## One brain node, loaded by a tiny Save autoload hook. It plays real runs,
-## controls the level-up draft itself, keeps loot through Save's own storage API,
-## and spends persistent resources between runs. No game script is patched except
-## the Save bootstrap.
+## delegates in-run level-ups to the native manual-play picker, keeps loot
+## through Save's storage API, and runs maintenance between runs.
 ##
 ## Design: docs/design/farmer.md. Game study: docs/analysis/.
 ## API_VERSION is bumped whenever the expected game symbols change.
@@ -30,8 +29,8 @@ const TICK_MS := 100
 const VICTORY_PULL_MS := 1500
 const KARMA_PORTAL_WAIT_MS := 20000
 const SETTLE_WAIT_MS := 25000
-const MAX_DRAFT_PER_TICK := 32
 const DIRECT_STALL_MS := 750
+const ALTAR_NO_PROGRESS := 5.0 # Allows Baldur's four-second calm window.
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -80,6 +79,8 @@ var last_maint: Dictionary = {}
 
 var _altar_seen: Dictionary = {}
 var _altar_channel: Dictionary = {}
+var _altar_fill_peak := 0.0
+var _altar_progress_clock := 0.0
 var _altar_direct := false
 
 var _time_last := -1.0
@@ -104,6 +105,12 @@ var _test_verify_wishlist := false
 var _test_freeze_run_time := false
 var _test_blocked_portal := false
 var _test_portal_seeded := false
+var _test_valkyrie := false
+var _test_raid_ability: Dictionary = {}
+var _test_raid_hits := 0
+var _test_raid_fails := 0
+var _test_raid_end := 0.0
+var _test_raid_marks := 0
 
 var _potential_script = null
 var _vanilla_input_seen := false
@@ -141,6 +148,7 @@ func _ready() -> void:
 	_test_wait_at_keep = _test_env("WAIT_AT_KEEP") == "1"
 	_test_freeze_run_time = _test_env("FREEZE_RUN_TIME") == "1"
 	_test_blocked_portal = _test_env("BLOCKED_PORTAL") == "1"
+	_test_valkyrie = _test_env("VALKYRIE") == "1"
 	_test_verify_wishlist = _test_env("WISHLIST") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
@@ -233,7 +241,6 @@ func _on_world_ready() -> void:
 	_apply_autopilot()
 	_replace_player_input()
 	Save.set_setting("onboarded", true)
-	Save.set_setting("endless_auto_pick", false)
 	# Keep the game from auto-ending the run after the MVP; the farmer decides
 	# at the victory point. This meta has no other effect in 0.2.3.
 	GameData.set_meta("karma_test", true)
@@ -298,6 +305,8 @@ func _prepare_run() -> void:
 		# Set up unspent points in the sandbox by earning XP, not by editing allocated stats.
 		if Save.free_points(active_class) <= 0:
 			Save.add_class_xp(active_class, Save.class_climb_xp(active_class))
+		Save.set_setting("endless_auto_pick", true)
+		AutoPick.log_picks = true
 		_test_preparation["before"] = _preparation_snapshot(Save.data)
 	_apply_build_settings(active_class)
 	var run_id := "%s-r%d" % [session_id, runs_started + 1]
@@ -338,7 +347,6 @@ func _prepare_run() -> void:
 	world.danger = active_danger
 	world.speed = clampi(int(cfg.get("game_speed", 3)), 1, 3)
 	Save.set_setting("onboarded", true)
-	Save.set_setting("endless_auto_pick", false)
 	# The game consumes even an empty override; never inherit the saved set.
 	world.oaths_next = cfg["oaths"] if active_danger == GameData.DANGER_MAX else {}
 	# 0.2.5 suppresses the finale on autopilot unless this meta is set.
@@ -346,10 +354,19 @@ func _prepare_run() -> void:
 		GameData.set_meta("finale_at", GameData.MORROC_FINALE.at)
 	if _test_blocked_portal:
 		GameData.set_meta("mvp_at", 2.0)
+	# The native start resets this manual-run toggle; don't persist its reset.
+	var settings: Dictionary = Save.data.settings
+	var had_auto_pick := settings.has("endless_auto_pick")
+	var auto_pick = settings.get("endless_auto_pick")
 	world.start_run(active_class)
+	if had_auto_pick:
+		settings["endless_auto_pick"] = auto_pick
+	else:
+		settings.erase("endless_auto_pick")
 	if cfg["karma_route"] == "valhalla" and is_instance_valid(world.karma):
 		world.karma.path = "light"
 	active_oath_points = int(world.oath_points())
+	_test_raid_ability = {}
 	_replace_player_input()
 	_apply_autopilot()
 	Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
@@ -385,6 +402,12 @@ func _tick_run(now: int) -> void:
 	_replace_player_input()
 	_handle_job_change(world.player)
 	_draft_player()
+	if _test_valkyrie:
+		if world.running:
+			_test_tick_valkyrie()
+		if not world.running:
+			_begin_settle(now)
+		return
 	if cfg["altar_policy"] == "map-wide":
 		_observe_altars()
 	if world.running:
@@ -501,14 +524,16 @@ func _wait_for_valhalla(now: int) -> bool:
 	if won or (has_karma and valkyrie and karma.route == "light"):
 		if not bool(run_state["valhalla_entered"]):
 			run_state["valhalla_entered"] = true
-			_log("KARMA_ROUTE side=light mvp=reginleif after_mvp=%d t=%.1f" % [regular, float(world.time)])
+			_log("KARMA_ROUTE side=light mvp=reginleif after_mvp=%d t=%.1f revives=%d falls=%d doom=%s" % [
+				regular, float(world.time), world.player.revives, world.player.falls, str(world.player.doom)])
 		if not won:
 			return true
 		run_state["valhalla_until"] = 0
 		run_state["last_run_mvps"] = int(world.run_mvps)
 		run_state["won_at"] = now
 		run_state["valkyrie_kills"] = int(run_state.get("valkyrie_kills", 0)) + 1
-		_log("VALKYRIE_KILLED mvp=reginleif after_mvp=%d boons=%d t=%.1f" % [regular, int(karma.boons), float(world.time)])
+		_log("VALKYRIE_KILLED mvp=reginleif after_mvp=%d boons=%d t=%.1f revives=%d falls=%d" % [
+			regular, int(karma.boons), float(world.time), world.player.revives, world.player.falls])
 		return false
 	if bool(run_state["valhalla_entered"]):
 		return true
@@ -579,13 +604,15 @@ func _begin_settle(now: int) -> void:
 		# The native end resets Morroc's event; the finale kill increments this
 		# stat before settlement, independently of the regular MVP counter.
 		var finale_won := Save.stat("morroc_finale") > float(run_state["morroc_finale_before"])
+		if _test_valkyrie and not _test_raid_ability.is_empty():
+			_test_log_valkyrie(died)
 		run_state["finale_won"] = finale_won
 		var victory := not bool(run_state["died"]) and not bool(run_state["forced"]) \
 			and (finale_won or bool(run_state["victory"]) or bool(run_state["boss_won"]))
 		run_state["victory"] = victory
 		if bool(run_state["died"]) and p != null and is_instance_valid(p):
-			_log("PLAYER_DIED t=%.1f by=%s what=%s" % [
-				float(world.time), str(p.death_by.get("by", "")), str(p.death_by.get("what", ""))])
+			_log("PLAYER_DIED t=%.1f by=%s what=%s revives=%d falls=%d" % [
+				float(world.time), str(p.death_by.get("by", "")), str(p.death_by.get("what", "")), p.revives, p.falls])
 		_log("SETTLE victory=%s died=%s endless=%s t=%.1f finale_won=%s" % [
 			str(victory), str(bool(run_state["died"])), str(bool(world.endless)), float(world.time), str(finale_won)])
 	phase = "settle"
@@ -808,51 +835,11 @@ func _results_forced(reason: String, now: int) -> void:
 # ---------------------------------------------------------------------------
 
 func _draft_player() -> void:
-	if world == null or not is_instance_valid(world):
-		return
-	var p = world.player
-	if p == null or not is_instance_valid(p):
-		return
-	_draft_hero(p, MAX_DRAFT_PER_TICK)
-	if p.pending_levels <= 0:
-		if world.menus != null and is_instance_valid(world.menus) and str(world.menus._mode) == "level_up":
-			world.menus.hide_level_up()
-			if get_tree().paused:
-				get_tree().paused = false
-
-
-func _draft_hero(h, limit: int) -> void:
-	if h == null or not is_instance_valid(h):
-		return
-	var guard := 0
-	while int(h.pending_levels) > 0 and guard < limit:
-		guard += 1
-		var choices: Array = h.offered_choices()
-		if choices.is_empty():
-			h.pending_levels = 0
-			break
-		var pick: Dictionary = _choose_choice(h, choices)
-		if pick.is_empty():
-			break
-		h.apply_choice(pick, world)
-		h.offer = []
-		h.pending_levels = maxi(0, int(h.pending_levels) - 1)
-		_after_choice(h)
-	if h == world.player and int(h.pending_levels) <= 0:
-		if world.menus != null and is_instance_valid(world.menus) and str(world.menus._mode) == "level_up":
-			world.menus.hide_level_up()
-			if get_tree().paused:
-				get_tree().paused = false
-
-
-func _after_choice(h) -> void:
-	if h == null or not is_instance_valid(h):
-		return
-	if h.skills.has("call_homunculus") and str(h.homun_type) == "":
-		h.homun_type = str(Save.setting("homun_pick", "homun_lif"))
-		world.spawn_homun(h)
-	world.check_more_homun(h)
-
+	# Menus.auto_pick is needed for loot and job dialogs, but uses Bot.pick_choice
+	# for levels. Run before the World tick and let its native timer pace picks.
+	if world.running and world.player.pending_levels > 0 and world._level_up_delay <= 0.0 \
+			and not world.busy() and not world.loot_waits_for_me():
+		world._auto_pick()
 
 func _handle_job_change(h) -> void:
 	if h == null or not is_instance_valid(h):
@@ -872,102 +859,17 @@ func _handle_job_change(h) -> void:
 
 
 func _preferred_start_skill(h) -> String:
-	var b: Dictionary = _build_for(str(h.class_id))
-	var prio: Array = b.get("skills", [])
+	var prio: Array = h.pick_order()
+	if prio.is_empty():
+		var build = cfg["builds"].get(str(h.class_id), {})
+		if build is Dictionary:
+			prio = build.get("skills", [])
 	var opts: Array = h.job_start_options()
 	for id in prio:
 		var sid := str(id)
 		if opts.has(sid):
 			return sid
 	return ""
-
-
-func _choose_choice(h, choices: Array) -> Dictionary:
-	var b: Dictionary = _build_for(str(h.class_id))
-	var prio: Array = b.get("skills", [])
-	var stat_prio: Array = b.get("stats", [])
-	var caps: Dictionary = b.get("caps", {})
-	var hp_ratio := float(h.hp) / maxf(1.0, float(h.max_hp))
-	var best: Dictionary = {}
-	var best_score := -1.0e30
-	for c in choices:
-		if not (c is Dictionary):
-			continue
-		var score := _choice_score(h, c, prio, stat_prio, caps, hp_ratio)
-		if score > best_score:
-			best_score = score
-			best = c
-	return best
-
-
-func _choice_score(h, c: Dictionary, prio: Array, stats_prio: Array, caps: Dictionary, hp_ratio: float) -> float:
-	var kind := str(c.get("kind", ""))
-	var id := str(c.get("id", ""))
-	var rarity := float(c.get("rarity", 0))
-	if kind == "potion":
-		return -1000.0
-	if kind == "evolve":
-		var base := Player.base_skill(id)
-		var idx := prio.find(id)
-		if idx < 0:
-			idx = prio.find(base)
-		if idx >= 0:
-			return 10000.0 - float(idx) * 10.0
-		return 500.0 + rarity
-	if kind == "skill":
-		var base := Player.base_skill(id)
-		var idx := prio.find(base)
-		if idx < 0:
-			idx = prio.find(id)
-		if caps.has(base) and int(c.get("level", 1)) > int(caps[base]):
-			return -500.0
-		if idx >= 0:
-			return 5000.0 - float(idx) * 10.0 + rarity
-		return _fallback_skill_score(h, c, hp_ratio)
-	if kind == "stat":
-		var sid := id
-		var idx := stats_prio.find(sid)
-		if idx < 0:
-			return 40.0 + rarity
-		var limit := 999
-		if caps.has(sid):
-			limit = int(caps[sid])
-		if int(h.stats.get(sid, 0)) >= limit:
-			return -800.0
-		return 900.0 - float(idx) * 20.0 + rarity
-	return 0.0
-
-
-func _fallback_skill_score(h, c: Dictionary, hp_ratio: float) -> float:
-	var id := str(c.get("id", ""))
-	var base := Player.base_skill(id)
-	var d: Dictionary = GameData.SKILLS.get(base, {})
-	if d.is_empty():
-		d = GameData.SKILLS.get(id, {})
-	if d.is_empty():
-		return 10.0
-	var typ := str(d.get("type", ""))
-	var rarity := float(c.get("rarity", 0)) * 8.0
-	var score := 100.0
-	if typ in ["aoe_self", "aoe_target", "petal_rain", "ground", "orbit", "summon", "falcon", "bolt"]:
-		score = 320.0
-	elif typ in ["melee_arc", "melee", "projectile", "dash", "charge", "trap"]:
-		score = 260.0
-	elif typ == "heal":
-		score = 280.0 if hp_ratio < 0.7 else 160.0
-	elif typ in ["shield", "buff"]:
-		score = 220.0 if hp_ratio < 0.6 else 150.0
-	elif typ == "passive":
-		score = 170.0
-		for base_id in GameData.EVOLUTIONS:
-			if str(GameData.EVOLUTIONS[base_id].get("passive", "")) == base and h.skills.has(base_id):
-				score = 420.0
-				break
-	if d.get("evolved", false):
-		score += 30.0
-	if h.skills.has(base):
-		score += 20.0
-	return score + rarity
 
 
 # ---------------------------------------------------------------------------
@@ -983,6 +885,15 @@ func steer(hero) -> Vector2:
 		return Vector2.ZERO
 	if get_tree().paused:
 		return Vector2.ZERO
+	var raid = world.raid
+	if cfg["karma_route"] == "valhalla" and raid.mvp == "reginleif" and raid.state == "fight":
+		for attack in raid._objects:
+			if attack.kind == "starfall":
+				return _kite_starfall(hero, raid)
+	return _steer_baseline(hero)
+
+
+func _steer_baseline(hero) -> Vector2:
 	_altar_direct = false
 	var goal: Vector3 = _steer_goal(hero)
 	if goal != Vector3.INF:
@@ -996,6 +907,20 @@ func steer(hero) -> Vector2:
 			return _steer_direct(at, goal, to)
 	_direct_progress_ms = -1
 	return Bot.steer(world, goal, hero)
+
+
+func _kite_starfall(hero: Player, raid) -> Vector2:
+	# Each mark locks to the hero's current position. Keep moving along a
+	# wide arc inside the arena so the rim cannot force a stop or reversal.
+	var offset: Vector3 = hero.position - raid.center
+	var radial := Vector2(offset.x, offset.z)
+	var distance := radial.length()
+	if distance < 0.1:
+		return Vector2.RIGHT
+	radial /= distance
+	# Reginleif's crystals sit at 55% radius; orbit beyond them.
+	var turn := clampf((float(raid.radius) * 0.7 - distance) * 0.3, -2.0, 2.0)
+	return (Vector2(-radial.y, radial.x) + radial * turn).normalized()
 
 
 func _direct_goal() -> bool:
@@ -1103,17 +1028,23 @@ func _direct_tile_path(map: RoMap, from: Vector2i, to: Vector2i) -> Array[Vector
 
 func _steer_goal(hero) -> Vector3:
 	var raid = world.raid
+	var map_wide: bool = cfg["altar_policy"] == "map-wide" and not (raid != null and raid.in_arena())
 	if raid != null and is_instance_valid(raid):
 		var st := str(raid.state)
 		if st == "won" and cfg["karma_route"] == "valhalla" and raid._kportal_pos != Vector3.INF:
 			if int(run_state.get("valhalla_until", 0)) > 0:
 				return _karma_portal_goal(hero, raid)
 			return hero.position
+		if map_wide and st == "portal":
+			var baldur := _altar_hold_goal(hero, true)
+			if baldur == Vector3.INF:
+				baldur = _map_altar_goal(hero, true)
+			if baldur != Vector3.INF:
+				return _avoid_portal(hero.position, baldur, raid.portal_pos)
 		if st == "fight" or st == "portal" or st == "intro" or st == "loading":
 			var g: Vector3 = raid.autopilot_goal(hero)
 			if g != Vector3.INF:
 				return g
-	var map_wide: bool = cfg["altar_policy"] == "map-wide" and not (raid != null and raid.in_arena())
 	if map_wide:
 		var hold := _altar_hold_goal(hero)
 		if hold != Vector3.INF:
@@ -1243,15 +1174,18 @@ func _best_altar(hero) -> Vector3:
 
 
 func _karma_portal_goal(hero, raid) -> Vector3:
-	var goal: Vector3 = raid._kportal_pos
-	var normal: Vector3 = raid.portal_pos
-	var start: Vector3 = hero.position
+	return _avoid_portal(hero.position, raid._kportal_pos, raid.portal_pos)
+
+
+func _avoid_portal(start: Vector3, goal: Vector3, normal: Vector3) -> Vector3:
+	if normal == Vector3.INF or start == goal:
+		return goal
 	normal.y = 0.0
 	start.y = 0.0
 	var end := Vector3(goal.x, 0.0, goal.z)
 	var closest := Geometry3D.get_closest_point_to_segment(normal, start, end)
 	if closest.distance_squared_to(normal) < 1.4 * 1.4:
-		# The game tests the return portal first; steer around its trigger.
+		# Avoid the native 1.2-unit trigger before reaching the intended target.
 		var side := (end - normal).cross(Vector3.UP).normalized() * 1.8
 		var pass_at := normal + (start - normal).normalized() * 1.4
 		return pass_at + (side if (start - normal).dot(side) >= 0.0 else -side)
@@ -1259,10 +1193,16 @@ func _karma_portal_goal(hero, raid) -> Vector3:
 
 
 func _altar_skip(entry: Dictionary, reason: String) -> void:
-	if entry.has("skip"):
-		return
-	entry["skip"] = reason
-	_log("ALTAR_SKIP id=%s reason=%s t=%.1f" % [str(entry.altar.id), reason, float(world.time)])
+	if reason == "baldur_waits_portal":
+		if entry.has("waited"):
+			return
+		entry["waited"] = true
+	else:
+		if entry.has("skip"):
+			return
+		entry["skip"] = reason
+	_log("ALTAR_SKIP id=%s reason=%s t=%.1f raid=%s ref=%d" % [
+		str(entry.altar.id), reason, float(world.time), str(world.raid.state), int(entry.ref)])
 
 
 func _altar_rejection(id: String) -> String:
@@ -1281,11 +1221,13 @@ func _observe_altars() -> void:
 		var key: int = a.node.get_instance_id()
 		if _altar_seen.has(key):
 			continue
-		var entry := {"altar": a, "dist": _flat_distance(hero.position, a.pos)}
+		var entry := {"altar": a, "dist": _flat_distance(hero.position, a.pos), "ref": key}
 		_altar_seen[key] = entry
 		var reason := _altar_rejection(str(a.id))
 		if reason != "":
 			_altar_skip(entry, reason)
+		elif a.id == "baldur" and world.raid.state == "idle":
+			_altar_skip(entry, "baldur_waits_portal")
 	for key in _altar_seen.keys():
 		var entry: Dictionary = _altar_seen[key]
 		var a: Dictionary = entry.altar
@@ -1293,23 +1235,32 @@ func _observe_altars() -> void:
 			continue
 		if float(a.fill) >= GameData.ALTAR_CHANNEL:
 			var nearby: int = world.enemies_in_radius(a.pos, 5.0).size()
-			_log("ALTAR_TAKE id=%s from=%.1f nearby=%d t=%.1f" % [str(a.id), float(entry.dist), nearby, float(world.time)])
+			_log("ALTAR_TAKE id=%s from=%.1f nearby=%d t=%.1f raid=%s ref=%d" % [
+				str(a.id), float(entry.dist), nearby, float(world.time), str(world.raid.state), key])
 		else:
 			_altar_skip(entry, "expired" if float(a.life) <= 0.0 else "removed")
 		_altar_seen.erase(key)
 
 
-func _altar_hold_goal(hero) -> Vector3:
-	for a in world.altars.waiting:
-		if _altar_rejection(str(a.id)) != "" and _flat_distance(hero.position, a.pos) < GameData.ALTAR_RADIUS:
-			# Proximity alone channels altars, even if they aren't a goal.
-			var away: Vector3 = hero.position - a.pos
-			away.y = 0.0
-			return a.pos + (away.normalized() if away != Vector3.ZERO else Vector3.RIGHT) * (GameData.ALTAR_RADIUS + 1.0)
+func _altar_hold_goal(hero, baldur_only := false) -> Vector3:
 	if not _altar_channel.is_empty():
-		if world.altars.waiting.has(_altar_channel):
-			return _channel_altar_at(hero, _altar_channel.pos)
+		if world.altars.waiting.has(_altar_channel) and (not baldur_only or _altar_channel.id == "baldur"):
+			if float(_altar_channel.fill) > _altar_fill_peak:
+				_altar_fill_peak = float(_altar_channel.fill)
+				_altar_progress_clock = float(world.clock)
+			if float(world.clock) - _altar_progress_clock < ALTAR_NO_PROGRESS:
+				return _channel_altar_at(hero, _altar_channel.pos)
+			_altar_skip(_altar_entry(hero, _altar_channel), "channel_interrupted")
 		_altar_channel = {}
+	if not baldur_only:
+		for a in world.altars.waiting:
+			if _flat_distance(hero.position, a.pos) < GameData.ALTAR_RADIUS \
+					and (a.id == "baldur" or _altar_rejection(str(a.id)) != "" \
+					or _altar_seen.get(a.node.get_instance_id(), {}).has("skip")):
+				# Proximity alone channels altars, even if they aren't a goal.
+				var away: Vector3 = hero.position - a.pos
+				away.y = 0.0
+				return a.pos + (away.normalized() if away != Vector3.ZERO else Vector3.RIGHT) * (GameData.ALTAR_RADIUS + 1.0)
 	return Vector3.INF
 
 
@@ -1318,7 +1269,14 @@ func _channel_altar_at(hero, pos: Vector3) -> Vector3:
 	return hero.position if _flat_distance(hero.position, pos) < GameData.ALTAR_RADIUS else pos
 
 
-func _map_altar_goal(hero) -> Vector3:
+func _altar_entry(hero, altar: Dictionary) -> Dictionary:
+	var key: int = altar.node.get_instance_id()
+	if not _altar_seen.has(key):
+		_altar_seen[key] = {"altar": altar, "dist": _flat_distance(hero.position, altar.pos), "ref": key}
+	return _altar_seen[key]
+
+
+func _map_altar_goal(hero, baldur_only := false) -> Vector3:
 	var priority: Array = cfg["altar_priority"]
 	var map: RoMap = world.map
 	var from := map.tile_of(hero.position)
@@ -1327,22 +1285,21 @@ func _map_altar_goal(hero) -> Vector3:
 	var best_dist := INF
 	for a in world.altars.waiting:
 		var aid := str(a.id)
-		if _altar_rejection(aid) != "":
+		if (aid == "baldur") != baldur_only or _altar_rejection(aid) != "":
 			continue
 		var rank := priority.find(aid)
 		var pos: Vector3 = a.pos
 		var dist := _flat_distance(hero.position, pos)
 		if rank > best_rank or (rank == best_rank and dist >= best_dist):
 			continue
-		var key: int = a.node.get_instance_id()
-		var entry: Dictionary = _altar_seen.get(key, {})
-		if entry.get("skip") == "unreachable":
+		var entry := _altar_entry(hero, a)
+		if entry.has("skip"):
 			continue
 		if dist >= GameData.ALTAR_RADIUS and not entry.get("reachable", false):
 			var tile := map.tile_of(pos)
 			if _direct_line_blocked(map, hero.position, pos - hero.position, from, tile) \
 					and _direct_tile_path(map, from, tile).is_empty():
-				_altar_skip(entry if not entry.is_empty() else {"altar": a}, "unreachable")
+				_altar_skip(entry, "unreachable")
 				continue
 			entry["reachable"] = true
 		best = a
@@ -1352,6 +1309,20 @@ func _map_altar_goal(hero) -> Vector3:
 		return Vector3.INF
 	if best_dist < GameData.ALTAR_RADIUS:
 		_altar_channel = best
+		_altar_fill_peak = float(best.fill)
+		_altar_progress_clock = float(world.clock)
+	elif baldur_only and _flat_distance(best.pos, world.raid.portal_pos) < 1.5:
+		var portal: Vector3 = world.raid.portal_pos
+		var away: Vector3 = best.pos - portal
+		away.y = 0.0
+		if away.is_zero_approx():
+			away = Vector3.RIGHT
+		var spot := portal + away.normalized() * 1.5
+		if not map.is_walkable(spot):
+			_altar_skip(_altar_entry(hero, best), "unreachable")
+			return Vector3.INF
+		_altar_direct = true
+		return spot
 	return _channel_altar_at(hero, best.pos)
 
 
@@ -2200,75 +2171,6 @@ func _goal_done() -> bool:
 # Build settings
 # ---------------------------------------------------------------------------
 
-func _build_for(cid: String) -> Dictionary:
-	var orders = Save.setting("pick_order", {})
-	if orders is Dictionary:
-		var raw_order = orders.get(cid, [])
-		if raw_order is Array and not raw_order.is_empty():
-			var pskills: Array = []
-			var pstats: Array = []
-			for id in raw_order:
-				var sid := str(id)
-				if GameData.STATS.has(sid):
-					pstats.append(sid)
-				else:
-					pskills.append(sid)
-			var pcaps: Dictionary = {}
-			var limits = Save.setting("pick_limits", {})
-			if limits is Dictionary and limits.get(cid) is Dictionary:
-				pcaps = (limits[cid] as Dictionary).duplicate()
-			return {"skills": pskills, "stats": pstats, "caps": pcaps}
-	var builds = cfg.get("builds", {})
-	if builds is Dictionary and builds.get(cid) is Dictionary:
-		return builds[cid]
-	var out := {"skills": [], "stats": []}
-	var d: Dictionary = GameData.CLASSES.get(cid, {})
-	if d.is_empty():
-		return out
-	var junk: Array = cfg.get("junk_skills", ["throw_stone", "steal"])
-	var skills: Array = []
-	for id in d.get("skills", []):
-		if not junk.has(str(id)):
-			skills.append(str(id))
-	for id in d.get("passives", []):
-		skills.append(str(id))
-	var j2 = d.get("job2", {})
-	if j2 is Dictionary:
-		for id in j2.get("skills", []):
-			skills.append(str(id))
-		for id in j2.get("passives", []):
-			skills.append(str(id))
-		var tr = j2.get("trans", {})
-		if tr is Dictionary:
-			for id in tr.get("skills", []):
-				skills.append(str(id))
-			for id in tr.get("passives", []):
-				skills.append(str(id))
-	var alt = d.get("job2_alt", {})
-	if alt is Dictionary:
-		for id in alt.get("skills", []):
-			skills.append(str(id))
-		for id in alt.get("passives", []):
-			skills.append(str(id))
-		var tr2 = alt.get("trans", {})
-		if tr2 is Dictionary:
-			for id in tr2.get("skills", []):
-				skills.append(str(id))
-			for id in tr2.get("passives", []):
-				skills.append(str(id))
-	out["skills"] = skills
-	var base: Dictionary = d.get("stats", {})
-	var keys: Array = base.keys()
-	keys.sort_custom(func(a, b): return int(base[a]) > int(base[b]))
-	var stats: Array = []
-	for k in keys:
-		stats.append(str(k))
-	if not stats.has("vit"):
-		stats.append("vit")
-	out["stats"] = stats
-	return out
-
-
 func _job_path(cid: String) -> int:
 	var builds: Dictionary = cfg.get("builds", {})
 	var b: Dictionary = builds.get(cid) if builds.get(cid) is Dictionary else {}
@@ -2523,6 +2425,71 @@ func _test_tick_blocked_portal() -> bool:
 	return false
 
 
+func _test_tick_valkyrie() -> void:
+	var raid = world.raid
+	var hero = world.player
+	if raid.state == "idle" and _test_raid_ability.is_empty() and not get_tree().paused:
+		world.karma.enter_route()
+		return
+	if raid.state != "fight":
+		return
+	if _test_raid_ability.is_empty():
+		# Isolate one native ability per fight so collision and damage meter
+		# deltas are attributable even for delayed strikes.
+		var abilities: Array = raid.data.abilities
+		var index := runs_started - 1
+		var ab: Dictionary = abilities[index] if index < abilities.size() else {}
+		if ab.is_empty():
+			for attack in abilities:
+				if attack.id == "starfall":
+					ab = attack
+					break
+		_test_raid_marks = 0
+		raid.boss.max_hp *= 100.0
+		raid.boss.hp = raid.boss.max_hp
+		raid.boss.hold = 20.0
+		for other in abilities:
+			raid._timers[other.id] = 999.0
+		if ab.id == "starfall":
+			if not hero.doom:
+				_fail_session("valkyrie_drill_missing_doom")
+				return
+			# Stress a depleted late-run hero without changing native damage.
+			hero.hp = minf(hero.hp, hero.max_hp * 0.2)
+			hero.revives = 0
+			var trial := 0 if index < abilities.size() else index - abilities.size() + 1
+			var d := Vector3.RIGHT.rotated(Vector3.UP, float(trial) * TAU / 10.0)
+			var at: Vector3 = raid.center + d * (raid.radius - 1.0)
+			if world.map.is_walkable(at):
+				hero.position = Vector3(at.x, world.map.height_at(at), at.z)
+				var boss_at: Vector3 = at - d * 3.0
+				raid.boss.position = Vector3(boss_at.x, world.map.height_at(boss_at), boss_at.z)
+		_test_raid_ability = ab
+		_test_raid_hits = _test_valkyrie_hits()
+		_test_raid_fails = int(raid.stats.fails)
+		_test_raid_end = float(raid.stats.time) + maxf(6.0, float(ab.get("time", 0.0)) + 3.0)
+		raid._start(ab)
+	else:
+		if _test_raid_ability.id == "starfall":
+			for attack in raid._objects:
+				if attack.kind == "starfall":
+					_test_raid_marks = int(attack.n)
+					break
+		if float(raid.stats.time) >= _test_raid_end:
+			_end_run_safe(false)
+
+
+func _test_valkyrie_hits() -> int:
+	return int(world.meter_taken.get("mechanics:reginleif", {}).get("hits", 0))
+
+
+func _test_log_valkyrie(died: bool) -> void:
+	_log("VALKYRIE_DRILL run=%d ability=%s danger=%d oaths=%d marks=%d contacts=%d hits=%d died=%s cause=%s" % [
+		runs_started, _test_raid_ability.id, active_danger, active_oath_points, _test_raid_marks,
+		int(world.raid.stats.fails) - _test_raid_fails, _test_valkyrie_hits() - _test_raid_hits,
+		str(died), str(world.player.death_by.get("what", "")) if died else ""])
+
+
 func _test_seed_wishlist_offer() -> void:
 	# Avoid random drops; the game's own end screen still builds the keep offer.
 	if _test_wishlist_ids.is_empty():
@@ -2604,6 +2571,8 @@ func _preparation_snapshot(profile: Dictionary) -> Dictionary:
 		"album": profile.get("card_slots", []), "stats": stats, "free_points": Save.free_points(active_class),
 		"rebirths": profile.get("rebirths", {}), "rebirth_levels": rebirth_levels,
 		"pick_order": settings.get("pick_order", {}), "pick_limits": settings.get("pick_limits", {}),
+		"pick_fill": settings.get("pick_fill"), "pick_bans": settings.get("pick_bans"),
+		"endless_auto_pick": settings.get("endless_auto_pick"),
 	}.duplicate(true)
 
 
@@ -2790,7 +2759,6 @@ func _load_cfg() -> bool:
 		"altar_priority": ["freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "odin", "emperium"],
 		"altar_range": 12.0,
 		"altar_policy": "cautious", "karma_route": "natural",
-		"junk_skills": ["throw_stone", "steal"],
 		"goals": {}, "goal_stop": false,
 	}
 	for k in raw.keys():

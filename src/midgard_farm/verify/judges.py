@@ -95,11 +95,14 @@ def preparation_unchanged(run: Run, driven: Driven, status: dict) -> None:
     need(before["free_points"] > 0, "the starting character must have unspent stat points")
     need(before["potentials"], "the starting profile must have worn equipment")
     need(after["free_points"] >= before["free_points"], "unspent stat points decreased")
-    for field in ("loadouts", "potentials", "album", "stats", "rebirths", "rebirth_levels", "pick_order", "pick_limits"):
+    for field in ("loadouts", "potentials", "album", "stats", "rebirths", "rebirth_levels",
+                  "pick_order", "pick_limits", "pick_fill", "pick_bans", "endless_auto_pick"):
         need(before[field] == after[field], f"character preparation changed: {field}")
     # The game itself can activate a newly tamed pet when no pet was selected.
     if before["pet"]:
         need(before["pet"] == after["pet"], "character preparation changed: pet")
+    need(any("AUTOPICK t=" in out.read_text(encoding="utf-8") for out in driven.outputs),
+         "native auto-pick did not apply a level-up")
 
 
 def stop(run: Run, driven: Driven, status: dict) -> None:
@@ -227,10 +230,19 @@ def hell_rotation(run: Run, driven: Driven, status: dict) -> None:
     log = run.artifact("farmer.log").read_text(encoding="utf-8")
     need(re.search(r"KEEP_DONE .*victory=true free=true slots=3$", log, re.MULTILINE),
          "expected three free keep slots after victory")
-    altars = re.findall(r"^FARMER \S+ ALTAR_TAKE id=(\w+) from=([\d.]+) nearby=\d+ ", log, re.MULTILINE)
-    need(any(float(distance) > 12 for _, distance in altars), "no map-wide altar taken")
+    altars = re.findall(
+        r"^FARMER \S+ ALTAR_TAKE id=(\w+) from=([\d.]+) nearby=\d+ t=[\d.]+ raid=(\w+) ref=(\d+)$",
+        log, re.MULTILINE)
+    need(any(float(distance) > 12 for _, distance, _, _ in altars), "no map-wide altar taken")
     priority = {"freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "odin", "emperium"}
-    need(all(altar in priority for altar, _ in altars), "took an altar not allowed by Hell policy")
+    need(all(altar in priority for altar, _, _, _ in altars), "took an altar not allowed by Hell policy")
+    need(all(raid == "portal" for altar, _, raid, _ in altars if altar == "baldur"),
+         "Baldur taken outside portal window")
+    skips = re.findall(r"ALTAR_SKIP id=(\w+) reason=(\w+) t=[\d.]+ raid=(\w+) ref=(\d+)$", log, re.MULTILINE)
+    need(all(altar == "baldur" and raid == "idle" for altar, reason, raid, _ in skips
+             if reason == "baldur_waits_portal"), "invalid Baldur field skip")
+    interrupted = {ref for _, reason, _, ref in skips if reason == "channel_interrupted"}
+    need(not any(ref in interrupted for _, _, _, ref in altars), "took an altar after its channel was interrupted")
 
     mvps = list(re.finditer(r"^FARMER \S+ BOSS_WON .* mvps=(\d+) ", log, re.MULTILINE))
     routes = list(re.finditer(r"^FARMER \S+ KARMA_ROUTE side=light mvp=reginleif after_mvp=(\d+) ", log, re.MULTILINE))
@@ -238,7 +250,8 @@ def hell_rotation(run: Run, driven: Driven, status: dict) -> None:
                             log, re.MULTILINE))
     endless = list(re.finditer(r"^FARMER \S+ ENDLESS_START .* n=(\d+)$", log, re.MULTILINE))
     count = len(mvps)
-    need(count > 0 and all(row.get("run_mvps") == count * 2 for row in (status["last"], rows[0])),
+    # Native run_mvps also counts the Morroc finale, which has no Valhalla route.
+    need(count > 0 and all(row.get("run_mvps") == count * 2 + 1 for row in (status["last"], rows[0])),
          "MVP count does not match the run journal")
     need(len(endless) == count, "expected endless to continue once per regular MVP")
     for n, (mvp, continuation) in enumerate(zip(mvps, endless, strict=True), 1):
@@ -252,6 +265,26 @@ def hell_rotation(run: Run, driven: Driven, status: dict) -> None:
              f"no Valkyrie kill before endless continued after MVP {mvp_id}")
     need(len(routes) == len(kills) == count and rows[0].get("valkyrie_kills") == count,
          "Valkyrie kill count does not match the run journal")
+
+
+def valkyrie_drill(run: Run, driven: Driven, status: dict, *, count: int) -> None:
+    _exit(driven)
+    _done(status)
+    need(status["totals"]["runs"] == count, "Valkyrie drill did not finish every fight")
+    log = run.artifact("farmer.log").read_text(encoding="utf-8")
+    rows = re.findall(
+        r"^FARMER \S+ VALKYRIE_DRILL run=(\d+) ability=(\w+) danger=30 oaths=37 "
+        r"marks=(\d+) contacts=(\d+) hits=(\d+) died=(true|false) cause=(.*)$", log, re.MULTILINE)
+    expected = Counter("spear spears pillars starfall judgment aegis einherjar seals charge scales".split())
+    expected["starfall"] += count - 10
+    need([int(n) for n, *_ in rows] == list(range(1, count + 1))
+         and Counter(row[1] for row in rows) == expected, "missing D30/37-oath Valkyrie fight evidence")
+    waves = [(n, marks, contacts, hits, died, cause)
+             for n, ab, marks, contacts, hits, died, cause in rows if ab == "starfall"]
+    failures = [row for row in waves if int(row[2]) > 0 or int(row[3]) > 0 or row[4] == "true"]
+    need(not failures, f"Caída de Valhalla hit or killed the hero: {failures}")
+    need(len(waves) >= 10 and all(marks == "6" for _, marks, *_ in waves),
+         "expected ten complete six-mark Caída de Valhalla waves")
 
 
 def blocked_portal(run: Run, driven: Driven, status: dict) -> None:

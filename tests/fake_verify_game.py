@@ -18,6 +18,7 @@ session = os.environ["FARMER_SESSION_ID"]
 assert session.startswith("verify-")
 cfg = json.loads((profile / "farmer.cfg").read_bytes())
 assert not cfg["display"]
+valkyrie_drill = os.environ.get("FARMER_TEST_VALKYRIE") == "1"
 if cfg.get("run_minutes") != 50:
     assert "altar_policy" not in cfg and "karma_route" not in cfg
 checkpoint_path = profile / "farmer_session.json"
@@ -37,7 +38,7 @@ verify_wishlist = os.environ.get("FARMER_TEST_WISHLIST") == "1"
 wishlist_evidence = []
 oath_costs = {"tough": [1, 2, 4], "elite": [2, 4, 6], "hunt": [1, 2, 3], "kyrie": [1, 2, 3],
               "mvp_fury": [2, 4], "hellfire": [1, 2, 3], "lex": [2, 4], "curse": [2, 4], "unlucky": [3, 6]}
-hell_rotation = cfg.get("run_minutes") == 50
+hell_rotation = cfg.get("run_minutes") == 50 and not valkyrie_drill
 rotation_offset = 0
 rotation_locations = [
     {"id": "prontera", "name": "Prontera Field", "unlocked": True, "min_difficulty": 1, "max_difficulty": 30},
@@ -95,12 +96,17 @@ def status(phase, reason="", code=0, detail=""):
         before = {"loadouts": {"swordsman": {"weapon": "worn"}}, "potentials": {"worn": {"tier": 1}},
                   "pet": "poring", "album": ["poring_card"], "stats": {"swordsman": {"str": 1}},
                   "rebirths": {}, "rebirth_levels": {"swordsman": 0}, "free_points": 2,
-                  "pick_order": {"swordsman": ["bash"]}, "pick_limits": {}}
+                  "pick_order": {"swordsman": ["bash"]}, "pick_limits": {}, "pick_fill": True,
+                  "pick_bans": {"swordsman": ["skill:magnum_break"]}, "endless_auto_pick": True}
         after = before | {"free_points": 3}
         if fault == "rerolled-worn-item":
             after["potentials"] = {"worn": {"tier": 2}}
         if fault == "no-free-points":
             before["free_points"] = 0
+        if fault == "reset-saved-auto-pick":
+            after["endless_auto_pick"] = False
+        if fault != "no-native-auto-pick":
+            print("AUTOPICK t=4.0 lv=2 pick=skill:bash Nv 2", flush=True)
         data["preparation"] = {"before": before, "after": after}
     if phase == "done" and catalog_evidence:
         data["catalog_evidence"] = catalog_evidence
@@ -186,13 +192,21 @@ def settle_wishlist(row):
 
 
 def hell_evidence(row):
-    row.update(run_mvps=4, endless_mvps=2, valkyrie_kills=2, reginleif_cards_gain=1)
+    row.update(run_mvps=4 if fault == "uncounted-finale-mvp" else 5,
+               endless_mvps=2, valkyrie_kills=2, reginleif_cards_gain=1)
     if fault != "no-altars":
-        log("ALTAR_TAKE id=freyja from=26.5 nearby=12 t=90.0")
+        log("ALTAR_TAKE id=freyja from=26.5 nearby=12 t=90.0 raid=idle ref=1")
     if fault == "took-hel":
-        log("ALTAR_TAKE id=hel from=25.0 nearby=11 t=120.0")
+        log("ALTAR_TAKE id=hel from=25.0 nearby=11 t=120.0 raid=idle ref=2")
     else:
-        log("ALTAR_SKIP id=hel reason=hel t=120.0")
+        log("ALTAR_SKIP id=hel reason=hel t=120.0 raid=idle ref=2")
+    skip_raid = "portal" if fault == "wrong-baldur-skip" else "idle"
+    take_raid = "idle" if fault == "baldur-in-field" else "portal"
+    log(f"ALTAR_SKIP id=baldur reason=baldur_waits_portal t=440.0 raid={skip_raid} ref=3")
+    log(f"ALTAR_TAKE id=baldur from=8.0 nearby=0 t=480.0 raid={take_raid} ref=3")
+    log("ALTAR_SKIP id=thor reason=channel_interrupted t=520.0 raid=idle ref=4")
+    if fault == "interrupted-altar-taken":
+        log("ALTAR_TAKE id=thor from=8.0 nearby=0 t=521.0 raid=idle ref=4")
     for n, mvp in enumerate((1, 3), 1):
         if n == 2 and fault == "missing-mvp-log":
             break
@@ -392,6 +406,17 @@ if os.environ.get("FARMER_TEST_FLUSH_FAIL") == "1":
     log("FAIL flush_failed")
     status("failed", "flush_failed", 1)
     sys.exit(1)
+if valkyrie_drill:
+    moves = "spear spears pillars starfall judgment aegis einherjar seals charge scales".split()
+    for started, ability in enumerate(moves + ["starfall"] * (cfg["max_runs"] - len(moves)), 1):
+        run_id = f"{session}-r{started}"
+        meteor_hit = int(fault == "meteor-hit" and started == 4)
+        contacts = max(meteor_hit, int(fault == "meteor-contact" and started == 4))
+        marks = (5 if fault == "meteor-incomplete" and started == 4 else 6) if ability == "starfall" else 0
+        log(f"VALKYRIE_DRILL run={started} ability={ability} danger={difficulty()} oaths={oath_points()} "
+            f"marks={marks} contacts={contacts} hits={meteor_hit} died=false cause=")
+        settle("")
+    finish("max_runs")
 settle("" if hell_rotation else "run_timeout")
 if verify_wishlist:
     started += 1
