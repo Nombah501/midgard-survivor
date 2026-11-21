@@ -19,8 +19,10 @@ from midgard_farm.verify import scenarios
 from test_profile import make_profile
 
 ALL = (
-    "one-run", "catalog", "preparation-unchanged", "wishlist-keep", "run-choice", "run-choice-resume",
+    "one-run", "catalog", "preparation-unchanged", "wishlist-keep", "keep-unowned-legendaries",
+    "run-choice", "run-choice-resume",
     "location-rotation", "location-rotation-resume",
+    "native-progress-parity",
     "oaths", "oaths-disabled", "invalid-oath", "invalid-oath-rank", "invalid-oath-difficulty", "invalid-location",
     "invalid-difficulty", "invalid-rotation-difficulty", "stop", "endless", "hell-rotation",
     "hell-rotation-payon", "hell-rotation-orc_dun", "hell-rotation-nameless", "hell-rotation-turtle",
@@ -137,6 +139,19 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
         assert len(list(logdir.glob("attempt-*.log"))) == 2
 
 
+@pytest.mark.parametrize(("seed", "first"), [("0", "orc"), ("1", "prontera"), ("5", "orc")])
+@pytest.mark.parametrize("scenario", ["location-rotation", "location-rotation-resume"])
+def test_rotation_judges_accept_different_seeded_starts(verification, monkeypatch, seed, first, scenario):
+    monkeypatch.setenv("FAKE_VERIFY_ROTATION_SEED", seed)
+    _, _, _, _, out, _ = verification
+    row = execute(verification, scenario)
+    assert row["verdict"] == "PASS", row
+    logs = (out / f"{scenario}.crash.farmer.log", out / f"{scenario}.farmer.log")
+    starts = [line.split(" ROTATION_START stage=")[1] for log in logs if log.is_file()
+              for line in log.read_text().splitlines() if " ROTATION_START stage=" in line]
+    assert starts == [first]
+
+
 def test_windowed_scenario_finishes_one_supervised_attempt(verification, monkeypatch):
     _, _, _, _, out, root = verification
     monkeypatch.setenv("FAKE_VERIFY_WATCH_MODE", "1")
@@ -171,6 +186,8 @@ def test_hell_rotation_requires_a_real_finale_win(verification, monkeypatch, fau
 
 
 @pytest.mark.parametrize(("name", "fault", "reason"), [
+    ("native-progress-parity", "native-progress-online", "network activity during settlement"),
+    ("native-progress-parity", "replayed-native-progress", "recovery changed the native progression"),
     ("one-run", "no-transition", "last_transition empty"),
     ("one-run", "no-victory", "last run was not a victory"),
     ("catalog", "no-catalog", "no valid catalog"),
@@ -181,6 +198,7 @@ def test_hell_rotation_requires_a_real_finale_win(verification, monkeypatch, fau
     ("preparation-unchanged", "no-free-points", "the starting character must have unspent stat points"),
     ("wishlist-keep", "duplicate-wishlist-item", "wrong items added to saved storage"),
     ("wishlist-keep", "no-wishlist-cash-in", "legendary offers were not cashed in"),
+    ("keep-unowned-legendaries", "ignored-wishlist-priority", "wrong items added to saved storage"),
     ("run-choice", "wrong-run-journal-target", "wrong location or difficulty in journal"),
     ("location-rotation", "locked-rotation-location", "wrong location or difficulty in journal"),
     ("oaths", "wrong-oath-journal-points", "wrong oath points in journal"),
@@ -265,7 +283,7 @@ def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(fake_cli,
 
 def test_cli_all_runs_supported_scenarios_and_reports_windows_skip(fake_cli, tmp_path):
     _, _, _, candidate, _, invoke = fake_cli
-    result = invoke("--all", "--candidate-dir", str(candidate), timeout=120, FAKE_VERIFY_RELEASE_OS="windows")
+    result = invoke("--all", "--candidate-dir", str(candidate), timeout=4 * len(ALL), FAKE_VERIFY_RELEASE_OS="windows")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "supervised-kill-run is Linux only (unsupported on this OS)" in result.stdout
     out, = (tmp_path / ".sandbox").glob("verify-*")

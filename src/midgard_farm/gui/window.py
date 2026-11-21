@@ -125,6 +125,10 @@ class _Backend(QObject):
     def setWishlisted(self, item_id: str, selected: bool) -> None:
         self._enqueue(partial(self._model.set_wishlisted, item_id, selected))
 
+    @Slot(bool)
+    def setKeepUnownedLegendaries(self, enabled: bool) -> None:
+        self._enqueue(partial(self._model.set_keep_unowned_legendaries, enabled))
+
     @Slot(str, bool)
     def setMaintenance(self, name: str, enabled: bool) -> None:
         self._enqueue(partial(self._model.set_maintenance, name, enabled))

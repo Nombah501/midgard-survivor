@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] Window switch, remembered, carried by Start/Resume into `farmer.cfg`; covered by GUI and service tests.
-- [ ] With the switch on, an offered unowned legendary not on the wishlist is kept; an owned one is not; wishlist items win when slots are short; covered by a verify judge on the existing deterministic `wishlist-keep` offer and a real run.
+- [x] Window switch, remembered, carried by Start/Resume into `farmer.cfg`; covered by GUI and service tests.
+- [x] With the switch on, an offered unowned legendary not on the wishlist is kept; an owned one is not; wishlist items win when slots are short; covered by `keep-unowned-legendaries` on the existing deterministic offer and a real run. `wishlist-keep` also passed with the switch off.
 - [ ] Static checks, mypy (linux, win32), pytest suites pass.

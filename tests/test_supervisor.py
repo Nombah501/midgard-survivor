@@ -200,7 +200,8 @@ def test_clean_finish_uses_character_and_preset_without_restart(farm, location, 
         farm.send("start", character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
                   settings={"location": location, "difficulty": difficulty, "oaths": oaths,
                             "wishlist": ["sacred_excalibur", "gungnir"],
-                            "upgrades": False, "card_fusion": False, "star_smith": True, "storage_cleanup": True})
+                            "upgrades": False, "card_fusion": False, "star_smith": True, "storage_cleanup": True,
+                            "keep_unowned_legendaries": True})
         outcome, directory = farm.outcome()
     assert (outcome["kind"], outcome["reason"]) == ("finished", "max_runs")
     assert len(outcome["attempts"]) == 1
@@ -210,6 +211,7 @@ def test_clean_finish_uses_character_and_preset_without_restart(farm, location, 
     config = json.loads((farm.profile / "farmer.cfg").read_bytes())
     assert (config["stage"], config["danger"], config["class"], config["oaths"]) == (location, difficulty, "archer", oaths)
     assert config["wishlist"] == ["sacred_excalibur", "gungnir"]
+    assert config["keep_unowned_legendaries"] is True
     assert config["auto_upgrades"] is config["auto_sage"] is config["auto_fuse"] is False
     assert config["auto_potential"] is config["auto_storage_prune"] is True
     assert config["job_paths"]["archer"] == 1
@@ -260,7 +262,7 @@ def test_malformed_wishlists_are_refused(farm, wishlist):
 
 @pytest.mark.parametrize(("key", "value"), [
     ("upgrades", 0), ("card_fusion", "false"), ("star_smith", None), ("storage_cleanup", []),
-    ("show_game_window", "true"),
+    ("show_game_window", "true"), ("keep_unowned_legendaries", 1),
 ])
 def test_non_boolean_session_switches_are_refused(farm, key, value):
     with farm.service():
@@ -312,7 +314,8 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
         if structured:
             farm.send("resume", settings={"location": {"mode": "rotation"}, "difficulty": 30, "oaths": {"tough": 3},
                                           "wishlist": ["gungnir"], "upgrades": False, "card_fusion": False,
-                                          "star_smith": True, "storage_cleanup": True, "show_game_window": True})
+                                          "star_smith": True, "storage_cleanup": True, "show_game_window": True,
+                                          "keep_unowned_legendaries": True})
         else:
             farm.send("resume")
         resumed = farm.status("run")
@@ -320,6 +323,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
         assert (config["stage"], config["danger"], config["oaths"]) == (
             ({"mode": "rotation"}, 30, {"tough": 3}) if structured else ("payon", 12, {}))
         assert config["wishlist"] == (["gungnir"] if structured else [])
+        assert config["keep_unowned_legendaries"] is structured
         assert config["auto_upgrades"] is config["auto_sage"] is config["auto_fuse"] is (not structured)
         assert config["auto_potential"] is config["auto_storage_prune"] is structured
         assert config["display"] is (sys.platform == "win32")  # Resume did not relaunch the game.
@@ -331,6 +335,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
             "upgrades": not structured, "card_fusion": not structured,
             "star_smith": structured, "storage_cleanup": structured,
             "show_game_window": structured,
+            "keep_unowned_legendaries": structured,
         }
         wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
             d["phase"] == "run" and d["pid"] == running["pid"] and d["heartbeat_seq"] >= resumed["heartbeat_seq"] + 3

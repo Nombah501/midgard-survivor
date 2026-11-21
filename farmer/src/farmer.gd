@@ -348,6 +348,9 @@ func _prepare_run() -> void:
 	var run_id := "%s-r%d" % [session_id, runs_started + 1]
 	run_state = _snapshot_run_state()
 	run_state["run_id"] = run_id
+	if _test_env("PROGRESS") == "1":
+		_test_seed_progress()
+		run_state["progress"] = {"before": _progress_snapshot(Save.data), "board_requests": 0}
 	run_state["class"] = active_class
 	run_state["stage"] = active_stage
 	run_state["danger"] = active_danger
@@ -398,6 +401,8 @@ func _prepare_run() -> void:
 	var auto_pick = settings.get("endless_auto_pick")
 	world.start_run(active_class)
 	world.player.farmer_fell.connect(_on_player_fell)
+	if run_state.has("progress"):
+		world.board.child_entered_tree.connect(_test_progress_board_request)
 	if had_auto_pick:
 		settings["endless_auto_pick"] = auto_pick
 	else:
@@ -642,10 +647,47 @@ func _end_run_safe(victory: bool) -> void:
 	if not world.running:
 		return
 	run_state["victory"] = victory
+	run_state["native_victory"] = victory
 	if _test_verify_wishlist:
 		_test_seed_wishlist_offer()
 	world._end_run(victory)
 	_set_autopilot_flags(false)
+
+
+func _record_local_progress() -> void:
+	var run_id: String = run_state["run_id"]
+	if run_state.get("native_progress") == run_id:
+		return
+	# Recovery only journals the settled result, never re-enters keep.
+	run_state["native_progress"] = run_id
+	var victory := bool(run_state.get("native_victory",
+		bool(world.endless) if run_state["died"] else run_state["victory"]))
+	var p = world.player
+	if p != null and not world.training and not p.tampered and not p.stats_plausible():
+		p.tampered = true
+	# Native log_run also posts telemetry; use only its local writer.
+	world.board._keep_history(world, victory)
+	var altars_taken := int(world.altars.taken.size())
+	if altars_taken > 0:
+		Save.bump("altars", altars_taken)
+		Save.stat_max("altars_run", altars_taken)
+	if not world.training:
+		var autopilot: bool = world.autopilot
+		var channel = world.channel
+		var chat = channel.world_chat if is_instance_valid(channel) else null
+		# Titles.news records local notifications; don't let it queue or send chat feats.
+		if is_instance_valid(channel):
+			channel.world_chat = null
+		world.autopilot = false
+		world.titles.after_run(world, victory)
+		world.autopilot = autopilot
+		if is_instance_valid(channel):
+			channel.world_chat = chat
+	if run_state.has("progress"):
+		run_state["progress"].merge({
+			"run_id": run_id, "altar_takes": altars_taken, "mvps": world.run_mvps,
+			"net_mode": world.net.mode, "autopilot_restored": world.autopilot,
+		})
 
 
 func _on_player_fell(cause: Dictionary, piercing: bool, revives_left: int) -> void:
@@ -1942,19 +1984,32 @@ func _do_keep() -> void:
 	var kept: Array = []
 	var skipped: Array = []
 	var wishlist: Array = cfg["wishlist"]
+	var keep_unowned: bool = cfg["keep_unowned_legendaries"]
 	var wishlist_evidence := {}
 	if _test_verify_wishlist:
+		if keep_unowned and _test_wishlist_ids.size() == 3:
+			# Put the non-wishlist fixture first to make the paid-slot priority observable.
+			for i in offer.size():
+				if offer[i].id == _test_wishlist_ids[2]:
+					offer.push_front(offer.pop_at(i))
+					break
 		wishlist_evidence = _test_wishlist_evidence(offer, free)
-	if not wishlist.is_empty() and not offer.is_empty():
+	if (not wishlist.is_empty() or keep_unowned) and not offer.is_empty():
 		var owned := {}
 		for item in Save.storage():
 			owned[str(item.id)] = true
+		var wanted: Array = []
+		var others: Array = []
 		for it in offer:
 			if not (it is Dictionary) or bool(it.get("_kept", false)):
 				continue
+			if wishlist.has(str(it.get("id", ""))):
+				wanted.append(it)
+			elif keep_unowned and Equipment.is_legendary(it):
+				others.append(it)
+		wanted.append_array(others)
+		for it in wanted:
 			var id := str(it.get("id", ""))
-			if not wishlist.has(id):
-				continue
 			var reason := ""
 			var cost := 0
 			if owned.has(id):
@@ -1996,7 +2051,11 @@ func _do_keep() -> void:
 	if world.menus != null and is_instance_valid(world.menus):
 		world.menus._keep_offer = []
 		world.menus._keep_pending = false
+	_record_local_progress()
 	Save.flush()
+	if run_state.has("progress"):
+		world.board.child_entered_tree.disconnect(_test_progress_board_request)
+		run_state["progress"]["after"] = _progress_snapshot(Save._read(Save.PATH))
 	if _test_verify_wishlist:
 		wishlist_evidence["after"] = _keep_snapshot(Save._read(Save.PATH))
 		_test_wishlist_runs.append(wishlist_evidence)
@@ -2404,8 +2463,8 @@ func _validate_location_difficulty(difficulty: float, stage: String) -> bool:
 	return true
 
 
-func _rotation_stage(difficulty: Variant) -> String:
-	var first := ""
+func _rotation_stage(difficulty: Variant, choose_start: bool = false) -> String:
+	var unlocked: Array[String] = []
 	var next_stage := ""
 	var after_cursor := not GameData.STAGES.has(_last_rotated_stage)
 	var fixed_difficulty := difficulty is int or difficulty is float
@@ -2416,20 +2475,24 @@ func _rotation_stage(difficulty: Variant) -> String:
 		if _stage_ok(stage):
 			if fixed_difficulty and not _validate_location_difficulty(difficulty, stage):
 				return ""
-			if first == "":
-				first = stage
+			unlocked.append(stage)
 			if after_cursor and next_stage == "":
 				next_stage = stage
 		if is_cursor:
 			after_cursor = true
-	if first == "":
+	if unlocked.is_empty():
 		_fail_session("invalid_location", true, "No unlocked locations for All locations in turn.")
-	return next_stage if next_stage != "" else first
+		return ""
+	if choose_start and not GameData.STAGES.has(_last_rotated_stage):
+		var start: String = unlocked[randi_range(0, unlocked.size() - 1)]
+		_log("ROTATION_START stage=" + start)
+		return start
+	return next_stage if next_stage != "" else unlocked[0]
 
 
 func _choose_target() -> Dictionary:
 	var raw = cfg.get("danger", "auto")
-	var stage := _rotation_stage(raw) if _rotating else str(cfg.get("stage", ""))
+	var stage := _rotation_stage(raw, true) if _rotating else str(cfg.get("stage", ""))
 	if _rotating and stage == "":
 		return {}
 	var danger := 0
@@ -3393,6 +3456,33 @@ func _preparation_snapshot(profile: Dictionary) -> Dictionary:
 	}.duplicate(true)
 
 
+func _test_progress_board_request(child: Node) -> void:
+	if child is HTTPRequest and not world.running:
+		run_state["progress"]["board_requests"] += 1
+
+
+func _test_seed_progress() -> void:
+	# Make the fixture observable even if the copied profile already holds the records.
+	var seen: Dictionary = Save.data.get("seen", {})
+	seen.get("title_hell_classes", {}).erase(active_class)
+	seen.get("title_hell_maps", {}).erase(active_stage)
+	Save.data.get("oath_best", {}).erase(active_stage)
+	Save.data["stats"]["altars_run"] = 0
+	Save.mark_dirty()
+
+
+func _progress_snapshot(profile: Dictionary) -> Dictionary:
+	var seen: Dictionary = profile.get("seen", {})
+	var stats: Dictionary = profile.get("stats", {})
+	return {
+		"history": profile.get("history", []), "hell_classes": seen.get("title_hell_classes", {}),
+		"hell_maps": seen.get("title_hell_maps", {}), "titles": seen.get("titles", {}),
+		"oath_best": profile.get("oath_best", {}), "altars": stats.get("altars", 0),
+		"altars_run": stats.get("altars_run", 0), "cloud_rev": profile.get("settings", {}).get("cloud_rev"),
+		"world_feats": profile.get("settings", {}).get("world_feats"),
+	}.duplicate(true)
+
+
 # One-shot per sandbox: the relaunch (or supervisor restart) passes the same point.
 func _test_crash(point: String) -> void:
 	if _test_env("CRASH_AT") != point or FileAccess.file_exists(TEST_CRASHED_PATH):
@@ -3467,6 +3557,8 @@ func _build_result() -> Dictionary:
 		"value": 0.0,
 		"rate": 0.0,
 	}
+	if run_state.has("progress"):
+		result["progress"] = run_state["progress"]
 	if cfg["karma_route"] == "valhalla":
 		result["valkyrie_kills"] = int(run_state.get("valkyrie_kills", 0))
 		result["reginleif_cards_gain"] = int(Save.data.get("cards", {}).get("reginleif_card", 0)) \
@@ -3559,6 +3651,7 @@ func _load_cfg() -> bool:
 		"stage": "", "danger": "auto", "danger_ceiling": 30,
 		"oaths": {},
 		"wishlist": [],
+		"keep_unowned_legendaries": false,
 		"auto_danger": true, "explore_every": 5, "danger_step": 1,
 		"featured_bonus": true,
 		"speed": 4.0, "game_speed": 3,
@@ -3612,6 +3705,8 @@ func _load_cfg() -> bool:
 				errors.append("wishlist must be an array of distinct item ids")
 				break
 			ids[id] = true
+	if not (cfg["keep_unowned_legendaries"] is bool):
+		errors.append("keep_unowned_legendaries must be a boolean")
 	if not errors.is_empty():
 		_log("CFG invalid: " + str(errors))
 		return false
@@ -3719,6 +3814,8 @@ func _write_status() -> void:
 		data["oath_evidence"] = _test_oaths
 	if not _test_wishlist_runs.is_empty():
 		data["wishlist_evidence"] = _test_wishlist_runs
+	if phase == "done" and _test_env("PROGRESS") == "1":
+		data["progress_saved"] = _progress_snapshot(Save._read(Save.PATH))
 	_atomic_write(STATUS_PATH, JSON.stringify(data))
 
 

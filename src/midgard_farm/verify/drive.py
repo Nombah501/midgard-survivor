@@ -240,7 +240,8 @@ def _sample_during(run: Run) -> Iterator[None]:
 
 
 def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: str = "",
-               sample: bool = False, resume: SessionSettings | None = None, **hooks: str) -> Driven:
+               sample: bool = False, resume: SessionSettings | None = None, resume_after_runs: int = 0,
+               **hooks: str) -> Driven:
     app_data = run.os.app_data_dir()
     log_dir = session_log_dir(run.os, run.session)
     outcome_path = log_dir / "outcome.json"
@@ -264,7 +265,8 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
             switches[name] = enabled
         settings = SessionSettings(config.pop("stage") or None, None if danger == "auto" else danger,
                                    config.pop("oaths", {}), config.pop("wishlist", []),
-                                   show_game_window=config.pop("display", False), **switches)
+                                   show_game_window=config.pop("display", False),
+                                   keep_unowned_legendaries=config.pop("keep_unowned_legendaries", False), **switches)
         strategy = run.artifact("strategy.json")
         strategy.write_text(json.dumps(config, indent=2), encoding="utf-8")
         start = Start(Character(cid, config.get("job_paths", {}).get(cid, 0)), strategy, settings)
@@ -301,7 +303,9 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
             elif resume is not None and not resume_sent:
                 state = read_state(run.os)
                 if state.kind is StateKind.ACTIVE and state.session_id == run.session:
-                    if state.farmer_phase == "run" and not pause_sent:
+                    if (state.farmer_phase == "run" and not pause_sent
+                            and (not resume_after_runs or run.status().get("totals", {}).get("runs", 0)
+                                 >= resume_after_runs)):
                         submit(run.os, "pause")
                         pause_sent = True
                     elif state.farmer_phase == "paused" and pause_sent:

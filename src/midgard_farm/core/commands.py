@@ -51,12 +51,13 @@ class SessionSettings:
     star_smith: bool = False
     storage_cleanup: bool = False
     show_game_window: bool = False
+    keep_unowned_legendaries: bool = False
 
     @classmethod
     def decode(cls, value: object) -> "SessionSettings":
         if (not isinstance(value, dict) or not {"location", "difficulty"} <= value.keys()
                 or value.keys() - {"location", "difficulty", "oaths", "wishlist", "show_game_window",
-                                   *MAINTENANCE_CONFIG_KEYS}):
+                                   "keep_unowned_legendaries", *MAINTENANCE_CONFIG_KEYS}):
             raise ValueError(
                 "settings must be an object with location, difficulty and optional oaths, wishlist and switches"
             )
@@ -75,16 +76,13 @@ class SessionSettings:
                 or any(not isinstance(item, str) or not item.strip() or "\0" in item for item in wishlist)
                 or len(set(wishlist)) != len(wishlist)):
             raise ValueError("settings.wishlist must be an array of distinct item ids")
-        maintenance = {}
-        for name in MAINTENANCE_CONFIG_KEYS:
+        switches = {}
+        for name in (*MAINTENANCE_CONFIG_KEYS, "show_game_window", "keep_unowned_legendaries"):
             enabled = value.get(name, getattr(cls, name))
             if not isinstance(enabled, bool):
                 raise ValueError(f"settings.{name} must be a boolean")
-            maintenance[name] = enabled
-        show_game_window = value.get("show_game_window", cls.show_game_window)
-        if not isinstance(show_game_window, bool):
-            raise ValueError("settings.show_game_window must be a boolean")
-        return cls(location, difficulty, oaths, wishlist, show_game_window=show_game_window, **maintenance)
+            switches[name] = enabled
+        return cls(location, difficulty, oaths, wishlist, **switches)
 
     def maintenance(self) -> dict[str, bool]:
         return {name: getattr(self, name) for name in MAINTENANCE_CONFIG_KEYS}
@@ -92,7 +90,8 @@ class SessionSettings:
     def config(self) -> dict:
         switches = {key: enabled for name, enabled in self.maintenance().items() for key in MAINTENANCE_CONFIG_KEYS[name]}
         return {"stage": self.location or "", "danger": "auto" if self.difficulty is None else self.difficulty,
-                "oaths": self.oaths, "wishlist": self.wishlist, **switches}
+                "oaths": self.oaths, "wishlist": self.wishlist,
+                "keep_unowned_legendaries": self.keep_unowned_legendaries, **switches}
 
 
 @dataclass(frozen=True)

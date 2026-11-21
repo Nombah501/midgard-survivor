@@ -55,6 +55,9 @@ SCENARIOS = {
     }, partial(drive.direct, FARMER_TEST_PREPARATION="1"), judges.preparation_unchanged),
     "wishlist-keep": Scenario(120, _SHORT | {"max_runs": 2, "keep_max_pct": 0.20, "auto_achievements": False},
                               partial(drive.supervised, FARMER_TEST_WISHLIST="1"), judges.wishlist_keep),
+    "keep-unowned-legendaries": Scenario(120, _SHORT | {
+        "max_runs": 3, "keep_max_pct": 0.20, "auto_achievements": False, "keep_unowned_legendaries": True,
+    }, partial(drive.supervised, FARMER_TEST_WISHLIST="1"), partial(judges.wishlist_keep, keep_unowned=True)),
     "run-choice": Scenario(120, _SHORT | {"objective": "progress", "danger_ceiling": 1, "danger": 2},
                            drive.supervised, partial(judges.run_choice, expected=(("prontera", 2),))),
     "run-choice-resume": Scenario(180, _SHORT | {"max_runs": 2},
@@ -64,9 +67,15 @@ SCENARIOS = {
         "stage": _ROTATION, "danger": 30, "oaths": {"tough": 3, "elite": 1}, "max_runs": _ROTATION_RUNS,
     }, partial(drive.supervised, crash_at="settled", FARMER_TEST_OATHS="1"),
        partial(judges.location_rotation, count=_ROTATION_RUNS)),
-    "location-rotation-resume": Scenario(180, _SHORT | {"max_runs": 3, "danger_ceiling": 1, "objective": "progress"},
-                                         partial(drive.supervised, resume=_resume_settings(_ROTATION)),
-                                         judges.location_rotation_resume),
+    "location-rotation-resume": Scenario(180, _SHORT | {
+        "stage": _ROTATION, "danger": 30, "max_runs": 3, "danger_ceiling": 1, "objective": "progress",
+    }, partial(drive.supervised, crash_at="settled", resume=_resume_settings(_ROTATION), resume_after_runs=1),
+       judges.location_rotation_resume),
+    "native-progress-parity": Scenario(360, _HELL_RUN | {
+        "stage": "prontera", "endless": False, "run_minutes": 12.0, "karma_route": "natural",
+        "auto_achievements": False,
+    }, partial(drive.supervised, crash_at="settled", FARMER_TEST_PROGRESS="1"),
+       judges.native_progress_parity, preset="hell-rotation.json"),
     "oaths": Scenario(180, _OATH_RUNS | {"danger": 30, "oaths": {"tough": 3, "elite": 1}},
                       partial(drive.supervised, FARMER_TEST_OATHS="1",
                               resume=_resume_settings("prontera", 30, {"hunt": 2})),

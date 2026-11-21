@@ -394,6 +394,7 @@ class SessionView:
     wishlist_items: list[dict[str, Any]] = field(default_factory=list)
     wishlist_count: int = 0
     can_edit_wishlist: bool = False
+    keep_unowned_legendaries: bool = False
     maintenance: dict[str, bool] = field(default_factory=lambda: commands.SessionSettings().maintenance())
     can_edit_maintenance: bool = False
     show_game_window: bool = False
@@ -526,6 +527,7 @@ class SessionModel:
             can_pick_oaths=bool(oaths and (oath_difficulty or oath_blocker) and (not reason or can_resume)),
             wishlist_items=_wishlist_rows(item_names, latest["owned_item_ids"], wishlist) if latest is not None else [],
             wishlist_count=len(wishlist), can_edit_wishlist=latest is not None and can_pick_run_choice,
+            keep_unowned_legendaries=self._session_settings.keep_unowned_legendaries,
             maintenance=self._session_settings.maintenance(), can_edit_maintenance=not reason or can_resume,
             show_game_window=self._session_settings.show_game_window,
             can_change_show_game_window=not oath_blocker and (not reason or can_resume),
@@ -784,6 +786,11 @@ class SessionModel:
                 ))
                 self._save_picks()
                 return
+
+    def set_keep_unowned_legendaries(self, enabled: bool) -> None:
+        if self.poll().can_pick_run_choice:
+            self._session_settings = replace(self._session_settings, keep_unowned_legendaries=enabled)
+            self._save_picks()
 
     def set_maintenance(self, name: str, enabled: bool) -> None:
         if name in commands.MAINTENANCE_CONFIG_KEYS and self.poll().can_edit_maintenance:

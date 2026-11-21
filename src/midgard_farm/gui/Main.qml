@@ -370,6 +370,14 @@ ApplicationWindow {
                             }
                             Item { Layout.fillWidth: true; visible: !oathPanel.visible }
                             Switch {
+                                objectName: "keepUnownedLegendaries"
+                                Layout.minimumHeight: 44
+                                text: qsTr("Keep every legendary I don't own yet")
+                                checked: shell.session.keep_unowned_legendaries
+                                enabled: shell.session.can_pick_run_choice
+                                onToggled: shell.backend.setKeepUnownedLegendaries(checked)
+                            }
+                            Switch {
                                 objectName: "showGameWindow"
                                 Layout.minimumHeight: 44
                                 text: qsTr("Show game window")

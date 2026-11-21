@@ -233,7 +233,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     assert json.loads(request.read_bytes())["settings"] == {
         "location": "prontera", "difficulty": 2, "oaths": {}, "wishlist": [],
         "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
-        "show_game_window": False,
+        "show_game_window": False, "keep_unowned_legendaries": False,
     }
     model = SessionModel(farm.platform)
     view = model.poll()
@@ -255,7 +255,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
         "command": "resume", "settings": {
             "location": "orc", "difficulty": 6, "oaths": {}, "wishlist": [],
             "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
-            "show_game_window": False,
+            "show_game_window": False, "keep_unowned_legendaries": False,
         },
     }
     view = SessionModel(farm.platform).poll()
@@ -950,7 +950,10 @@ def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_das
     assert SessionModel(farm.platform).poll().maintenance == resume.settings.maintenance()
 
 
-def test_show_game_window_is_remembered_and_submitted_at_start_and_resume(open_dashboard, farm):
+@pytest.mark.parametrize(("control", "setting"), [
+    ("showGameWindow", "show_game_window"), ("keepUnownedLegendaries", "keep_unowned_legendaries"),
+])
+def test_session_switch_is_remembered_and_submitted_at_start_and_resume(open_dashboard, farm, control, setting):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
 
@@ -958,13 +961,14 @@ def test_show_game_window_is_remembered_and_submitted_at_start_and_resume(open_d
 
     farm.state()
     window = open_dashboard("afkTab")
-    switch = qml_item(window, "showGameWindow")
+    switch = qml_item(window, control)
     assert switch.property("visible") and switch.property("enabled")
     assert not switch.property("checked")
-    assert "treated as a game exit" in switch.property("helpText")
+    if control == "showGameWindow":
+        assert "treated as a game exit" in switch.property("helpText")
     switch.forceActiveFocus()
     QTest.keyClick(window, Qt.Key.Key_Space)
-    wait_until(lambda: SessionModel(farm.platform).poll().show_game_window)
+    wait_until(lambda: getattr(SessionModel(farm.platform).poll(), setting))
     qml_item(window, "startButton").forceActiveFocus()
     QTest.keyClick(window, Qt.Key.Key_Space)
     wait_until(lambda: not switch.property("enabled"))
@@ -976,13 +980,13 @@ def test_show_game_window_is_remembered_and_submitted_at_start_and_resume(open_d
     wait_until(lambda: switch.property("enabled"))
     switch.forceActiveFocus()
     QTest.keyClick(window, Qt.Key.Key_Space)
-    wait_until(lambda: not SessionModel(farm.platform).poll().show_game_window)
+    wait_until(lambda: not getattr(SessionModel(farm.platform).poll(), setting))
     qml_item(window, "pauseButton").forceActiveFocus()
     QTest.keyClick(window, Qt.Key.Key_Space)
     wait_until(lambda: len(requested_commands(farm)) == 2)
     start, resume = requested_commands(farm)
-    assert isinstance(start, commands.Start) and start.settings.show_game_window is True
-    assert isinstance(resume, commands.Resume) and resume.settings.show_game_window is False
+    assert isinstance(start, commands.Start) and getattr(start.settings, setting) is True
+    assert isinstance(resume, commands.Resume) and getattr(resume.settings, setting) is False
 
 
 @pytest.mark.parametrize(("screen", "phase", "extra"), [

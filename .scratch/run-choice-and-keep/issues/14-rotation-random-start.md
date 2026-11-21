@@ -7,5 +7,5 @@
 **Status:** ready-for-agent
 
 - [ ] A new session starts at a random unlocked location (logged), then follows catalog order; covered by a fake-game test over several seeds and the real `location-rotation` scenario adapted to accept any start.
-- [ ] A restart within the session continues from the checkpointed position; covered by `location-rotation-resume`.
+- [x] A restart within the session continues from the checkpointed position; real `location-rotation-resume` passed, including Pause/Resume with a new difficulty.
 - [ ] Static checks, mypy (linux, win32), pytest suites pass.

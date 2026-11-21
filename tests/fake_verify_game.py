@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from random import Random
 
 from fake_smoke_game import CATALOG
 from midgard_farm import platform
@@ -23,9 +24,10 @@ valkyrie_drill = os.environ.get("FARMER_TEST_VALKYRIE") == "1"
 field_navigation = os.environ.get("FARMER_TEST_FIELD_NAVIGATION") == "1"
 field_charge = os.environ.get("FARMER_TEST_FIELD_CHARGE") == "1"
 mvp_drill = os.environ.get("FARMER_TEST_MVP_MECHANICS") == "1"
+verify_progress = os.environ.get("FARMER_TEST_PROGRESS") == "1"
 if field_navigation:
     assert cfg["altar_policy"] == "map-wide"
-elif cfg.get("run_minutes") != 50:
+elif cfg.get("run_minutes") != 50 and not verify_progress:
     assert "altar_policy" not in cfg and "karma_route" not in cfg
 checkpoint_path = profile / "farmer_session.json"
 journal_path = profile / "farmer_runs.jsonl"
@@ -45,7 +47,7 @@ wishlist_evidence = []
 oath_costs = {"tough": [1, 2, 4], "elite": [2, 4, 6], "hunt": [1, 2, 3], "kyrie": [1, 2, 3],
               "mvp_fury": [2, 4], "hellfire": [1, 2, 3], "lex": [2, 4], "curse": [2, 4], "unlucky": [3, 6]}
 hell_rotation = cfg.get("run_minutes") == 50 and not (valkyrie_drill or field_charge or mvp_drill)
-rotation_offset = 0
+rotation_index = None
 rotation_locations = [
     {"id": "prontera", "name": "Prontera Field", "unlocked": True, "min_difficulty": 1, "max_difficulty": 30},
     {"id": "payon", "name": "Payon Forest", "unlocked": False, "min_difficulty": 2, "max_difficulty": 30},
@@ -57,12 +59,22 @@ def rotating():
     return cfg.get("stage") == {"mode": "rotation"}
 
 
+def advance_rotation():
+    global rotation_index
+    if rotating():
+        if rotation_index is None:
+            rotation_index = Random(int(os.environ.get("FAKE_VERIFY_ROTATION_SEED", "0"))).randrange(2)
+            log(f"ROTATION_START stage={rotation_location()['id']}")
+        else:
+            rotation_index = (rotation_index + 1) % 2
+
+
 def rotation_location():
-    return [rotation_locations[0], rotation_locations[2]][(started - rotation_offset - 1) % 2]
+    return [rotation_locations[0], rotation_locations[2]][rotation_index]
 
 
 def location():
-    return rotation_location()["id"] if rotating() and started > rotation_offset else cfg.get("stage")
+    return rotation_location()["id"] if rotating() and rotation_index is not None else cfg.get("stage")
 
 
 def publish_rotation_catalog():
@@ -121,6 +133,12 @@ def status(phase, reason="", code=0, detail=""):
         data["oath_evidence"] = {"before": saved, "after": {} if fault == "changed-saved-oaths" else saved}
     if phase == "done" and verify_wishlist:
         data["wishlist_evidence"] = wishlist_evidence
+    if phase == "done" and verify_progress:
+        data["run_id"] = ""  # Recovery finished with a last run, not an active one.
+        after = last["progress"]["after"].copy()
+        if fault == "replayed-native-progress":
+            after["history"] = [after["history"][0], *after["history"][:49]]
+        data["progress_saved"] = after
     if fault == "no-transition":
         del data["last_transition"]
     if fault == "pause-starts-run" and phase == "paused" and seq > 2:
@@ -134,7 +152,8 @@ def log(message):
 
 
 def checkpoint(phase, row=None):
-    payload = {"phase": phase, "session": session, "run_id": run_id, "totals": totals(), "row": row}
+    payload = {"phase": phase, "session": session, "run_id": run_id, "totals": totals(), "row": row,
+               "rotation_index": rotation_index}
     os_.write_atomic(checkpoint_path, json.dumps(payload).encode())
 
 
@@ -172,27 +191,37 @@ def account(row):
 
 
 def settle_wishlist(row):
-    expensive, wanted, unwanted = ("sacred_excalibur", "gungnir", "legendary_shield")
+    expensive, wanted, other = ("sacred_excalibur", "gungnir", "legendary_shield")
+    keep_unowned = cfg["keep_unowned_legendaries"]
     skips = [{"id": expensive, "reason": "over_zeny_limit"}]
-    if started == 1:
-        row["kept"] = [wanted]
-        before = {"stored_ids": [], "legend_coins": 0, "zeny": 100000}
-        after = {"stored_ids": [wanted], "legend_coins": 4, "zeny": 85000}
-    else:
+    before = {"stored_ids": [], "legend_coins": 0, "zeny": 200000}
+    if wishlist_evidence:
+        before = wishlist_evidence[-1]["after"]
+    kept = [wanted] if started == 1 else [other] if started == 2 and keep_unowned else []
+    if started > 1:
         skips.append({"id": wanted, "reason": "already_owned"})
-        before = {"stored_ids": [wanted], "legend_coins": 4, "zeny": 85000}
-        after = {"stored_ids": [wanted], "legend_coins": 9, "zeny": 85000}
-        if fault == "duplicate-wishlist-item":
-            after["stored_ids"].append(wanted)
+    if keep_unowned and started != 2:
+        skips.append({"id": other, "reason": "no_keep_slots" if started == 1 else "already_owned"})
+    if fault == "ignored-wishlist-priority" and started == 1:
+        kept = [other]
+    row["kept"] = kept
+    after = {"stored_ids": before["stored_ids"] + kept,
+             "legend_coins": before["legend_coins"] + 5 - len(kept),
+             "zeny": before["zeny"] - 15000 * len(kept)}
+    if fault == "duplicate-wishlist-item" and started == 2:
+        after["stored_ids"].append(wanted)
     if fault == "no-wishlist-cash-in":
         after["legend_coins"] = before["legend_coins"]
     for skip in skips:
         log(f"KEEP_SKIP {skip['id']} reason={skip['reason']}")
     row.update(victory=False, keep_skipped=skips)
+    offer = [(expensive, 50000, 3), (wanted, 15000, 1), (other, 15000, 1)]
+    if keep_unowned:
+        offer.insert(0, offer.pop())
     wishlist_evidence.append({
-        "fixture_ids": [expensive, wanted, unwanted], "wishlist": [expensive, wanted], "free": False,
+        "fixture_ids": [expensive, wanted, other], "wishlist": [expensive, wanted], "free": False,
         "offer": [{"id": item, "cost": cost, "legend_coins": coins, "sell_zeny": 0}
-                  for item, cost, coins in ((expensive, 25000, 3), (wanted, 15000, 1), (unwanted, 15000, 1))],
+                  for item, cost, coins in offer],
         "before": before, "after": after,
     })
 
@@ -225,6 +254,23 @@ def hell_evidence(row):
         log(f"ENDLESS_START time={n * 480:.1f} n={n}")
         if n == 2 and fault == "late-valkyrie":
             log(kill)
+
+
+def settle_progress(row):
+    row.update(game_s=510, **{"class": "thief"})
+    entry = {key: row[key] for key in ("class", "stage", "danger", "victory")} | {"mvps": 1, "time": 510}
+    before = {
+        "history": [{"at": index} for index in range(50)], "altars": 23, "altars_run": 0, "oath_best": {},
+        "hell_maps": {}, "hell_classes": {}, "titles": {}, "cloud_rev": 5, "world_feats": [],
+    }
+    after = before | {
+        "history": [entry, *before["history"][:49]], "altars": 26, "altars_run": 3, "oath_best": {"prontera": 37},
+        "hell_maps": {"prontera": True}, "hell_classes": {"thief": True}, "titles": {"hell_15": True, "oath_max": True},
+    }
+    row["progress"] = {
+        "run_id": run_id, "before": before, "after": after, "altar_takes": 3, "mvps": 1, "net_mode": "",
+        "board_requests": int(fault == "native-progress-online"),
+    }
 
 
 def settle(force, *, wait_at_keep=False):
@@ -270,6 +316,8 @@ def settle(force, *, wait_at_keep=False):
             time.sleep(0.025)
     if verify_wishlist:
         settle_wishlist(row)
+    if verify_progress:
+        settle_progress(row)
     if hell_rotation:
         keep = "free=false slots=1" if fault == "paid-finale-keep" else "free=true slots=3"
         log(f"KEEP_DONE kept=0 offer=0 victory={str(row['victory']).lower()} {keep}")
@@ -345,6 +393,7 @@ if checkpoint_path.exists():
         status("failed", "checkpoint_corrupt", 1)
         sys.exit(1)
     started, run_id = saved["totals"]["started"], saved["run_id"]
+    rotation_index = saved.get("rotation_index")
     if saved["phase"] == "run":
         lost = 1
         log("RUN_LOST before settlement")
@@ -358,14 +407,17 @@ if checkpoint_path.exists():
         if fault == "duplicate-journal":
             append(row)
         account(row)
+        if verify_progress:
+            finish("max_runs")
 
 started += 1
+advance_rotation()
 run_id = f"{session}-r{started}"
 checkpoint("run")
 crash("run")
 status("run")
 deadline = time.monotonic() + 0.65 if cfg.get("run_minutes") == 0.2 else 0
-if started == 1:
+if started == 1 or (started == 2 and rotating()):
     while time.monotonic() < deadline:
         control = command()
         if control == "abort":
@@ -382,19 +434,20 @@ if started == 1:
                 if action == "resume_settings":
                     cfg = json.loads((profile / "farmer.cfg").read_bytes())
                     if rotating():
-                        rotation_offset = started
                         publish_rotation_catalog()
                     break
                 if action == "resume":
                     break
                 time.sleep(0.04)
             started += 1
+            advance_rotation()
             run_id = f"{session}-r{started}"
             status("run")
             time.sleep(0.07)  # Leave time to observe the new run.
             settle("run_timeout")
             while rotating() and runs < cfg["max_runs"]:
                 started += 1
+                advance_rotation()
                 run_id = f"{session}-r{started}"
                 settle("run_timeout")
             finish("max_runs")
@@ -451,12 +504,9 @@ if mvp_drill:
         settle("")
     finish("max_runs")
 settle("" if hell_rotation else "run_timeout")
-if verify_wishlist:
+while (rotating() or verify_wishlist) and runs < cfg["max_runs"]:
     started += 1
-    run_id = f"{session}-r{started}"
-    settle("run_timeout")
-while rotating() and runs < cfg["max_runs"]:
-    started += 1
+    advance_rotation()
     run_id = f"{session}-r{started}"
     settle("run_timeout")
 if cfg.get("endless") and not hell_rotation:

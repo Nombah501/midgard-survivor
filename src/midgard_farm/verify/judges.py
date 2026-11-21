@@ -21,8 +21,8 @@ def need(condition: object, message: str) -> None:
         raise VerificationFailure(message)
 
 
-def _marker(run: Run, marker: str) -> None:
-    path = run.artifact("farmer.log")
+def _marker(run: Run, marker: str, *, suffix: str = "farmer.log") -> None:
+    path = run.artifact(suffix)
     need(path.is_file(), "no farmer.log")
     need(marker in path.read_text(encoding="utf-8"), f"missing log marker: {marker}")
 
@@ -34,7 +34,7 @@ def _done(status: dict, *, needs_run: bool = True) -> None:
     need(status.get("finish_reason"), "finish_reason empty")
     need(status.get("last_transition"), "last_transition empty")
     need(int(status.get("heartbeat_seq") or 0) > 0, "heartbeat_seq == 0")
-    need(status.get("run_id"), "run_id empty")
+    need(status.get("run_id") or (status.get("last") or {}).get("run_id"), "run_id empty")
     if needs_run:
         need(int((status.get("totals") or {}).get("runs") or 0) >= 1, "runs == 0")
 
@@ -207,10 +207,22 @@ def _unlocked_locations(run: Run) -> list[dict]:
     return locations
 
 
+def _rotation_start(run: Run, locations: list[dict]) -> int:
+    logs = (run.artifact("crash.farmer.log"), run.artifact("farmer.log"))
+    starts = [start for log in logs if log.is_file()
+              for start in re.findall(r" ROTATION_START stage=(\S+)$",
+                                      log.read_text(encoding="utf-8"), re.MULTILINE)]
+    need(len(starts) == 1, "rotation must choose its start exactly once per session")
+    ids = [row["id"] for row in locations]
+    need(starts[0] in ids, "rotation started at a locked or unknown location")
+    return ids.index(starts[0])
+
+
 def location_rotation(run: Run, driven: Driven, status: dict, count: int) -> None:
     locations = _unlocked_locations(run)
     need(count > len(locations), "scenario did not cover a full rotation")
-    expected = tuple((locations[i % len(locations)]["id"], 30) for i in range(count))
+    start = _rotation_start(run, locations)
+    expected = tuple((locations[(start + i) % len(locations)]["id"], 30) for i in range(count))
     run_choice(run, driven, status, expected, (6,) * count, attempts=("failed", "finished"))
     game = status.get("game") or {}
     need((game.get("stage"), game.get("danger")) == expected[-1], "the game ended at the wrong location or difficulty")
@@ -223,9 +235,11 @@ def hell_rotation(run: Run, driven: Driven, status: dict, *, stage: str | None =
     need(totals["started"] == totals["runs"] == 1, "expected one completed run")
     rows = _journal(run.artifact("journal.jsonl"))
     need(len(rows) == 1 and rows[0].get("run_id") == f"{run.session}-r1", "expected one run in the journal")
-    first = stage if stage is not None else _unlocked_locations(run)[0]["id"]
+    if stage is None:
+        locations = _unlocked_locations(run)
+        stage = locations[_rotation_start(run, locations)]["id"]
     for result in (status.get("last") or {}, rows[0]):
-        need((result.get("stage"), result.get("danger")) == (first, 30), "wrong location or difficulty")
+        need((result.get("stage"), result.get("danger")) == (stage, 30), "wrong location or difficulty")
         need(result.get("oath_points") == 37, "wrong oath points")
         need(not result.get("forced") and not result.get("force_reason"),
              f"run was forced: {result.get('force_reason') or 'unknown reason'}")
@@ -347,8 +361,37 @@ def field_charge(run: Run, driven: Driven, status: dict) -> None:
 
 def location_rotation_resume(run: Run, driven: Driven, status: dict) -> None:
     locations = _unlocked_locations(run)
-    expected = (("prontera", 1), *((row["id"], row["min_difficulty"]) for row in locations[:2]))
-    run_choice(run, driven, status, expected)
+    start = _rotation_start(run, locations)
+    selected = [locations[(start + i) % len(locations)] for i in range(3)]
+    expected = tuple((row["id"], 30 if i < 2 else row["min_difficulty"]) for i, row in enumerate(selected))
+    run_choice(run, driven, status, expected, attempts=("failed", "finished"))
+
+
+def native_progress_parity(run: Run, driven: Driven, status: dict) -> None:
+    run_choice(run, driven, status, expected=(("prontera", 30),), attempts=("failed", "finished"))
+    row, = _journal(run.artifact("journal.jsonl"))
+    need(row["victory"] and not row["forced"] and row["oath_points"] == 37, "expected a native D30/37 win")
+    evidence = row["progress"]
+    need(evidence["run_id"] == row["run_id"] and evidence["mvps"] > 0, "no native progress from the winning run")
+    need(evidence["board_requests"] == 0 and evidence["net_mode"] == "", "network activity during settlement")
+    before, after = evidence["before"], evidence["after"]
+    history = after["history"]
+    need(history and history[1:] == before["history"][:49], "native Album history was not appended exactly once")
+    entry = history[0]
+    need(entry["class"] == row["class"] and entry["stage"] == row["stage"] and entry["danger"] == 30
+         and entry["victory"] is True and entry["mvps"] == evidence["mvps"]
+         and abs(entry["time"] - row["game_s"]) <= 0.5, "native Album row did not describe this win")
+    need(after["hell_maps"] == before["hell_maps"] | {row["stage"]: True}
+         and after["hell_classes"] == before["hell_classes"] | {row["class"]: True}, "Hell title progress differs")
+    need(after["oath_best"] == before["oath_best"] | {row["stage"]: 37}, "oath best did not advance to 37")
+    need({"hell_15", "oath_max"} <= after["titles"].keys(), "missing native Hell/oath title records")
+    takes = evidence["altar_takes"]
+    need(takes > 0 and after["altars"] == before["altars"] + takes
+         and after["altars_run"] == max(takes, before["altars_run"]), "native altar counters disagree with altar takes")
+    need(before["cloud_rev"] == after["cloud_rev"] and before["world_feats"] == after["world_feats"],
+         "settlement changed online profile or queued a world-chat feat")
+    _marker(run, "TEST_CRASH settled", suffix="crash.farmer.log")
+    need(status.get("progress_saved") == after, "recovery changed the native progression a second time")
 
 
 def invalid_rotation_difficulty(run: Run, driven: Driven, status: dict) -> None:
@@ -360,16 +403,17 @@ def invalid_rotation_difficulty(run: Run, driven: Driven, status: dict) -> None:
     invalid_choice(run, driven, status, field="difficulty", selection=f"location '{incompatible}'")
 
 
-def wishlist_keep(run: Run, driven: Driven, status: dict) -> None:
+def wishlist_keep(run: Run, driven: Driven, status: dict, *, keep_unowned: bool = False) -> None:
     rows = _journal(run.artifact("journal.jsonl"))
-    run_choice(run, driven, status, expected=(("prontera", 1), ("prontera", 1)))
+    count = 3 if keep_unowned else 2
+    run_choice(run, driven, status, expected=(("prontera", 1),) * count)
     evidence = status.get("wishlist_evidence", [])
-    need(len(evidence) == 2, "missing two keep snapshots")
-    first, second = evidence
-    ids = first["fixture_ids"]
-    need(len(ids) == len(set(ids)) == 3 and ids == second["fixture_ids"], "missing fixture items")
-    expensive, wanted, unwanted = ids
-    need(second["before"]["stored_ids"].count(wanted) == 1, "first keep did not persist into the next run")
+    need(len(evidence) == count, f"missing {count} keep snapshots")
+    ids = evidence[0]["fixture_ids"]
+    need(len(ids) == len(set(ids)) == 3 and all(ids == data["fixture_ids"] for data in evidence),
+         "missing fixture items")
+    expensive, wanted, other = ids
+    expected_keeps = [[wanted], [other] if keep_unowned else []] + ([[]] if keep_unowned else [])
     for index, (data, row) in enumerate(zip(evidence, rows, strict=True)):
         need(data["wishlist"] == [expensive, wanted] and not data["free"], "not a paid wishlist offer")
         before, after = data["before"], data["after"]
@@ -377,20 +421,27 @@ def wishlist_keep(run: Run, driven: Driven, status: dict) -> None:
         drops = {item["id"]: item for item in offer}
         need(all(item in drops and drops[item]["legend_coins"] > 0 for item in ids),
              "fixture legendaries are missing from the game's offer")
-        expected = [] if index else [wanted]
+        if keep_unowned:
+            need(offer[0]["id"] == other, "non-wishlist fixture must be offered before the wishlist")
+        expected = expected_keeps[index]
         added = Counter(after["stored_ids"]) - Counter(before["stored_ids"])
         need(added == Counter(expected), "wrong items added to saved storage")
-        need(after["stored_ids"].count(wanted) == 1 and unwanted not in after["stored_ids"],
-             "duplicate wishlist keep or unwanted legendary in storage")
+        owned_other = int(keep_unowned and index >= 1)
+        need(after["stored_ids"].count(wanted) == 1 and after["stored_ids"].count(other) == owned_other,
+             "incorrect ownership after keep")
         need(row["kept"] == expected, "journal kept items disagree with saved storage")
         skips = {item["id"]: item["reason"] for item in row["keep_skipped"]}
         need(skips.get(expensive) == "over_zeny_limit", "journal did not record the unaffordable item")
         if index:
-            need(skips.get(wanted) == "already_owned", "journal did not record the owned wishlist item")
-        spent = 0 if index else drops[wanted]["cost"]
-        need(after["zeny"] == before["zeny"] + sum(i["sell_zeny"] for i in offer) - spent and (index or spent > 0),
-             "wrong zeny debited for paid keep")
-        expected_cash = sum(i["legend_coins"] for i in offer) - (0 if index else drops[wanted]["legend_coins"])
+            need(before["stored_ids"].count(wanted) == 1 and skips.get(wanted) == "already_owned",
+                 "owned wishlist item did not persist or was not skipped")
+        if keep_unowned and index != 1:
+            reason = "already_owned" if index else "no_keep_slots"
+            need(skips.get(other) == reason, f"non-wishlist item was not skipped for {reason}")
+        spent = sum(drops[item]["cost"] for item in expected)
+        need(after["zeny"] == before["zeny"] + sum(i["sell_zeny"] for i in offer) - spent
+             and (not expected or spent > 0), "wrong zeny debited for paid keep")
+        expected_cash = sum(i["legend_coins"] for i in offer) - sum(drops[item]["legend_coins"] for item in expected)
         need(after["legend_coins"] == before["legend_coins"] + expected_cash, "legendary offers were not cashed in")
     log = run.artifact("farmer.log").read_text(encoding="utf-8")
     need(any(wanted in line and "already_owned" in line for line in log.splitlines()),
