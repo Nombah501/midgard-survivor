@@ -50,13 +50,15 @@ class SessionSettings:
     card_fusion: bool = True
     star_smith: bool = False
     storage_cleanup: bool = False
+    show_game_window: bool = False
 
     @classmethod
     def decode(cls, value: object) -> "SessionSettings":
         if (not isinstance(value, dict) or not {"location", "difficulty"} <= value.keys()
-                or value.keys() - {"location", "difficulty", "oaths", "wishlist", *MAINTENANCE_CONFIG_KEYS}):
+                or value.keys() - {"location", "difficulty", "oaths", "wishlist", "show_game_window",
+                                   *MAINTENANCE_CONFIG_KEYS}):
             raise ValueError(
-                "settings must be an object with location, difficulty and optional oaths, wishlist and maintenance switches"
+                "settings must be an object with location, difficulty and optional oaths, wishlist and switches"
             )
         location = _decode_location(value["location"])
         difficulty = value["difficulty"]
@@ -79,7 +81,10 @@ class SessionSettings:
             if not isinstance(enabled, bool):
                 raise ValueError(f"settings.{name} must be a boolean")
             maintenance[name] = enabled
-        return cls(location, difficulty, oaths, wishlist, **maintenance)
+        show_game_window = value.get("show_game_window", cls.show_game_window)
+        if not isinstance(show_game_window, bool):
+            raise ValueError("settings.show_game_window must be a boolean")
+        return cls(location, difficulty, oaths, wishlist, show_game_window=show_game_window, **maintenance)
 
     def maintenance(self) -> dict[str, bool]:
         return {name: getattr(self, name) for name in MAINTENANCE_CONFIG_KEYS}

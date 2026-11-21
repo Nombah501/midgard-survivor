@@ -129,6 +129,10 @@ class _Backend(QObject):
     def setMaintenance(self, name: str, enabled: bool) -> None:
         self._enqueue(partial(self._model.set_maintenance, name, enabled))
 
+    @Slot(bool)
+    def setShowGameWindow(self, enabled: bool) -> None:
+        self._enqueue(partial(self._model.set_show_game_window, enabled))
+
     @Slot()
     def start(self) -> None:
         self._enqueue(self._model.start)

@@ -233,6 +233,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     assert json.loads(request.read_bytes())["settings"] == {
         "location": "prontera", "difficulty": 2, "oaths": {}, "wishlist": [],
         "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
+        "show_game_window": False,
     }
     model = SessionModel(farm.platform)
     view = model.poll()
@@ -254,6 +255,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
         "command": "resume", "settings": {
             "location": "orc", "difficulty": 6, "oaths": {}, "wishlist": [],
             "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
+            "show_game_window": False,
         },
     }
     view = SessionModel(farm.platform).poll()
@@ -946,6 +948,41 @@ def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_das
     assert isinstance(start, commands.Start) and start.settings.maintenance() == changed
     assert isinstance(resume, commands.Resume) and resume.settings.maintenance() == changed | {"star_smith": False}
     assert SessionModel(farm.platform).poll().maintenance == resume.settings.maintenance()
+
+
+def test_show_game_window_is_remembered_and_submitted_at_start_and_resume(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state()
+    window = open_dashboard("afkTab")
+    switch = qml_item(window, "showGameWindow")
+    assert switch.property("visible") and switch.property("enabled")
+    assert not switch.property("checked")
+    assert "treated as a game exit" in switch.property("helpText")
+    switch.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: SessionModel(farm.platform).poll().show_game_window)
+    qml_item(window, "startButton").forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: not switch.property("enabled"))
+
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    wait_until(lambda: qml_item(window, "phaseValue").property("text") == "Run in progress")
+    assert not switch.property("enabled")
+    farm.state("active", session_id="afk-fixture", farmer_phase="paused")
+    wait_until(lambda: switch.property("enabled"))
+    switch.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: not SessionModel(farm.platform).poll().show_game_window)
+    qml_item(window, "pauseButton").forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Space)
+    wait_until(lambda: len(requested_commands(farm)) == 2)
+    start, resume = requested_commands(farm)
+    assert isinstance(start, commands.Start) and start.settings.show_game_window is True
+    assert isinstance(resume, commands.Resume) and resume.settings.show_game_window is False
 
 
 @pytest.mark.parametrize(("screen", "phase", "extra"), [

@@ -18,9 +18,11 @@ Open the installed `midgard-farm` window and use **Start service** for the first
 
 If the legacy checkout mounted the farmer patch on Linux, restore the official patch with the legacy `uninstall.sh` before starting the new service. The new app expects its own `patches/official-state.json` in the game profile and will not guess from legacy backups.
 
-## AFK maintenance
+## AFK settings
 
 Open **Maintenance** on the **AFK session** screen to choose Kafra/Sage upgrades, spare-card fusion, Star Smith for unworn items, and storage cleanup. Upgrades and fusion start enabled; Star Smith and cleanup start disabled. The window remembers these choices on this machine and applies them on **Start** or **Resume**. Presets tune limits and reserves, not which actions are enabled.
+
+**Show game window** on the **AFK session** screen is off by default and remembered on this machine. It applies the next time the game launches; changing it before **Resume** does not reopen the running game. The farmer plays the same way and Linux still isolates its network. Closing the game window is a game exit and may trigger a restart; use **Finish** to settle the current run and stop normally. Remove `display` from any old app preset. Developers can still force watch mode with `FARMER_DISPLAY=1` in the launcher's environment.
 
 ## App updates
 

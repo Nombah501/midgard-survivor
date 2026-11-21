@@ -396,6 +396,8 @@ class SessionView:
     can_edit_wishlist: bool = False
     maintenance: dict[str, bool] = field(default_factory=lambda: commands.SessionSettings().maintenance())
     can_edit_maintenance: bool = False
+    show_game_window: bool = False
+    can_change_show_game_window: bool = False
     can_start: bool = False
     can_pick_character: bool = False
     can_pick_preset: bool = False
@@ -525,6 +527,8 @@ class SessionModel:
             wishlist_items=_wishlist_rows(item_names, latest["owned_item_ids"], wishlist) if latest is not None else [],
             wishlist_count=len(wishlist), can_edit_wishlist=latest is not None and can_pick_run_choice,
             maintenance=self._session_settings.maintenance(), can_edit_maintenance=not reason or can_resume,
+            show_game_window=self._session_settings.show_game_window,
+            can_change_show_game_window=not oath_blocker and (not reason or can_resume),
             catalog_refresh=_catalog_refresh(latest),
             start_reason=reason or oath_blocker, start_refusal=refusal,
             resume_refusal=(oath_blocker or resume_refusal) if can_resume else resume_refusal,
@@ -785,6 +789,11 @@ class SessionModel:
         if name in commands.MAINTENANCE_CONFIG_KEYS and self.poll().can_edit_maintenance:
             changes: dict[str, Any] = {name: enabled}
             self._session_settings = replace(self._session_settings, **changes)
+            self._save_picks()
+
+    def set_show_game_window(self, enabled: bool) -> None:
+        if self.poll().can_change_show_game_window:
+            self._session_settings = replace(self._session_settings, show_game_window=enabled)
             self._save_picks()
 
     def _selected_settings(self, view: SessionView, *, resuming: bool = False) -> commands.SessionSettings:

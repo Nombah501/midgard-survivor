@@ -14,7 +14,6 @@
   "auto_achievements": true,
   "upgrade_reserve": 200000,
   "storage_target": 140,
-  "display": false,
   "offline": true,
   "hard_exit": true
 }

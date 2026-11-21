@@ -36,6 +36,7 @@ def status(phase="run", reason=""):
     data = {"phase": phase, "terminal": phase in {"done", "failed"},
             "failed": phase == "failed", "finish_reason": reason,
             "heartbeat_seq": seq, "pid": os.getpid(), "session": os.environ["FARMER_SESSION_ID"]}
+    data["exit_code"] = int(phase == "failed")
     data["heartbeat"] = time.time()
     if kind == "commands":
         data["game"] = {"time": seq if arg == "endless" else 640, "in_raid": arg == "raid"}
@@ -81,6 +82,13 @@ if kind == "done-bad-exit":
 if kind == "done-sigkill":
     status("done", arg)
     os.kill(os.getpid(), signal.SIGKILL)
+if kind in {"done-sigabrt", "run-sigabrt"}:
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    if kind == "done-sigabrt":
+        status("done", arg)
+    os.kill(os.getpid(), signal.SIGABRT)
 if kind == "fail":
     status("failed", arg)
     os._exit(1)
@@ -128,6 +136,8 @@ if kind == "commands":
         if command == "pause":
             phase = "paused"
         elif command in ("resume", "resume_settings"):
+            if arg == "exit-on-resume":
+                os._exit(1)
             phase = "run"
         if deadline is not None and time.monotonic() >= deadline:
             status("done", "fixture_deadline")

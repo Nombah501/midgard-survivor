@@ -16,7 +16,9 @@ import pytest
 
 from midgard_farm import platform
 from midgard_farm.core import patch_info
+from midgard_farm.core.commands import SessionSettings
 from midgard_farm.core.backup import known_good_snapshot, publish_known_good
+from midgard_farm.core.launch import run_attempt
 
 from test_profile import godot_root, make_profile
 
@@ -124,6 +126,34 @@ def test_supervised_game_uses_loopback_only_namespace(supervised):
     assert os.readlink("/proc/self/ns/net") == outer_netns
 
 
+@pytest.mark.parametrize(("show_game_window", "override", "windowed"), [
+    (False, "", False), (True, "", True), (False, "1", True),
+])
+def test_supervised_watch_mode_uses_local_display_socket(supervised, monkeypatch, show_game_window, override, windowed):
+    preset = supervised.profile / "strategy.json"
+    preset.write_text('{"speed": 10}')
+    monkeypatch.setenv("FARMER_DISPLAY", override)
+    monkeypatch.chdir(supervised.game.parent)
+    display_path = "display.sock"
+    with socket.socket(socket.AF_UNIX) as display:
+        display.bind(display_path)
+        display.listen()
+        monkeypatch.setenv("FAKE_DISPLAY_SOCKET", display_path)
+        result = run_attempt(supervised.os_, supervised.profile, preset, "acceptance-afk-session",
+                             settings=SessionSettings(show_game_window=show_game_window))
+        if windowed:
+            display.settimeout(2)
+            with display.accept()[0] as connection:
+                assert connection.recv(32) == b"display connected"
+
+    assert result.clean(supervised.os_)
+    record = supervised.record()
+    assert record["netns"] != os.readlink("/proc/self/ns/net")
+    assert record["interfaces"] == ["lo"]
+    assert record["args"] == ([] if windowed else ["--headless"])
+    assert record["config"]["display"] is windowed and record["config"]["speed"] == 10
+
+
 def test_sandbox_launch_uses_separate_backup_directory(supervised, tmp_path, monkeypatch):
     backups = tmp_path / "sandbox backups"
     monkeypatch.setenv("FARMER_BACKUP_DIR", str(backups))
@@ -222,7 +252,7 @@ def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_preset)
 
 
 @pytest.mark.parametrize("key", [
-    "stage", "danger", "class", "builds.class", "oaths", "wishlist",
+    "stage", "danger", "class", "builds.class", "oaths", "wishlist", "display",
     "auto_upgrades", "auto_sage", "auto_fuse", "auto_potential", "auto_storage_prune",
 ])
 def test_run_choice_keys_in_presets_are_unfixable(launcher, tmp_path, key):

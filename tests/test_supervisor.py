@@ -150,6 +150,9 @@ def farm(tmp_path, monkeypatch, service_game_platform):
         bridge_file="bridge.pck", bridge_sha256="", bytecode="ebc36a7", farmer_api=1,
         farmer_hash=farmer_hash(), result_sha256=hashlib.sha256(b"farmer").hexdigest(), built_at="fixture",
     ))
+    if sys.platform == "win32":
+        # The fake is a python.exe, which rejects the Godot-only --headless flag.
+        monkeypatch.setenv("FARMER_DISPLAY", "1")
     preset = tmp_path / "farmer preset.json"
     game = os_.game_executable()
     if sys.platform == "win32":
@@ -175,7 +178,7 @@ def farm(tmp_path, monkeypatch, service_game_platform):
     else:
         game.write_bytes(f"#!{sys.executable}\n".encode() + FAKE.read_bytes())
         game.chmod(0o755)
-    preset.write_text(json.dumps({"display": sys.platform == "win32", "speed": 5,
+    preset.write_text(json.dumps({"speed": 5,
                                   "builds": {"archer": {"job_path": 0, "skills": ["agi"]}}}))
     return Farm(os_, profile, preset, plan)
 
@@ -257,8 +260,9 @@ def test_malformed_wishlists_are_refused(farm, wishlist):
 
 @pytest.mark.parametrize(("key", "value"), [
     ("upgrades", 0), ("card_fusion", "false"), ("star_smith", None), ("storage_cleanup", []),
+    ("show_game_window", "true"),
 ])
-def test_non_boolean_maintenance_switches_are_refused(farm, key, value):
+def test_non_boolean_session_switches_are_refused(farm, key, value):
     with farm.service():
         for command in ("start", "resume"):
             request = farm.send(command, character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
@@ -308,7 +312,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
         if structured:
             farm.send("resume", settings={"location": {"mode": "rotation"}, "difficulty": 30, "oaths": {"tough": 3},
                                           "wishlist": ["gungnir"], "upgrades": False, "card_fusion": False,
-                                          "star_smith": True, "storage_cleanup": True})
+                                          "star_smith": True, "storage_cleanup": True, "show_game_window": True})
         else:
             farm.send("resume")
         resumed = farm.status("run")
@@ -318,6 +322,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
         assert config["wishlist"] == (["gungnir"] if structured else [])
         assert config["auto_upgrades"] is config["auto_sage"] is config["auto_fuse"] is (not structured)
         assert config["auto_potential"] is config["auto_storage_prune"] is structured
+        assert config["display"] is (sys.platform == "win32")  # Resume did not relaunch the game.
         assert config["class"] == "archer" and config["job_paths"] == {"archer": 1}
         saved = json.loads((farm.data / "session.json").read_bytes())
         assert saved["start"]["settings"] == {
@@ -325,6 +330,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
             "wishlist": config["wishlist"],
             "upgrades": not structured, "card_fusion": not structured,
             "star_smith": structured, "storage_cleanup": structured,
+            "show_game_window": structured,
         }
         wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)), lambda d: (
             d["phase"] == "run" and d["pid"] == running["pid"] and d["heartbeat_seq"] >= resumed["heartbeat_seq"] + 3
@@ -334,6 +340,22 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
     assert running["pid"] == paused["pid"] == resumed["pid"]
     assert (outcome["kind"], outcome["reason"], len(outcome["attempts"])) == ("finished", "finish", 1)
     assert farm.notifications() == ["stop"]
+
+
+@POSIX
+def test_pending_watch_mode_is_used_by_the_restarted_game(farm):
+    plan_game(farm, "commands:exit-on-resume", "done-sigabrt:max_runs")
+    with farm.service():
+        farm.start()
+        farm.status("run")
+        assert json.loads((farm.profile / "farmer.cfg").read_bytes())["display"] is False
+        farm.send("pause")
+        farm.status("paused")
+        commands.submit(farm.os_, commands.Resume(commands.SessionSettings(show_game_window=True)))
+        outcome, _ = farm.outcome()
+    assert json.loads((farm.profile / "farmer.cfg").read_bytes())["display"] is True
+    assert (outcome["kind"], outcome["reason"]) == ("finished", "max_runs")
+    assert [attempt["outcome"] for attempt in outcome["attempts"]] == ["failed", "finished"]
 
 
 @POSIX
@@ -413,7 +435,7 @@ def test_stale_verdict_is_checked_against_current_status_and_exit(tmp_path, monk
     monkeypatch.setattr(os_, "check_network_isolation", lambda: "")
     monkeypatch.setenv("FARMER_BACKUP_DIR", str(tmp_path / "backups"))
     monkeypatch.setattr(launch, "check_prerequisites", lambda *_: (tmp_path / "game", None))
-    monkeypatch.setattr(launch, "preflight", lambda *_: SimpleNamespace(argv=[tmp_path / "game"], config=None))
+    monkeypatch.setattr(launch, "preflight", lambda *_, **__: SimpleNamespace(argv=[tmp_path / "game"], config=None))
     reads = polls = 0
     killed = False
     monkeypatch.setattr(supervisor, "time", SimpleNamespace(monotonic=lambda: float(polls * 2), time=time.time))
@@ -475,7 +497,7 @@ def test_run_stall_is_rechecked_before_killing(tmp_path, monkeypatch, before_kil
     monkeypatch.setattr(os_, "check_network_isolation", lambda: "")
     monkeypatch.setenv("FARMER_BACKUP_DIR", str(tmp_path / "backups"))
     monkeypatch.setattr(launch, "check_prerequisites", lambda *_: (tmp_path / "game", None))
-    monkeypatch.setattr(launch, "preflight", lambda *_: SimpleNamespace(argv=[tmp_path / "game"], config=None))
+    monkeypatch.setattr(launch, "preflight", lambda *_, **__: SimpleNamespace(argv=[tmp_path / "game"], config=None))
     reads = polls = 0
     finished = killed = False
     monkeypatch.setattr(supervisor, "time", SimpleNamespace(monotonic=lambda: float(polls), time=time.time))
@@ -716,6 +738,31 @@ def test_terminal_status_allows_the_games_expected_headless_sigkill(farm):
         outcome, _ = farm.outcome()
     assert (outcome["kind"], outcome["reason"], len(outcome["attempts"])) == ("finished", "goal", 1)
     assert known_good_snapshot(farm.data / "backups") is not None
+
+
+@POSIX
+@pytest.mark.parametrize(("show_game_window", "step", "finished"), [
+    (True, "done-sigabrt", True),
+    (False, "done-sigabrt", False),
+    (True, "run-sigabrt", False),
+    (True, "exit:134", False),
+])
+def test_only_a_windowed_abort_after_verified_finish_is_a_terminal_outcome(farm, show_game_window, step, finished):
+    plan_game(farm, f"{step}:goal" if ":" not in step else step, "clean:stop")
+    with farm.service():
+        commands.submit(farm.os_, commands.Start(None, farm.preset, commands.SessionSettings(
+            show_game_window=show_game_window,
+        )))
+        outcome, _ = farm.outcome()
+    assert outcome["kind"] == "finished"
+    if finished:
+        assert outcome["reason"] == "goal"
+        assert len(outcome["attempts"]) == 1
+        assert outcome["attempts"][0]["exit_code"] == -signal.SIGABRT
+    else:
+        assert outcome["reason"] == "stop"
+        assert len(outcome["attempts"]) == 2
+        assert outcome["attempts"][0]["outcome"] == "failed"
 
 
 @pytest.mark.parametrize("legacy_lock", [False, True])

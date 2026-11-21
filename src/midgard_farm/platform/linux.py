@@ -223,6 +223,7 @@ class LinuxPlatform(Platform):
         if not isolate_network:
             return _GroupTree(subprocess.Popen(command, start_new_session=True, **popen_kwargs))
         # unshare execs the helper, which execs the game in the same killable group.
+        # Keep the mount namespace: local X11 and Wayland display sockets use filesystem paths.
         helper = [sys.executable, "--_isolated-exec"] if getattr(sys, "frozen", False) else [
             sys.executable, "-m", "midgard_farm.platform.linux",
         ]

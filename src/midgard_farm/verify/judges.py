@@ -50,6 +50,16 @@ def one_run(run: Run, driven: Driven, status: dict) -> None:
     need(not reason, reason)
 
 
+def watch_mode(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    need(status["totals"]["runs"] == 1, "expected one completed run")
+    outcome = driven.outcome or {}
+    need(outcome.get("kind") == "finished" and outcome.get("reason") == "max_runs",
+         "supervisor did not report a clean finish at the run limit")
+    need(len(outcome.get("attempts", [])) == 1, "supervisor restarted the game")
+
+
 def catalog(run: Run, driven: Driven, status: dict) -> None:
     _exit(driven)
     _done(status)

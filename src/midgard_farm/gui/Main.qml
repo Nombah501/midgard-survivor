@@ -369,6 +369,19 @@ ApplicationWindow {
                                 wrapMode: Text.Wrap
                             }
                             Item { Layout.fillWidth: true; visible: !oathPanel.visible }
+                            Switch {
+                                objectName: "showGameWindow"
+                                Layout.minimumHeight: 44
+                                text: qsTr("Show game window")
+                                readonly property string helpText: qsTr("Applies at the next game launch. Closing the game window is treated as a game exit; the supervisor may restart it.")
+                                Accessible.description: helpText
+                                ToolTip.text: helpText
+                                ToolTip.visible: hovered || activeFocus
+                                ToolTip.delay: 350
+                                checked: shell.session.show_game_window
+                                enabled: shell.session.can_change_show_game_window
+                                onToggled: shell.backend.setShowGameWindow(checked)
+                            }
                             ActionButton {
                                 id: wishlistPanel
                                 objectName: "wishlistPanel"

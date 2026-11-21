@@ -18,7 +18,7 @@ from .commands import MAINTENANCE_CONFIG_KEYS
 
 
 _OBSOLETE_KEYS = farmer_inputs() / "obsolete_config_keys.json"
-_RUN_CHOICE_KEYS = ("stage", "danger", "class", "oaths", "wishlist")
+_SESSION_CONFIG_KEYS = ("stage", "danger", "class", "oaths", "wishlist", "display")
 
 
 class PreflightError(Exception):
@@ -85,7 +85,8 @@ def check_prerequisites(os_: Platform, profile: Path) -> tuple[Path, patch_info.
     return game, info
 
 
-def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, preset: Path | None) -> LaunchPlan:
+def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, preset: Path | None, *,
+              show_game_window: bool | None = None) -> LaunchPlan:
     """Check the mounted patch and preset under the launcher lock."""
     patches = profile / "patches"
     state = patches / "state.json"
@@ -120,7 +121,7 @@ def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, preset: Pat
     obsolete = json.loads(_read_preflight_input(_OBSOLETE_KEYS, Path.read_bytes))
     removed = [key for key in obsolete if key in config]
     if preset is not None:
-        removed.extend(key for key in _RUN_CHOICE_KEYS if key in config)
+        removed.extend(key for key in _SESSION_CONFIG_KEYS if key in config)
         removed.extend(key for keys in MAINTENANCE_CONFIG_KEYS.values() for key in keys if key in config)
         if isinstance(builds := config.get("builds"), dict) and "class" in builds:
             removed.append("builds.class")
@@ -129,7 +130,9 @@ def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, preset: Pat
         raise PreflightError(f"remove unsupported keys from {source}: {', '.join(removed)}")
     write_config = preset is not None
     if os.environ.get("FARMER_DISPLAY") in {"1", "true"}:
-        config["display"] = True
+        show_game_window = True
+    if show_game_window is not None:
+        config["display"] = show_game_window
         contents = json.dumps(config, indent=2).encode()
         write_config = True
 

@@ -17,7 +17,8 @@ assert os.environ["FARMER_SESSION"] == "1"
 session = os.environ["FARMER_SESSION_ID"]
 assert session.startswith("verify-")
 cfg = json.loads((profile / "farmer.cfg").read_bytes())
-assert not cfg["display"]
+assert cfg["display"] is (os.environ.get("FAKE_VERIFY_WATCH_MODE") == "1")
+assert sys.argv[1:] == ([] if cfg["display"] else ["--headless"])
 valkyrie_drill = os.environ.get("FARMER_TEST_VALKYRIE") == "1"
 if cfg.get("run_minutes") != 50:
     assert "altar_policy" not in cfg and "karma_route" not in cfg

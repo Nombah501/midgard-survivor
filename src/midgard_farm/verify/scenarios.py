@@ -42,6 +42,7 @@ _VALKYRIE_RUNS = 19  # One of each ability, plus nine more Caída waves.
 SCENARIOS = {
     # Done + terminal metadata, a win and last victory, kills/zeny > 0, FINISH.
     "one-run": Scenario(300, {}, drive.direct, judges.one_run),
+    "watch-mode": Scenario(300, {"display": True}, drive.supervised, judges.watch_mode),
     "catalog": Scenario(300, {}, partial(drive.direct, FARMER_TEST_CATALOG="1"), judges.catalog),
     "preparation-unchanged": Scenario(300, {
         "auto_achievements": True, "auto_upgrades": True, "auto_sage": True, "auto_fuse": True,
@@ -146,7 +147,7 @@ SCENARIOS = {
 }
 
 
-BOUNDED_SCENARIOS = tuple(name for name in SCENARIOS if name != "soak")
+BOUNDED_SCENARIOS = tuple(name for name in SCENARIOS if name not in {"soak", "watch-mode"})
 
 
 def check_supported(os_: Platform, name: str) -> None:
@@ -185,7 +186,7 @@ def run_scenario(os_: Platform, source: Path, candidate: Path, work: Path, out: 
         preset = json.loads((soak_preset or presets_dir() / "night.json").read_bytes())
         if not isinstance(preset, dict):
             raise ValueError("soak preset must be a JSON object")
-        config = preset | {"max_minutes": hours * 60, "max_runs": 0, "hard_exit": True, "display": False}
+        config = preset | {"max_minutes": hours * 60, "max_runs": 0, "hard_exit": True}
         timeout = int(hours * 3600) + scenario.timeout
     else:
         strategy = json.loads((presets_dir() / scenario.preset).read_bytes()) if scenario.preset else {}

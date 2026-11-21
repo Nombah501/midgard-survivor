@@ -263,7 +263,8 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
                 raise ValueError(f"verify config disagrees on the {name} switch")
             switches[name] = enabled
         settings = SessionSettings(config.pop("stage") or None, None if danger == "auto" else danger,
-                                   config.pop("oaths", {}), config.pop("wishlist", []), **switches)
+                                   config.pop("oaths", {}), config.pop("wishlist", []),
+                                   show_game_window=config.pop("display", False), **switches)
         strategy = run.artifact("strategy.json")
         strategy.write_text(json.dumps(config, indent=2), encoding="utf-8")
         start = Start(Character(cid, config.get("job_paths", {}).get(cid, 0)), strategy, settings)

@@ -47,9 +47,9 @@ class VerifyGamePlatform(type(platform.current())):
         return {self.tree.popen.pid} if self.tree is not None and self.tree.popen.poll() is None else set()
 
     def spawn_tree(self, argv, *, isolate_network=False, **kwargs):
-        assert isolate_network and argv[1:] == ["--headless"]
+        assert isolate_network
         fake = Path(__file__).with_name("fake_verify_game.py")
-        self.tree = super().spawn_tree([sys.executable, str(fake)], **kwargs)
+        self.tree = super().spawn_tree([sys.executable, str(fake), *argv[1:]], **kwargs)
         return self.tree
 
 
@@ -133,6 +133,15 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
         outcome = json.loads((logdir / "outcome.json").read_text())
         assert [(a["number"], a["outcome"]) for a in outcome["attempts"]] == [(1, "failed"), (2, "finished")]
         assert len(list(logdir.glob("attempt-*.log"))) == 2
+
+
+def test_windowed_scenario_finishes_one_supervised_attempt(verification, monkeypatch):
+    _, _, _, _, out, root = verification
+    monkeypatch.setenv("FAKE_VERIFY_WATCH_MODE", "1")
+    result = execute(verification, "watch-mode")
+    assert result["verdict"] == "PASS" and result["exit"] == 0 and result["runs"] == 1, result
+    assert json.loads(next(root.glob("*/farmer.cfg")).read_bytes())["display"] is True
+    assert "display" not in json.loads((out / "watch-mode.strategy.json").read_bytes())
 
 
 @pytest.mark.parametrize(("fault", "reason"), [
@@ -325,7 +334,7 @@ def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, cus
     if custom:
         preset = tmp_path / "custom.json"
         preset.write_text(json.dumps({"builds": {"archer": {"job_path": 1}},
-                                      "job_paths": {"swordsman": 2}, "display": True}))
+                                      "job_paths": {"swordsman": 2}}))
     row = execute(verification, "soak", hours=0.00001, soak_preset=preset)
     assert row["verdict"] == "FAIL" and row["exit"] == 0  # No post-warmup RSS in this intentionally short run.
     verdict = (out / "soak.verdict.log").read_text()

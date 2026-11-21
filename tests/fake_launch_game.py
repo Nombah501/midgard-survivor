@@ -22,6 +22,10 @@ record = {
     "session_id": os.environ.get("FARMER_SESSION_ID"),
     "config": json.loads((profile / "farmer.cfg").read_text()),
 }
+if not sys.argv[1:] and (display := os.environ.get("FAKE_DISPLAY_SOCKET")):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.connect(display)
+        connection.sendall(b"display connected")
 ready = profile / "fake-game.json"
 ready.with_suffix(".tmp").write_text(json.dumps(record))
 ready.with_suffix(".tmp").replace(ready)

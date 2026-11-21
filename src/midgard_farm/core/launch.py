@@ -71,6 +71,7 @@ class AttemptExit:
     status: dict | None
     last_status: dict | None
     forced_reason: str | None
+    windowed: bool = False
 
     @property
     def normalized_code(self) -> int:
@@ -78,11 +79,14 @@ class AttemptExit:
 
     def clean(self, os_: Platform) -> bool:
         status = self.status or {}
+        # Godot's Linux window teardown can abort after the farmer has flushed and reported success.
+        window_teardown = (self.windowed and self.code == -signal.SIGABRT and status.get("failed") is False
+                           and type(status.get("exit_code")) is int and status["exit_code"] == 0)
         # A verified headless Linux finish SIGKILLs itself. Windows has no
         # reliable hard-exit code, but both OSes require the farmer's status.
         return (self.forced_reason is None and status.get("phase") == "done"
                 and status.get("terminal") is True and not status.get("failed")
-                and (not os_.game_exit_status_reliable or self.normalized_code in (0, 137)))
+                and (not os_.game_exit_status_reliable or self.normalized_code in (0, 137) or window_teardown))
 
 
 def _select_character(config: dict, character: Character) -> None:
@@ -119,7 +123,7 @@ def run_attempt(
             raise GameBusy("another farmer launcher holds the lock") from exc
         if os_.game_running():
             raise GameBusy("the game is already running; close it first")
-        plan = preflight(game, info, profile, preset)
+        plan = preflight(game, info, profile, preset, show_game_window=settings.show_game_window if settings else None)
         if session_id:
             warning = os_.check_network_isolation()
             if warning:
@@ -128,7 +132,7 @@ def run_attempt(
         snapshot_profile(profile, backups)
         config = plan.config
         if character is not None or settings is not None:
-            assert config is not None, "session settings require a preset"
+            assert preset is not None and config is not None, "session settings require a preset"
             selected = json.loads(config)
             if character is not None:
                 _select_character(selected, character)
@@ -226,7 +230,8 @@ def run_attempt(
         status = _read_status(os_, profile, expected_session, retry_missing=True)
         if status is None and last_status is not None and last_status.get("terminal") is True:
             status = last_status
-        result = AttemptExit(code, status, status if status is not None else last_status, forced_reason)
+        result = AttemptExit(code, status, status if status is not None else last_status, forced_reason,
+                             windowed=len(plan.argv) == 1)
         reason = (status or {}).get("finish_reason")
         if session_id and result.clean(os_) and isinstance(reason, str) and reason in _SETTLED_REASONS:
             try:

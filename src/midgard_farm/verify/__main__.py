@@ -179,8 +179,9 @@ def main(argv: list[str] | None = None) -> int:
         return _worker(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--scenario", action="append", choices=BOUNDED_SCENARIOS, help="one bounded scenario (repeatable)")
-    mode.add_argument("--all", action="store_true", help="all supported bounded scenarios (not the soak)")
+    mode.add_argument("--scenario", action="append", choices=(*BOUNDED_SCENARIOS, "watch-mode"),
+                      help="one bounded scenario (repeatable)")
+    mode.add_argument("--all", action="store_true", help="all supported headless bounded scenarios")
     mode.add_argument("--soak", type=_hours, metavar="HOURS", help="run a Linux soak")
     parser.add_argument("--soak-preset", type=Path, metavar="JSON", help="override the built-in night preset")
     parser.add_argument("--candidate-dir", type=Path, metavar="DIR", help="read a built patch and its app metadata from DIR")
