@@ -532,7 +532,8 @@ def qml_item(window, name):
 def wait_until(predicate):
     from PySide6.QtTest import QTest
 
-    deadline = time.monotonic() + 3
+    # CI runners publish snapshots far slower than a workstation.
+    deadline = time.monotonic() + 10
     while not predicate():
         assert time.monotonic() < deadline, "Timed out waiting for the Qt window to update"
         QTest.qWait(20)
@@ -548,10 +549,10 @@ def click(window, name):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
 
-    # A published snapshot can change visibility before Qt polishes the layout.
+    # A published snapshot can change visibility and enablement before Qt polishes the layout.
     assert not window.grabWindow().isNull()
     item = qml_item(window, name)
-    assert item.property("visible") and item.property("enabled")
+    wait_until(lambda: item.property("visible") and item.property("enabled"))
     QTest.mouseClick(window, Qt.MouseButton.LeftButton, pos=item.mapToScene(item.boundingRect().center()).toPoint())
 
 
