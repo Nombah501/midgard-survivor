@@ -920,7 +920,7 @@ def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_das
     defaults = {"upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False}
     click(window, "maintenancePanel")
     switches = {name: qml_item(window, "maintenance-" + name) for name in defaults}
-    assert all(item.property("visible") and item.property("enabled") for item in switches.values())
+    wait_until(lambda: all(item.property("visible") and item.property("enabled") for item in switches.values()))
     assert {name: item.property("checked") for name, item in switches.items()} == defaults
     for name, item in switches.items():
         item.forceActiveFocus()
@@ -962,7 +962,7 @@ def test_session_switch_is_remembered_and_submitted_at_start_and_resume(open_das
     farm.state()
     window = open_dashboard("afkTab")
     switch = qml_item(window, control)
-    assert switch.property("visible") and switch.property("enabled")
+    wait_until(lambda: switch.property("visible") and switch.property("enabled"))
     assert not switch.property("checked")
     if control == "showGameWindow":
         assert "treated as a game exit" in switch.property("helpText")
