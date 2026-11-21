@@ -15,6 +15,7 @@ from midgard_farm.core import game_update, patch_info
 from midgard_farm.core.farmer_patch import farmer_hash
 from midgard_farm.core.farmer_patch.gdre import Gdre
 from midgard_farm.core.preflight import PreflightError
+from test_farmer_patch import PLAYER_CODE
 from test_profile import godot_root, make_profile
 
 
@@ -22,11 +23,6 @@ TOOLS = Path(__file__).with_name("fake_update_tools.py")
 SAVE = "res://scripts/autoload/save.gdc"
 PLAYER = "res://scripts/core/player.gdc"
 SAVE_CODE = "var _timer: = 0.0\nfunc _process(delta: float) -> void :\n\tpass\n"
-PLAYER_CODE = (
-    "func next_job(path: = 0) -> Dictionary:\n"
-    "\tvar paths: = GameData.job_paths(class_id)\n"
-    "\tvar job: Dictionary = paths[clampi(path, 0, paths.size() - 1)].duplicate()\n"
-)
 
 
 class UpdateGamePlatform(type(platform.current())):

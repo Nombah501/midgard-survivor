@@ -192,9 +192,10 @@ def run_choice(run: Run, driven: Driven, status: dict, expected: tuple[tuple[str
     session_notes = [r for r in read_history(run.os) if r.get("session_id") == run.session]
     need(len(session_notes) == 1, "no completed session in history")
     need(session_notes[0].get("run_choices") == [
-        {key: r[key] for key in ("run_id", "stage", "danger", "oath_points", "kept", "keep_skipped")
+        {key: r[key] for key in ("run_id", "stage", "danger", "oath_points",
+                                 "kept", "keep_skipped", "falls_by_mechanic")
          if key in r and (key not in ("kept", "keep_skipped") or r[key])} for r in rows
-    ], "history did not retain the location, difficulty and oath points of each run")
+    ], "history did not retain the location, difficulty, oath points and fall counts of each run")
 
 
 def _unlocked_locations(run: Run) -> list[dict]:
@@ -215,14 +216,14 @@ def location_rotation(run: Run, driven: Driven, status: dict, count: int) -> Non
     need((game.get("stage"), game.get("danger")) == expected[-1], "the game ended at the wrong location or difficulty")
 
 
-def hell_rotation(run: Run, driven: Driven, status: dict) -> None:
+def hell_rotation(run: Run, driven: Driven, status: dict, *, stage: str | None = None) -> None:
     _exit(driven)
     _done(status)
     totals = status["totals"]
     need(totals["started"] == totals["runs"] == 1, "expected one completed run")
     rows = _journal(run.artifact("journal.jsonl"))
     need(len(rows) == 1 and rows[0].get("run_id") == f"{run.session}-r1", "expected one run in the journal")
-    first = _unlocked_locations(run)[0]["id"]
+    first = stage if stage is not None else _unlocked_locations(run)[0]["id"]
     for result in (status.get("last") or {}, rows[0]):
         need((result.get("stage"), result.get("danger")) == (first, 30), "wrong location or difficulty")
         need(result.get("oath_points") == 37, "wrong oath points")
@@ -295,6 +296,28 @@ def valkyrie_drill(run: Run, driven: Driven, status: dict, *, count: int) -> Non
     need(not failures, f"Caída de Valhalla hit or killed the hero: {failures}")
     need(len(waves) >= 10 and all(marks == "6" for _, marks, *_ in waves),
          "expected ten complete six-mark Caída de Valhalla waves")
+
+
+def mvp_mechanics(run: Run, driven: Driven, status: dict, *, trials: int) -> None:
+    _exit(driven)
+    _done(status)
+    count = 3 * trials
+    need(status["totals"]["runs"] == count, "MVP drill did not finish every trial")
+    log = run.artifact("farmer.log").read_text(encoding="utf-8")
+    rows = re.findall(
+        r"^FARMER \S+ MVP_DRILL run=(\d+) ability=(spears|quake|slam) danger=30 oaths=37 "
+        r"strikes=(\d+) contacts=(\d+) hits=(\d+) died=(true|false)$", log, re.MULTILINE,
+    )
+    expected = [ability for ability in ("spears", "quake", "slam") for _ in range(trials)]
+    need([int(row[0]) for row in rows] == list(range(1, count + 1))
+         and [row[1] for row in rows] == expected, "missing D30/37-oath MVP drill trials")
+    failures = [row for row in rows if row[3:] != ("0", "0", "false")]
+    need(not failures, f"MVP drill mechanic hit or killed the hero: {failures}")
+    need(all(int(row[2]) == (2 if row[1] == "spears" else 1) for row in rows),
+         "MVP drill did not witness every strike")
+    journal = _journal(run.artifact("journal.jsonl"))
+    need(len(journal) == count and all(row.get("falls_by_mechanic") == {} for row in journal),
+         "MVP drill journal has missing or nonzero fall counts")
 
 
 def blocked_portal(run: Run, driven: Driven, status: dict) -> None:

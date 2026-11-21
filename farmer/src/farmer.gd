@@ -38,7 +38,8 @@ const PORTAL_CLEARANCE := 1.4
 const ALTAR_NO_PROGRESS := 5.0 # Allows Baldur's four-second calm window.
 const FIELD_CHARGE_SPEED := 17.0
 const FIELD_CHARGE_DURATION := 0.85
-const FIELD_CHARGE_MARGIN := 0.3
+const HAZARD_MARGIN := 0.3
+const FIELD_SLAM_RADIUS := 3.5
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -126,6 +127,9 @@ var _test_navigation := false
 var _test_nav: Dictionary = {}
 var _test_charge := false
 var _test_charge_enemy: Enemy
+var _test_mvp_mechanics := false
+var _test_mvp_enemy: Enemy
+var _test_mvp_waves: Array[Dictionary] = []
 
 var _potential_script = null
 var _vanilla_input_seen := false
@@ -180,6 +184,7 @@ func _ready() -> void:
 	_test_valkyrie = _test_env("VALKYRIE") == "1"
 	_test_navigation = _test_env("FIELD_NAVIGATION") == "1"
 	_test_charge = _test_env("FIELD_CHARGE") == "1"
+	_test_mvp_mechanics = _test_env("MVP_MECHANICS") == "1"
 	_test_verify_wishlist = _test_env("WISHLIST") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
@@ -356,6 +361,7 @@ func _prepare_run() -> void:
 	run_state["last_run_mvps"] = 0
 	run_state["settle_start"] = 0
 	run_state["died"] = false
+	run_state["falls_by_mechanic"] = {}
 	run_state["kills"] = 0
 	run_state["run_zeny"] = 0
 	run_state["run_mvps"] = 0
@@ -391,6 +397,7 @@ func _prepare_run() -> void:
 	var had_auto_pick := settings.has("endless_auto_pick")
 	var auto_pick = settings.get("endless_auto_pick")
 	world.start_run(active_class)
+	world.player.farmer_fell.connect(_on_player_fell)
 	if had_auto_pick:
 		settings["endless_auto_pick"] = auto_pick
 	else:
@@ -399,6 +406,8 @@ func _prepare_run() -> void:
 		world.karma.path = "light"
 	active_oath_points = int(world.oath_points())
 	_test_raid_ability = {}
+	_test_mvp_enemy = null
+	_test_mvp_waves.clear()
 	_replace_player_input()
 	_apply_autopilot()
 	Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
@@ -437,6 +446,12 @@ func _tick_run(now: int) -> void:
 	if _test_valkyrie:
 		if world.running:
 			_test_tick_valkyrie()
+		if not world.running:
+			_begin_settle(now)
+		return
+	if _test_mvp_mechanics:
+		if world.running:
+			_test_tick_mvp_mechanics()
 		if not world.running:
 			_begin_settle(now)
 		return
@@ -633,6 +648,19 @@ func _end_run_safe(victory: bool) -> void:
 	_set_autopilot_flags(false)
 
 
+func _on_player_fell(cause: Dictionary, piercing: bool, revives_left: int) -> void:
+	if phase != "run":
+		return
+	var by := str(cause.get("by", ""))
+	var what := str(cause.get("what", ""))
+	if what.is_empty():
+		what = "unknown"
+	var counts: Dictionary = run_state["falls_by_mechanic"]
+	counts[what] = int(counts.get(what, 0)) + 1
+	_log("PLAYER_FELL t=%.1f by=%s what=%s piercing=%s revives_left=%d" % [
+		float(world.time), by if not by.is_empty() else "unknown", what, str(piercing), revives_left])
+
+
 func _begin_settle(now: int) -> void:
 	if int(run_state.get("settle_start", 0)) == 0:
 		run_state["settle_start"] = now
@@ -646,6 +674,8 @@ func _begin_settle(now: int) -> void:
 		var finale_won := Save.stat("morroc_finale") > float(run_state["morroc_finale_before"])
 		if _test_valkyrie and not _test_raid_ability.is_empty():
 			_test_log_valkyrie(died)
+		if _test_mvp_mechanics and not _test_raid_ability.is_empty():
+			_test_log_mvp_mechanic(died)
 		if _test_charge and is_instance_valid(_test_charge_enemy):
 			_log("FIELD_CHARGE run=%d contacts=%d falls=%d died=%s" % [
 				runs_started, int(_test_charge_enemy.brain._dash_hit.has(p)), p.falls, str(died)])
@@ -929,84 +959,206 @@ func steer(hero) -> Vector2:
 		return Vector2.ZERO
 	if get_tree().paused:
 		return Vector2.ZERO
-	var raid = world.raid
-	if cfg["karma_route"] == "valhalla" and raid.mvp == "reginleif" and raid.state == "fight":
-		for attack in raid._objects:
-			if attack.kind == "starfall":
-				return _kite_starfall(hero, raid)
+	var raid: MvpRaid = world.raid
 	var move := _steer_movement(hero)
-	if raid.state in ["idle", "won"] and not raid.in_arena() and not world.morroc.active():
-		var safe := _avoid_field_charge(hero, move)
+	if raid.state == "fight" and is_instance_valid(raid.boss):
+		return _avoid_raid_hazards(hero, move, raid)
+	if raid.state in ["idle", "won", "portal"] and not raid.in_arena() and not world.morroc.active():
+		var safe := _avoid_field_hazards(hero, move)
 		if safe != move:
 			_field_progress = float(world.clock)
 			return safe
 	return move
 
 
-func _avoid_field_charge(hero: Player, preferred: Vector2) -> Vector2:
+func _avoid_field_hazards(hero: Player, preferred: Vector2) -> Vector2:
 	var at := hero.position
-	var map: RoMap = world.map
 	var look := clampf(hero.move_speed * 0.35, 2.5, 4.0)
 	var threats := PackedVector3Array()
-	# The field brain locks its heading when the tell appears and slides for
-	# 0.85 s. Read that state, not the telegraph mesh or the hero's current aim.
-	var final_tick := 0.05 * GameData.GAME_FAST_SPEED
-	for foe: Enemy in world.enemies_in_radius(at, FIELD_CHARGE_SPEED * (FIELD_CHARGE_DURATION + final_tick) + look + 4.0):
-		if foe.dead or foe.brain == null or foe.brain._state not in ["windup", "dash"]:
+	for foe: Enemy in world.enemies_in_radius(at, 24.0):
+		if foe.dead or foe.brain == null:
 			continue
 		var brain: BossBrain = foe.brain
-		if brain._dash_dir.is_zero_approx() or (brain._state == "dash" and brain._dash_hit.has(hero)):
-			continue
-		var duration := FIELD_CHARGE_DURATION if brain._state == "windup" else maxf(0.0, brain._state_time)
-		var start: Vector3 = foe.position
-		start.y = 0.0
-		var end: Vector3 = start + brain._dash_dir * FIELD_CHARGE_SPEED * (duration + final_tick)
-		var radius: float = foe.radius + 1.0 + FIELD_CHARGE_MARGIN
-		if _charge_clearance(at, start, end, radius) > look:
-			continue
-		threats.append(start)
-		threats.append(end)
-		threats.append(Vector3(radius, 0.0, 0.0))
+		match brain._state:
+			"slam":
+				var reach := clampf(hero.move_speed * 0.65, 4.0, 7.0)
+				for target in brain._targets:
+					if _flat_distance(at, target) < reach + FIELD_SLAM_RADIUS + HAZARD_MARGIN:
+						look = maxf(look, reach)
+						_add_hazard(threats, target, target, FIELD_SLAM_RADIUS)
+			"windup", "dash":
+				if brain._dash_dir.is_zero_approx() or (brain._state == "dash" and brain._dash_hit.has(hero)):
+					continue
+				var duration := FIELD_CHARGE_DURATION if brain._state == "windup" else brain._state_time
+				_add_dash_hazard(threats, at, foe, foe.position, brain._dash_dir, duration, look)
+	return _avoid_hazards(hero, preferred, threats, look)
+
+
+func _avoid_raid_hazards(hero: Player, preferred: Vector2, raid: MvpRaid) -> Vector2:
+	var threats := PackedVector3Array()
+	var at := hero.position
+	var look := clampf(hero.move_speed * 0.70, 4.0, 7.0)
+	var cast: Dictionary = raid._cast
+	if not cast.is_empty():
+		match str(cast.ab.mech):
+			"slam", "rain", "puddles":
+				for target in cast.targets:
+					_add_hazard(threats, target, target, float(cast.ab.size))
+			"charge":
+				_add_dash_hazard(threats, at, raid.boss, cast["from"], cast.dir, FIELD_CHARGE_DURATION, look)
+			"volley":
+				_add_volley_hazards(threats, raid, cast)
+			"spokes":
+				_add_spoke_hazards(threats, cast["from"], cast.base, raid._spoke_count(cast.ab), cast.ab.width, raid.radius)
+	for attack: Dictionary in raid._objects:
+		match str(attack.kind):
+			"volley_wave":
+				_add_volley_hazards(threats, raid, attack)
+			"spoke_wave":
+				_add_spoke_hazards(threats, attack["from"], attack.base, raid._spoke_count(attack.ab), attack.ab.width, raid.radius)
+			"dash":
+				if not attack.hit.has(hero):
+					_add_dash_hazard(threats, at, raid.boss, raid.boss.position, attack.dir, float(attack.t), look)
+			"puddle":
+				_add_hazard(threats, attack.pos, attack.pos, float(attack.ab.size))
+			"leap":
+				if attack.stage in ["air", "lock"]:
+					_add_hazard(threats, attack.at, attack.at, float(attack.ab.size) + 0.3)
+				elif attack.stage == "rifts":
+					_add_spoke_hazards(threats, attack.at, attack.base, attack.ab.rifts, attack.ab.width, raid.radius)
+			"starfall":
+				preferred = _kite_starfall(hero, raid)
+	return _avoid_hazards(hero, preferred, threats, look, raid)
+
+
+func _add_volley_hazards(threats: PackedVector3Array, raid: MvpRaid, wave: Dictionary) -> void:
+	var dir: Vector3 = wave.d
+	var side := Vector3(-dir.z, 0.0, dir.x)
+	for off in wave.lanes:
+		var at := raid.center + side * float(off)
+		_add_hazard(threats, at - dir * raid.radius, at + dir * raid.radius, float(wave.ab.width) * 0.5)
+
+
+func _add_spoke_hazards(threats: PackedVector3Array, from: Vector3, base: float, count: int,
+		width: float, radius: float) -> void:
+	for i in count:
+		var angle := base + TAU * i / float(count)
+		var dir := Vector3(cos(angle), 0.0, sin(angle))
+		_add_hazard(threats, from, from + dir * (radius * 2.2), width * 0.5 + 0.3)
+
+
+func _add_dash_hazard(threats: PackedVector3Array, hero_at: Vector3, foe: Enemy, from: Vector3,
+		dir: Vector3, duration: float, look: float) -> void:
+	from.y = 0.0
+	var final_tick := 0.05 * GameData.GAME_FAST_SPEED
+	var to := from + dir * FIELD_CHARGE_SPEED * (maxf(0.0, duration) + final_tick)
+	var radius := foe.radius + 1.0
+	if _hazard_clearance(hero_at, from, to, radius + HAZARD_MARGIN) <= look:
+		_add_hazard(threats, from, to, radius)
+
+
+func _add_hazard(threats: PackedVector3Array, from: Vector3, to: Vector3, radius: float) -> void:
+	# Every tell is a horizontal segment plus padding; a disc is a zero-length segment.
+	threats.append(Vector3(from.x, 0.0, from.z))
+	threats.append(Vector3(to.x, 0.0, to.z))
+	threats.append(Vector3(radius + HAZARD_MARGIN, 0.0, 0.0))
+
+
+func _avoid_hazards(hero: Player, preferred: Vector2, threats: PackedVector3Array, look: float,
+		raid: MvpRaid = null) -> Vector2:
 	if threats.is_empty():
 		return preferred
+	var at := hero.position
+	var map: RoMap = world.map
 	var intended := Vector3(preferred.x, 0.0, preferred.y) * look
-	var clearance := _charge_path_clearance(at, intended, threats)
-	if clearance >= 0.0:
+	var standing := _hazard_path_clearance(at, Vector3.ZERO, threats)
+	var escaping := standing < 0.0
+	if _hazard_path_clearance(at, intended, threats) >= 0.0 \
+			and (not escaping or (
+				_hazard_path_clearance(at, intended.limit_length(0.75), threats) > standing + 0.25
+				and not _hazard_step_blocked(map, at, at + intended, raid))):
 		return preferred
 	var best := Vector2.ZERO
-	var score := _charge_path_clearance(at, Vector3.ZERO, threats) * 4.0
-	for i in 16:
-		var dir := Vector2.RIGHT.rotated(float(i) * TAU / 16.0)
-		var step := Vector3(dir.x, 0.0, dir.y) * look
-		if _field_line_blocked(map, at, at + step, Vector3.INF):
-			step *= 0.5
-			if _field_line_blocked(map, at, at + step, Vector3.INF):
+	var score := minf(standing, 0.55) * 4.0
+	for i in 24:
+		var dir := Vector2.RIGHT.rotated(float(i) * TAU / 24.0)
+		var progress := 0.0
+		if escaping:
+			progress = _hazard_path_clearance(at, Vector3(dir.x, 0.0, dir.y) * 0.75, threats) - standing
+		for sample in 3:
+			var length := look * (1.0 - 0.35 * sample)
+			var step := Vector3(dir.x, 0.0, dir.y) * length
+			if _hazard_step_blocked(map, at, at + step, raid):
 				continue
-		var gap := _charge_path_clearance(at, step, threats)
-		var candidate := minf(gap, 0.55) * 4.0 + 0.35 * dir.dot(preferred)
-		if candidate > score:
-			score = candidate
-			best = _field_input(hero, at + step)
+			var gap := _hazard_path_clearance(at, step, threats)
+			if standing >= 0.0 and gap < 0.0:
+				continue
+			# Safe endpoints alone can cause alternating moves without getting clear.
+			var candidate := minf(gap, 0.55) * 4.0 + progress * 8.0 + 0.35 * dir.dot(preferred) - 0.025 * length
+			if candidate > score:
+				score = candidate
+				best = _field_input(hero, at + step)
 	return best
 
 
-func _charge_path_clearance(at: Vector3, step: Vector3, threats: PackedVector3Array) -> float:
+func _hazard_step_blocked(map: RoMap, at: Vector3, to: Vector3, raid: MvpRaid) -> bool:
+	if raid != null:
+		if _flat_distance(to, raid.center) > raid.radius \
+				and _flat_distance(to, raid.center) >= _flat_distance(at, raid.center):
+			return true
+		var start := Vector3(at.x, 0.0, at.z)
+		var end := Vector3(to.x, 0.0, to.z)
+		for pillar: Dictionary in raid._pillars:
+			if _hazard_clearance(pillar.pos, start, end, 0.83) < 0.0 and _flat_distance(at, pillar.pos) > 0.83:
+				return true
+	return _field_line_blocked(map, at, to, Vector3.INF)
+
+
+func _hazard_path_clearance(at: Vector3, step: Vector3, threats: PackedVector3Array) -> float:
+	at.y = 0.0
+	var to := at + step
 	var gap := INF
 	for i in range(0, threats.size(), 3):
 		var start := threats[i]
 		var end := threats[i + 1]
 		var radius := threats[i + 2].x
-		var finish := _charge_clearance(at + step, start, end, radius)
-		# Outside the line, do not cross it while moving to another safe point.
-		if _charge_clearance(at, start, end, radius) >= 0.0:
-			finish = minf(finish, _charge_clearance(at + step * 0.5, start, end, radius))
+		var finish := _hazard_clearance(to, start, end, radius)
+		# An escape may start inside a tell, but a safe path must not cross one.
+		var initial := _hazard_clearance(at, start, end, radius)
+		if initial >= 0.0 and step != Vector3.ZERO:
+			finish = minf(finish, initial)
+			finish = minf(finish, minf(_hazard_clearance(start, at, to, radius), _hazard_clearance(end, at, to, radius)))
+			var line := end - start
+			var cross := step.cross(line).y
+			if not is_zero_approx(cross):
+				var across := (start - at).cross(step).y / cross
+				var along := (start - at).cross(line).y / cross
+				if along >= 0.0 and along <= 1.0 and across >= 0.0 and across <= 1.0:
+					finish = -radius
 		gap = minf(gap, finish)
 	return gap
 
 
-func _charge_clearance(point: Vector3, start: Vector3, end: Vector3, radius: float) -> float:
+func _hazard_clearance(point: Vector3, start: Vector3, end: Vector3, radius: float) -> float:
 	point.y = 0.0
-	return point.distance_to(Geometry3D.get_closest_point_to_segment(point, start, end)) - radius
+	var nearest := start if start == end else Geometry3D.get_closest_point_to_segment(point, start, end)
+	return point.distance_to(nearest) - radius
+
+
+func _break_guard_goal(hero: Player, raid: MvpRaid) -> Vector3:
+	var best := Vector3.INF
+	var gap := INF
+	for attack: Dictionary in raid._objects:
+		if attack.kind != "break":
+			continue
+		for guard: Enemy in attack.adds:
+			if not is_instance_valid(guard) or guard.dead:
+				continue
+			var distance := _flat_distance(hero.position, guard.position)
+			if distance < gap:
+				best = guard.position
+				gap = distance
+	return best
 
 
 func _steer_movement(hero) -> Vector2:
@@ -1388,6 +1540,11 @@ func _steer_goal(hero) -> Vector3:
 			if g != Vector3.INF:
 				_raid_goal = true
 				return g
+		if st == "fight":
+			var guard := _break_guard_goal(hero, raid)
+			if guard != Vector3.INF:
+				_raid_goal = true
+				return guard
 	if map_wide:
 		var hold := _altar_hold_goal(hero)
 		if hold != Vector3.INF:
@@ -2940,6 +3097,151 @@ func _test_tick_navigation() -> bool:
 
 
 
+func _test_tick_mvp_mechanics() -> void:
+	if get_tree().paused:
+		return
+	var raid: MvpRaid = world.raid
+	var hero: Player = world.player
+	var trial := (runs_started - 1) % 5
+	var ability := "spears" if runs_started <= 5 else ("quake" if runs_started <= 10 else "slam")
+	if ability == "slam" and not _test_raid_ability.is_empty():
+		if not is_instance_valid(_test_mvp_enemy) or _test_mvp_enemy.dead:
+			_fail_session("field_slam_attacker_missing")
+			return
+		if _test_mvp_enemy.brain._state == "chase":
+			_test_raid_marks = int(_test_mvp_enemy.brain._state_time <= 0.0)
+			for at in _test_mvp_enemy.brain._targets:
+				if _flat_distance(hero.position, at) < FIELD_SLAM_RADIUS:
+					_test_raid_fails = 1
+					break
+			_end_run_safe(false)
+		elif float(world.clock) > _test_raid_end:
+			_fail_session("field_slam_did_not_resolve")
+		return
+	if not _test_raid_ability.is_empty():
+		if ability == "spears" and _test_mvp_waves.size() == 1:
+			for wave: Dictionary in raid._objects:
+				if wave.kind == "volley_wave":
+					_test_mvp_waves.append(wave)
+					break
+		_test_raid_marks = 0
+		for wave: Dictionary in _test_mvp_waves:
+			_test_raid_marks += int(float(wave.t) <= 0.0)
+		if float(raid.stats.time) >= _test_raid_end:
+			_end_run_safe(false)
+		return
+	if ability != "slam":
+		if raid.state == "idle":
+			raid.start_route("reginleif" if ability == "spears" else "orc_lord")
+			return
+		if raid.state != "fight":
+			return
+	if not hero.doom or active_danger != 30 or active_oath_points != 37:
+		_fail_session("invalid_mvp_mechanics_fixture")
+		return
+	_test_raid_marks = 0
+	hero.revives = 0
+	hero._invuln = 0.0
+	hero.hp = minf(hero.hp, hero.max_hp * 0.15)
+	if ability == "slam":
+		_test_start_field_slam(hero, trial)
+		return
+	raid.boss.max_hp *= 100.0
+	raid.boss.hp = raid.boss.max_hp
+	raid.boss.hold = 20.0
+	raid.boss.hit_cd = 20.0
+	for ab: Dictionary in raid.data.abilities:
+		raid._timers[ab.id] = 999.0
+		if ab.id == ability:
+			_test_raid_ability = ab
+	if _test_raid_ability.is_empty():
+		_fail_session("mvp_mechanics_ability_missing")
+		return
+	var dir := Vector3.RIGHT.rotated(Vector3.UP, float(trial) * TAU / 5.0)
+	if ability == "quake" and trial == 0:
+		# The native zero-offset dodge points +Z, into the rim at this start.
+		dir = Vector3(0.0, 0.0, 1.0)
+	var near_rim := raid.center + dir * (raid.radius - 0.4)
+	var at: Vector3 = raid._walkable(near_rim)
+	hero.position = Vector3(at.x, world.map.height_at(at), at.z)
+	_test_raid_hits = _test_mvp_hits()
+	_test_raid_fails = int(raid.stats.fails)
+	_test_raid_end = float(raid.stats.time) + 4.0
+	raid._start(_test_raid_ability)
+	if raid._cast.is_empty():
+		_fail_session("mvp_mechanics_telegraph_missing")
+		return
+	_test_mvp_waves.append(raid._cast)
+	if ability == "spears":
+		_test_place_near_volley_crystal(hero, raid, trial)
+
+
+func _test_place_near_volley_crystal(hero: Player, raid: MvpRaid, trial: int) -> void:
+	# Try the path where the native nearest-lane goal leads through a crystal.
+	# The real cast direction and all native collision checks remain unchanged.
+	var start := hero.position
+	var d: Vector3 = raid._cast.d
+	var side := Vector3(-d.z, 0.0, d.x)
+	for i in raid._pillars.size():
+		var pillar: Dictionary = raid._pillars[(i + trial) % raid._pillars.size()]
+		for sign_index in 2:
+			var dir := side * (1.0 if sign_index == 0 else -1.0)
+			var at: Vector3 = pillar.pos - dir * 0.85
+			if not world.map.is_walkable(at):
+				continue
+			hero.position = Vector3(at.x, world.map.height_at(at), at.z)
+			if (raid.autopilot_goal(hero) - hero.position).dot(dir) > 1.6:
+				return
+	hero.position = start
+
+
+func _test_start_field_slam(hero: Player, trial: int) -> void:
+	var map: RoMap = world.map
+	if map.blocked_in(220, 28, 249, 59) > 0:
+		_fail_session("invalid_field_slam_ground")
+		return
+	var at := map.cell_center(235 + trial, 43)
+	var dir := Vector3.RIGHT.rotated(Vector3.UP, float(trial) * TAU / 5.0)
+	hero.position = Vector3(at.x, map.height_at(at), at.z)
+	world.altars.spawn("loki", at)
+	var foe: Enemy = world.spawn_enemy("fallen_bishop", at - dir * 6.0, true)
+	if not is_instance_valid(foe) or foe.brain == null:
+		_fail_session("missing_field_slam_enemy")
+		return
+	foe._immovable = true
+	foe.max_hp *= 100.0
+	foe.hp = foe.max_hp * (0.45 if trial % 2 == 0 else 1.0)
+	foe.hold = 20.0
+	foe.hit_cd = 20.0
+	for _attempt in 12:
+		# The native starter picks slam or summon when charge is excluded.
+		foe.brain._last = "charge"
+		foe.brain._start_attack(world)
+		if foe.brain._state == "slam":
+			_test_mvp_enemy = foe
+			_test_raid_ability = {"id": "slam"}
+			_test_raid_hits = _test_mvp_hits()
+			_test_raid_fails = 0
+			_test_raid_end = float(world.clock) + 5.0
+			return
+		for add: Enemy in world.enemies.duplicate():
+			if add.summoned:
+				world.banish_enemy(add)
+	_fail_session("missing_field_slam_telegraph")
+
+
+func _test_mvp_hits() -> int:
+	var key := "fallen_bishop" if is_instance_valid(_test_mvp_enemy) else "mechanics:" + str(world.raid.mvp)
+	return int(world.meter_taken.get(key, {}).get("hits", 0))
+
+
+func _test_log_mvp_mechanic(died: bool) -> void:
+	var contacts := _test_raid_fails if is_instance_valid(_test_mvp_enemy) else int(world.raid.stats.fails) - _test_raid_fails
+	_log("MVP_DRILL run=%d ability=%s danger=%d oaths=%d strikes=%d contacts=%d hits=%d died=%s" % [
+		runs_started, _test_raid_ability.id, active_danger, active_oath_points, _test_raid_marks,
+		contacts, _test_mvp_hits() - _test_raid_hits, str(died)])
+
+
 func _test_tick_valkyrie() -> void:
 	var raid = world.raid
 	var hero = world.player
@@ -3136,6 +3438,7 @@ func _build_result() -> Dictionary:
 		"victory": bool(run_state.get("victory", false)),
 		"finale_won": bool(run_state.get("finale_won", false)),
 		"died": bool(run_state.get("died", false)),
+		"falls_by_mechanic": run_state["falls_by_mechanic"],
 		"forced": bool(run_state.get("forced", false)),
 		"force_reason": str(run_state.get("force_reason", "")),
 		"endless": bool(world.endless) if world != null and is_instance_valid(world) else false,

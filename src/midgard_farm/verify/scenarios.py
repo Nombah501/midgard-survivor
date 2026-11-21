@@ -37,6 +37,10 @@ _ROTATION_RUNS = 24  # Patch 0.2.5 has 23 catalog locations; include wraparound.
 _HELL_OATHS = {"tough": 3, "hunt": 3, "kyrie": 3, "elite": 3, "mvp_fury": 2,
                "hellfire": 3, "lex": 2, "curse": 2, "unlucky": 2}
 _VALKYRIE_RUNS = 19  # One of each ability, plus nine more Caída waves.
+_MVP_DRILL_TRIALS = 5
+_HELL_RUN: dict[str, object] = {
+    "class": "thief", "job_paths": {"thief": 0}, "danger": 30, "max_runs": 1, "oaths": _HELL_OATHS,
+}
 # Bounded scenarios inherit the shared one-run config, including speed 10,
 # hard exit and display false. All check exits, evidence and script errors.
 SCENARIOS = {
@@ -88,15 +92,24 @@ SCENARIOS = {
                      drive.direct, judges.stop),
     # Done + terminal metadata, endless victory with an MVP and kills, ENDLESS_DONE.
     "endless": Scenario(360, {"endless": True, "endless_minutes": 1.0, "endless_mvps": 2}, drive.direct, judges.endless),
-    "hell-rotation": Scenario(1800, {
-        "class": "thief", "job_paths": {"thief": 0}, "stage": _ROTATION, "danger": 30, "max_runs": 1,
-        "oaths": _HELL_OATHS,
-    }, drive.direct, judges.hell_rotation, preset="hell-rotation.json"),
+    "hell-rotation": Scenario(1800, _HELL_RUN | {"stage": _ROTATION},
+                              drive.direct, judges.hell_rotation, preset="hell-rotation.json"),
+    **{
+        f"hell-rotation-{stage}": Scenario(
+            1800, _HELL_RUN | {"stage": stage}, drive.direct,
+            partial(judges.hell_rotation, stage=stage), preset="hell-rotation.json",
+        )
+        for stage in ("payon", "orc_dun", "nameless", "turtle")
+    },
     "valkyrie-drill": Scenario(180, {
         "class": "thief", "stage": "prontera", "danger": 30, "oaths": _HELL_OATHS,
         "max_runs": _VALKYRIE_RUNS, "restart_seconds": 0, "endless": False,
     }, partial(drive.direct, FARMER_TEST_VALKYRIE="1"),
        partial(judges.valkyrie_drill, count=_VALKYRIE_RUNS), preset="hell-rotation.json"),
+    "mvp-mechanics-drill": Scenario(240, _HELL_RUN | {
+        "stage": "prontera", "max_runs": 3 * _MVP_DRILL_TRIALS, "restart_seconds": 0, "endless": False,
+    }, partial(drive.direct, FARMER_TEST_MVP_MECHANICS="1"),
+       partial(judges.mvp_mechanics, trials=_MVP_DRILL_TRIALS), preset="hell-rotation.json"),
     "blocked-portal": Scenario(45, {"class": "thief", "danger": 30, "run_minutes": 0.1},
                                partial(drive.direct, FARMER_TEST_BLOCKED_PORTAL="1"), judges.blocked_portal),
     "field-navigation": Scenario(45, {

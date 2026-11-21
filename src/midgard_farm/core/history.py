@@ -95,6 +95,8 @@ def session_summary(os_: Platform, profile: Path, session_id: str,
                 for key in ("kept", "keep_skipped"):
                     if isinstance(items := row.get(key), list) and items:
                         choice[key] = items
+                if isinstance(falls := row.get("falls_by_mechanic"), dict):
+                    choice["falls_by_mechanic"] = falls
                 choices.append(choice)
         runs += 1
         wins += row.get("victory") is True

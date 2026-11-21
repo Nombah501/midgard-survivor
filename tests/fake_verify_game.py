@@ -22,6 +22,7 @@ assert sys.argv[1:] == ([] if cfg["display"] else ["--headless"])
 valkyrie_drill = os.environ.get("FARMER_TEST_VALKYRIE") == "1"
 field_navigation = os.environ.get("FARMER_TEST_FIELD_NAVIGATION") == "1"
 field_charge = os.environ.get("FARMER_TEST_FIELD_CHARGE") == "1"
+mvp_drill = os.environ.get("FARMER_TEST_MVP_MECHANICS") == "1"
 if field_navigation:
     assert cfg["altar_policy"] == "map-wide"
 elif cfg.get("run_minutes") != 50:
@@ -43,7 +44,7 @@ verify_wishlist = os.environ.get("FARMER_TEST_WISHLIST") == "1"
 wishlist_evidence = []
 oath_costs = {"tough": [1, 2, 4], "elite": [2, 4, 6], "hunt": [1, 2, 3], "kyrie": [1, 2, 3],
               "mvp_fury": [2, 4], "hellfire": [1, 2, 3], "lex": [2, 4], "curse": [2, 4], "unlucky": [3, 6]}
-hell_rotation = cfg.get("run_minutes") == 50 and not (valkyrie_drill or field_charge)
+hell_rotation = cfg.get("run_minutes") == 50 and not (valkyrie_drill or field_charge or mvp_drill)
 rotation_offset = 0
 rotation_locations = [
     {"id": "prontera", "name": "Prontera Field", "unlocked": True, "min_difficulty": 1, "max_difficulty": 30},
@@ -229,11 +230,12 @@ def hell_evidence(row):
 def settle(force, *, wait_at_keep=False):
     row = {"session": session, "run_id": run_id, "zeny_gain": 20, "kills": 15, "game_s": 7, "victory": True,
            "endless": cfg.get("endless"), "endless_mvps": 3, "kept": [], "force_reason": force,
-           "forced": os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1" and fault != "unforced-stall"}
+           "forced": os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1" and fault != "unforced-stall",
+           "falls_by_mechanic": {"Golpe aplastante": 1} if fault == "mvp-fall" else {}}
     row.update(stage=location(), danger=difficulty(), oath_points=oath_points())
     if hell_rotation:
         assert cfg["objective"] == "crumbs" and cfg["class"] == "thief" and cfg["job_paths"] == {"thief": 0}
-        assert rotating() and cfg["danger"] == 30
+        assert cfg["danger"] == 30
         assert cfg["endless"] and cfg["endless_minutes"] == cfg["endless_mvps"] == 0
         assert cfg["altar_policy"] == "map-wide" and cfg["karma_route"] == "valhalla"
         hell_evidence(row)
@@ -436,6 +438,16 @@ if valkyrie_drill:
         marks = (5 if fault == "meteor-incomplete" and started == 4 else 6) if ability == "starfall" else 0
         log(f"VALKYRIE_DRILL run={started} ability={ability} danger={difficulty()} oaths={oath_points()} "
             f"marks={marks} contacts={contacts} hits={meteor_hit} died=false cause=")
+        settle("")
+    finish("max_runs")
+if mvp_drill:
+    trials = cfg["max_runs"] // 3
+    for started, ability in enumerate(["spears"] * trials + ["quake"] * trials + ["slam"] * trials, 1):
+        run_id = f"{session}-r{started}"
+        hits = int(fault == "mvp-contact" and started == 1)
+        strikes = 2 if ability == "spears" and fault != "mvp-incomplete" else 1
+        log(f"MVP_DRILL run={started} ability={ability} danger={difficulty()} oaths={oath_points()} "
+            f"strikes={strikes} contacts={hits} hits=0 died=false")
         settle("")
     finish("max_runs")
 settle("" if hell_rotation else "run_timeout")

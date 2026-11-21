@@ -34,6 +34,32 @@ PLAYER_CODE = (
     "func next_job(path: = 0) -> Dictionary:\n"
     "\tvar paths: = GameData.job_paths(class_id)\n"
     "\tvar job: Dictionary = paths[clampi(path, 0, paths.size() - 1)].duplicate()\n"
+    "signal died\n"
+    "func take_damage() -> void :\n"
+    "\tif hp <= 0.0:\n"
+    "\t\tif world.encore.siegfried_save(world, self):\n"
+    "\t\t\treturn\n"
+    "\t\tif effects.has(\"kaizel\"):\n"
+    "\t\t\t_kaizel(world)\n"
+    "\t\t\treturn\n"
+    "\t\tif has_uniq and Uniques.try_ankh(world, self):\n"
+    "\t\t\treturn\n"
+    "\t\tif revives > 0:\n"
+    "\t\t\t_revive(world)\n"
+    "\t\t\treturn\n"
+    "\t\tdied.emit()\n"
+    "func _doom_fall(world: World, from: Enemy, what: String) -> void :\n"
+    "\tif effects.has(\"kaizel\"):\n"
+    "\t\t_kaizel(world)\n"
+    "\t\treturn\n"
+    "\tif has_uniq and Uniques.try_ankh(world, self):\n"
+    "\t\treturn\n"
+    "\tif revives > 0:\n"
+    "\t\t_revive(world)\n"
+    "\t\treturn\n"
+    "\tdied.emit()\n"
+    "func _revive(world: World) -> void :\n"
+    "\trevives -= 1\n"
 )
 
 
@@ -80,6 +106,11 @@ def test_build_uses_patch_then_bridge_then_base_and_records_inputs(farm):
     assert result["res://other"] == "untouched"
     assert "# official" in result[SAVE] and "\t_farmer_tick()" in result[SAVE]
     assert "# base" in result[PLAYER] and 'Save.has_meta("farmer_job_paths")' in result[PLAYER]
+    fall = "farmer_fell.emit(death_by, %s, revives)"
+    for pierce in ("pierce", "true"):
+        assert "_revive(world)\n" + ("\t" * (3 if pierce == "pierce" else 2)) + fall % pierce in result[PLAYER]
+    assert result[PLAYER].count(fall % "pierce") == 5
+    assert result[PLAYER].count(fall % "true") == 4
     assert result[FARMER] == (REPO / "farmer/src/farmer.gd").read_text(encoding="utf-8")
     assert manifest == load(info_path(os_))
     assert (manifest.patch_file, manifest.patch_version, manifest.patch_sha256) == (official.name, "0.2.3", digest(official))
