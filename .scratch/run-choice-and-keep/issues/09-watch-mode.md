@@ -4,11 +4,11 @@
 
 **Blocked by:** 08.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] The switch is on the AFK screen, off by default, remembered, editable when Start is possible; covered by GUI tests.
 - [x] Start carries it into `farmer.cfg` `display`; the launcher runs the game windowed exactly when it is on; presets no longer contain `display` and a preset containing it is refused naming the key; covered by service launch tests.
-- [ ] On Linux the windowed game runs under the supervised session's network isolation (the display socket must stay reachable); a real launch with the switch on shows the game window and completes one run (operator-visible check, or a screenshot from the verify run).
+- [x] On Linux the windowed game runs under the supervised session's network isolation (the display socket must stay reachable); a real launch with the switch on shows the game window and completes one run (operator-visible check, or a screenshot from the verify run). Real `watch-mode` + `one-run` verify on 2026-11-21: PASS, exit 0, 1/1 win.
 - [x] Static checks, mypy (Linux and Windows targets as in `.githooks/pre-push`), the pytest suites pass.
 
 Spec: [`../spec.md`](../spec.md).
