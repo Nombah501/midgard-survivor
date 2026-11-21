@@ -30,7 +30,15 @@ const VICTORY_PULL_MS := 1500
 const KARMA_PORTAL_WAIT_MS := 20000
 const SETTLE_WAIT_MS := 25000
 const DIRECT_STALL_MS := 750
+const FIELD_STALL_S := 0.65
+const FIELD_TURN_RADIUS := 0.19
+const FIELD_OPEN := 3
+const FIELD_NEIGHBORS := [Vector2i.RIGHT, Vector2i.DOWN, Vector2i.LEFT, Vector2i.UP]
+const PORTAL_CLEARANCE := 1.4
 const ALTAR_NO_PROGRESS := 5.0 # Allows Baldur's four-second calm window.
+const FIELD_CHARGE_SPEED := 17.0
+const FIELD_CHARGE_DURATION := 0.85
+const FIELD_CHARGE_MARGIN := 0.3
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -81,7 +89,10 @@ var _altar_seen: Dictionary = {}
 var _altar_channel: Dictionary = {}
 var _altar_fill_peak := 0.0
 var _altar_progress_clock := 0.0
-var _altar_direct := false
+var _altar_routes: Dictionary = {}
+var _altar_route_from := Vector2i(-1, -1)
+var _altar_route_at := Vector3.INF
+var _altar_route_portal := Vector3.INF
 
 var _time_last := -1.0
 var _time_change_ms := 0
@@ -111,6 +122,10 @@ var _test_raid_hits := 0
 var _test_raid_fails := 0
 var _test_raid_end := 0.0
 var _test_raid_marks := 0
+var _test_navigation := false
+var _test_nav: Dictionary = {}
+var _test_charge := false
+var _test_charge_enemy: Enemy
 
 var _potential_script = null
 var _vanilla_input_seen := false
@@ -122,6 +137,20 @@ var _direct_best_dist := INF
 var _direct_grid: AStarGrid2D
 var _direct_path: Array[Vector2i] = []
 var _direct_step := 1
+var _raid_goal := false
+var _field_portal := Vector3.INF
+var _field_map_id := 0
+var _field_path := PackedVector3Array()
+var _field_step := 0
+var _field_tile := Vector2i(-1, -1)
+var _field_path_map_id := 0
+var _field_path_portal := Vector3.INF
+var _field_progress := 0.0
+var _field_best_dist := INF
+var _field_replanned := false
+var _field_failed: Dictionary = {}
+var _field_clearance := PackedByteArray()
+var _field_exit := PackedByteArray()
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -149,6 +178,8 @@ func _ready() -> void:
 	_test_freeze_run_time = _test_env("FREEZE_RUN_TIME") == "1"
 	_test_blocked_portal = _test_env("BLOCKED_PORTAL") == "1"
 	_test_valkyrie = _test_env("VALKYRIE") == "1"
+	_test_navigation = _test_env("FIELD_NAVIGATION") == "1"
+	_test_charge = _test_env("FIELD_CHARGE") == "1"
 	_test_verify_wishlist = _test_env("WISHLIST") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
@@ -342,6 +373,7 @@ func _prepare_run() -> void:
 	_pause_tries = 0
 	_direct_progress_ms = -1
 	_direct_grid = null
+	_field_map_id = 0
 	_set_autopilot_flags(true)
 	world.set_stage(active_stage)
 	world.danger = active_danger
@@ -408,8 +440,16 @@ func _tick_run(now: int) -> void:
 		if not world.running:
 			_begin_settle(now)
 		return
-	if cfg["altar_policy"] == "map-wide":
+	if _test_charge:
+		if world.running:
+			_test_tick_field_charge()
+		if not world.running:
+			_begin_settle(now)
+		return
+	if cfg["altar_policy"] == "map-wide" or not _altar_seen.is_empty():
 		_observe_altars()
+	if _test_navigation and world.running and _test_tick_navigation():
+		return
 	if world.running:
 		_handle_victory(now)
 	if world == null or not is_instance_valid(world):
@@ -606,6 +646,10 @@ func _begin_settle(now: int) -> void:
 		var finale_won := Save.stat("morroc_finale") > float(run_state["morroc_finale_before"])
 		if _test_valkyrie and not _test_raid_ability.is_empty():
 			_test_log_valkyrie(died)
+		if _test_charge and is_instance_valid(_test_charge_enemy):
+			_log("FIELD_CHARGE run=%d contacts=%d falls=%d died=%s" % [
+				runs_started, int(_test_charge_enemy.brain._dash_hit.has(p)), p.falls, str(died)])
+			_test_charge_enemy = null
 		run_state["finale_won"] = finale_won
 		var victory := not bool(run_state["died"]) and not bool(run_state["forced"]) \
 			and (finale_won or bool(run_state["victory"]) or bool(run_state["boss_won"]))
@@ -890,23 +934,114 @@ func steer(hero) -> Vector2:
 		for attack in raid._objects:
 			if attack.kind == "starfall":
 				return _kite_starfall(hero, raid)
-	return _steer_baseline(hero)
+	var move := _steer_movement(hero)
+	if raid.state in ["idle", "won"] and not raid.in_arena() and not world.morroc.active():
+		var safe := _avoid_field_charge(hero, move)
+		if safe != move:
+			_field_progress = float(world.clock)
+			return safe
+	return move
 
 
-func _steer_baseline(hero) -> Vector2:
-	_altar_direct = false
-	var goal: Vector3 = _steer_goal(hero)
-	if goal != Vector3.INF:
-		var at: Vector3 = hero.position
+func _avoid_field_charge(hero: Player, preferred: Vector2) -> Vector2:
+	var at := hero.position
+	var map: RoMap = world.map
+	var look := clampf(hero.move_speed * 0.35, 2.5, 4.0)
+	var threats := PackedVector3Array()
+	# The field brain locks its heading when the tell appears and slides for
+	# 0.85 s. Read that state, not the telegraph mesh or the hero's current aim.
+	var final_tick := 0.05 * GameData.GAME_FAST_SPEED
+	for foe: Enemy in world.enemies_in_radius(at, FIELD_CHARGE_SPEED * (FIELD_CHARGE_DURATION + final_tick) + look + 4.0):
+		if foe.dead or foe.brain == null or foe.brain._state not in ["windup", "dash"]:
+			continue
+		var brain: BossBrain = foe.brain
+		if brain._dash_dir.is_zero_approx() or (brain._state == "dash" and brain._dash_hit.has(hero)):
+			continue
+		var duration := FIELD_CHARGE_DURATION if brain._state == "windup" else maxf(0.0, brain._state_time)
+		var start: Vector3 = foe.position
+		start.y = 0.0
+		var end: Vector3 = start + brain._dash_dir * FIELD_CHARGE_SPEED * (duration + final_tick)
+		var radius: float = foe.radius + 1.0 + FIELD_CHARGE_MARGIN
+		if _charge_clearance(at, start, end, radius) > look:
+			continue
+		threats.append(start)
+		threats.append(end)
+		threats.append(Vector3(radius, 0.0, 0.0))
+	if threats.is_empty():
+		return preferred
+	var intended := Vector3(preferred.x, 0.0, preferred.y) * look
+	var clearance := _charge_path_clearance(at, intended, threats)
+	if clearance >= 0.0:
+		return preferred
+	var best := Vector2.ZERO
+	var score := _charge_path_clearance(at, Vector3.ZERO, threats) * 4.0
+	for i in 16:
+		var dir := Vector2.RIGHT.rotated(float(i) * TAU / 16.0)
+		var step := Vector3(dir.x, 0.0, dir.y) * look
+		if _field_line_blocked(map, at, at + step, Vector3.INF):
+			step *= 0.5
+			if _field_line_blocked(map, at, at + step, Vector3.INF):
+				continue
+		var gap := _charge_path_clearance(at, step, threats)
+		var candidate := minf(gap, 0.55) * 4.0 + 0.35 * dir.dot(preferred)
+		if candidate > score:
+			score = candidate
+			best = _field_input(hero, at + step)
+	return best
+
+
+func _charge_path_clearance(at: Vector3, step: Vector3, threats: PackedVector3Array) -> float:
+	var gap := INF
+	for i in range(0, threats.size(), 3):
+		var start := threats[i]
+		var end := threats[i + 1]
+		var radius := threats[i + 2].x
+		var finish := _charge_clearance(at + step, start, end, radius)
+		# Outside the line, do not cross it while moving to another safe point.
+		if _charge_clearance(at, start, end, radius) >= 0.0:
+			finish = minf(finish, _charge_clearance(at + step * 0.5, start, end, radius))
+		gap = minf(gap, finish)
+	return gap
+
+
+func _charge_clearance(point: Vector3, start: Vector3, end: Vector3, radius: float) -> float:
+	point.y = 0.0
+	return point.distance_to(Geometry3D.get_closest_point_to_segment(point, start, end)) - radius
+
+
+func _steer_movement(hero) -> Vector2:
+	var map: RoMap = world.map
+	var at: Vector3 = hero.position
+	var arena: bool = world.raid.in_arena()
+	if not arena and map.get_instance_id() != _field_map_id:
+		_field_map_id = map.get_instance_id()
+		_field_path.clear()
+		_field_failed.clear()
+		_field_clearance.clear()
+		_field_exit.clear()
+		_altar_routes.clear()
+	_raid_goal = false
+	_field_portal = Vector3.INF
+	var goal := _steer_goal(hero)
+	if _raid_goal:
+		_field_path.clear()
 		var to := goal - at
 		to.y = 0.0
-		if to.length_squared() < 0.45 * 0.45:
-			_direct_progress_ms = -1
-			return Vector2.ZERO
-		if _altar_direct or _direct_goal():
+		if to.length_squared() >= 0.45 * 0.45:
 			return _steer_direct(at, goal, to)
+		_direct_progress_ms = -1
+		return Vector2.ZERO
 	_direct_progress_ms = -1
-	return Bot.steer(world, goal, hero)
+	if goal != Vector3.INF:
+		if _flat_distance(at, goal) < FIELD_TURN_RADIUS:
+			_field_path.clear()
+			return Vector2.ZERO
+		var field_move := _steer_field(hero, map, goal)
+		if not field_move.is_zero_approx():
+			return field_move
+	else:
+		_field_path.clear()
+	return Bot.steer(world, Vector3.INF, hero) if arena else _steer_open_ground(hero, map)
 
 
 func _kite_starfall(hero: Player, raid) -> Vector2:
@@ -921,20 +1056,6 @@ func _kite_starfall(hero: Player, raid) -> Vector2:
 	# Reginleif's crystals sit at 55% radius; orbit beyond them.
 	var turn := clampf((float(raid.radius) * 0.7 - distance) * 0.3, -2.0, 2.0)
 	return (Vector2(-radial.y, radial.x) + radial * turn).normalized()
-
-
-func _direct_goal() -> bool:
-	# Raid mechanics need precise positioning; loot/altars are fine with steering.
-	var raid = world.raid
-	if raid != null and is_instance_valid(raid):
-		var st := str(raid.state)
-		if st == "fight" or st == "portal" or st == "intro":
-			return true
-		if st == "won" and cfg["karma_route"] == "valhalla" and int(run_state.get("valhalla_until", 0)) > 0:
-			return true
-	if world.morroc.active():
-		return true
-	return false
 
 
 func _steer_direct(at: Vector3, goal: Vector3, direct: Vector3) -> Vector2:
@@ -981,6 +1102,114 @@ func _steer_direct(at: Vector3, goal: Vector3, direct: Vector3) -> Vector2:
 	return Vector2(to.x, to.z) / distance * (minf(1.0, distance * 2.0) if detouring else 1.0)
 
 
+func _field_line_blocked(map: RoMap, at: Vector3, goal: Vector3, avoid: Vector3) -> bool:
+	if avoid != Vector3.INF:
+		var start := Vector3(at.x, 0.0, at.z)
+		var end := Vector3(goal.x, 0.0, goal.z)
+		var center := Vector3(avoid.x, 0.0, avoid.z)
+		if Geometry3D.get_closest_point_to_segment(center, start, end).distance_squared_to(center) < PORTAL_CLEARANCE * PORTAL_CLEARANCE:
+			return true
+	return _direct_line_blocked(map, at, goal - at, map.tile_of(at), map.tile_of(goal))
+
+
+func _field_plan(map: RoMap, at: Vector3, goal: Vector3, avoid := Vector3.INF) -> PackedVector3Array:
+	var path := PackedVector3Array()
+	if not map.is_walkable(at) or not map.is_walkable(goal):
+		return path
+	if not _field_line_blocked(map, at, goal, avoid):
+		path.append(goal)
+		return path
+	var cells := _direct_tile_path(map, map.tile_of(at), map.tile_of(goal), avoid)
+	if cells.size() < 2:
+		return path
+	# Keep corners, not each tile. Center the first segment when the actual
+	# sub-tile start cannot see its corner without clipping an inner wall.
+	var first := map.cell_center(cells[0].x, cells[0].y)
+	var last := at
+	for i in range(1, cells.size()):
+		if i < cells.size() - 1 and cells[i] - cells[i - 1] == cells[i + 1] - cells[i]:
+			continue
+		var point := map.cell_center(cells[i].x, cells[i].y)
+		if i == cells.size() - 1 and not _field_line_blocked(map, last, goal, avoid):
+			path.append(goal)
+			return path
+		if _field_line_blocked(map, last, point, avoid):
+			if not path.is_empty() or _field_line_blocked(map, at, first, avoid) \
+					or _field_line_blocked(map, first, point, avoid):
+				return PackedVector3Array()
+			path.append(first)
+		path.append(point)
+		last = point
+	if _field_line_blocked(map, last, goal, avoid):
+		return PackedVector3Array()
+	path.append(goal)
+	return path
+
+
+func _steer_field(hero: Player, map: RoMap, goal: Vector3) -> Vector2:
+	var at := hero.position
+	var tile := map.tile_of(goal)
+	var now := float(world.clock)
+	var map_id := map.get_instance_id()
+	var new_goal := _field_path.is_empty() or tile != _field_tile or map_id != _field_path_map_id \
+			or _field_portal != _field_path_portal
+	var blocked := false
+	var stalled := false
+	if not new_goal:
+		_field_path[_field_path.size() - 1] = goal
+		if _field_step < _field_path.size() - 1 and _flat_distance(at, _field_path[_field_step]) < FIELD_TURN_RADIUS \
+				and not _field_line_blocked(map, at, _field_path[_field_step + 1], _field_portal):
+			_field_step += 1
+			_field_best_dist = INF
+		blocked = _field_line_blocked(map, at, _field_path[_field_step], _field_portal)
+		stalled = now - _field_progress >= FIELD_STALL_S
+	if new_goal or blocked or stalled:
+		if blocked or stalled:
+			# A stalled turn can also mean the next segment changed.
+			_direct_grid = null
+			_altar_routes.clear()
+			_field_clearance.clear()
+		var retry := not new_goal and _field_replanned
+		_field_replanned = not new_goal
+		if retry:
+			_field_path.clear()
+		elif new_goal and at == _altar_route_at and _field_portal == _altar_route_portal and _altar_routes.has(goal):
+			_field_path = _altar_routes[goal]
+		else:
+			_field_path = _field_plan(map, at, goal, _field_portal)
+		_field_step = 0
+		_field_tile = tile
+		_field_path_map_id = map_id
+		_field_path_portal = _field_portal
+		_field_best_dist = INF
+		if _field_path.is_empty():
+			_field_failed[tile] = now + 2.0
+			return Vector2.ZERO
+	var distance := _flat_distance(at, _field_path[_field_step])
+	if distance < _field_best_dist - 0.12:
+		_field_best_dist = distance
+		_field_progress = now
+	# Stay on the centerline at turns even at the game's maximum frame delta.
+	return _field_input(hero, _field_path[_field_step])
+
+
+func _field_input(hero: Player, goal: Vector3) -> Vector2:
+	var to := Vector2(goal.x - hero.position.x, goal.z - hero.position.z)
+	return to / maxf(to.length(), 0.05 * GameData.GAME_FAST_SPEED * maxf(1.0, hero.move_speed))
+
+
+func _field_goal_available(goal: Vector3) -> bool:
+	if goal == Vector3.INF:
+		return false
+	var map: RoMap = world.map
+	var tile := map.tile_of(goal)
+	if _field_failed.has(tile):
+		if float(world.clock) < float(_field_failed[tile]):
+			return false
+		_field_failed.erase(tile)
+	return map.cell_walkable(tile.x, tile.y)
+
+
 func _direct_line_blocked(map: RoMap, at: Vector3, to: Vector3, cell: Vector2i, end: Vector2i) -> bool:
 	# Visit the exact tiles crossed by the flat segment, not a sampled ray.
 	var center := map.cell_center(cell.x, cell.y)
@@ -991,6 +1220,9 @@ func _direct_line_blocked(map: RoMap, at: Vector3, to: Vector3, cell: Vector2i, 
 	var x := (0.5 + (center.x - at.x) * sx) * dx if cell.x != end.x else INF
 	var y := (0.5 - (center.z - at.z) * sy) * dy if cell.y != end.y else INF
 	while cell != end:
+		if is_equal_approx(x, y) and (not map.cell_walkable(cell.x + sx, cell.y) \
+				or not map.cell_walkable(cell.x, cell.y + sy)):
+			return true
 		if x <= y:
 			cell.x += sx
 			x = x + dx if cell.x != end.x else INF
@@ -1002,7 +1234,7 @@ func _direct_line_blocked(map: RoMap, at: Vector3, to: Vector3, cell: Vector2i, 
 	return false
 
 
-func _direct_tile_path(map: RoMap, from: Vector2i, to: Vector2i) -> Array[Vector2i]:
+func _direct_tile_path(map: RoMap, from: Vector2i, to: Vector2i, avoid := Vector3.INF) -> Array[Vector2i]:
 	var bounds := Rect2i(1, 1, map.width - 2, map.height - 2)
 	if not bounds.has_point(from) or not bounds.has_point(to):
 		return []
@@ -1023,7 +1255,115 @@ func _direct_tile_path(map: RoMap, from: Vector2i, to: Vector2i) -> Array[Vector
 					_direct_grid.set_point_solid(Vector2i(x, y))
 	if _direct_grid.is_point_solid(from) or _direct_grid.is_point_solid(to):
 		return []
+	if avoid != Vector3.INF:
+		# Leave room for a cardinal segment between two safe cell centers.
+		var center := map.tile_of(avoid)
+		var masked: Array[Vector2i] = []
+		for y in range(center.y - 2, center.y + 3):
+			for x in range(center.x - 2, center.x + 3):
+				var cell := Vector2i(x, y)
+				if cell != from and cell != to and bounds.has_point(cell) and not _direct_grid.is_point_solid(cell) \
+						and _flat_distance(map.cell_center(x, y), avoid) < PORTAL_CLEARANCE + 0.25:
+					_direct_grid.set_point_solid(cell)
+					masked.append(cell)
+		var path := _direct_grid.get_id_path(from, to)
+		for cell in masked:
+			_direct_grid.set_point_solid(cell, false)
+		return path
 	return _direct_grid.get_id_path(from, to)
+
+func _build_field_clearance(map: RoMap) -> void:
+	var width := map.width
+	var height := map.height
+	var size := width * height
+	_field_clearance.resize(size)
+	_field_exit.resize(size)
+	_field_exit.fill(0)
+	var queue := PackedInt32Array()
+	queue.resize(size)
+	var end := 0
+	for y in height:
+		for x in width:
+			var i := y * width + x
+			var room := 0
+			if map.cell_walkable(x, y):
+				room = 1
+				if x > 1 and y > 1 and x < width - 2 and y < height - 2 \
+						and map.blocked_in(x - 1, y - 1, x + 1, y + 1) == 0:
+					room = 2
+					if x > 2 and y > 2 and x < width - 3 and y < height - 3 \
+							and map.blocked_in(x - 2, y - 2, x + 2, y + 2) == 0:
+						room = FIELD_OPEN
+						queue[end] = i
+						end += 1
+			_field_clearance[i] = room
+	# Flood outward from open cells so even a long cul-de-sac has an exit
+	# direction, not just a local clearance score with a dead-end maximum.
+	var start := 0
+	var offsets := [1, width, -1, -width]
+	while start < end:
+		var i := queue[start]
+		start += 1
+		for dir in offsets.size():
+			var n: int = i + offsets[dir]
+			if _field_clearance[n] == 0 or _field_clearance[n] == FIELD_OPEN or _field_exit[n] != 0:
+				continue
+			_field_exit[n] = (dir + 2) % 4 + 1
+			queue[end] = n
+			end += 1
+
+
+func _steer_open_ground(hero: Player, map: RoMap) -> Vector2:
+	if _field_clearance.is_empty():
+		_build_field_clearance(map)
+	var at := hero.position
+	var cell := map.tile_of(at)
+	if not Rect2i(1, 1, map.width - 2, map.height - 2).has_point(cell):
+		return Bot.steer(world, Vector3.INF, hero)
+	var index := cell.y * map.width + cell.x
+	var exit := _field_exit[index]
+	if exit != 0 and _field_clearance[index] == 1:
+		var next: Vector2i = cell + FIELD_NEIGHBORS[exit - 1]
+		var goal := map.cell_center(next.x, next.y)
+		if not _field_line_blocked(map, at, goal, Vector3.INF):
+			return _field_input(hero, goal)
+		_field_clearance.clear()
+		return Vector2.ZERO
+	var preferred := Bot.steer(world, Vector3.INF, hero)
+	if preferred != Vector2.ZERO and _open_room_ahead(map, at, preferred) == FIELD_OPEN:
+		return preferred
+	var best := Vector2.ZERO
+	var best_score := -INF
+	for i in 16:
+		var dir := Vector2.RIGHT.rotated(float(i) * TAU / 16.0)
+		var room := _open_room_ahead(map, at, dir)
+		if room == 0:
+			continue
+		var score := float(room) + 1.6 * dir.dot(preferred)
+		if score > best_score:
+			best_score = score
+			best = dir
+	if best != Vector2.ZERO:
+		return best
+	# An entirely cramped component might not have a five-by-five opening.
+	for d in FIELD_NEIGHBORS:
+		var next: Vector2i = cell + d
+		if map.cell_walkable(next.x, next.y):
+			var goal := map.cell_center(next.x, next.y)
+			if not _field_line_blocked(map, at, goal, Vector3.INF):
+				return _field_input(hero, goal)
+	return Vector2.ZERO
+
+
+func _open_room_ahead(map: RoMap, at: Vector3, dir: Vector2) -> int:
+	var step := Vector3(dir.x, 0.0, dir.y)
+	var ahead := at + step * 2.5
+	if _field_line_blocked(map, at, ahead, Vector3.INF):
+		return 0
+	var mid := map.tile_of(at + step * 1.25)
+	var end := map.tile_of(ahead)
+	return mini(_field_clearance[mid.y * map.width + mid.x], _field_clearance[end.y * map.width + end.x])
+
 
 
 func _steer_goal(hero) -> Vector3:
@@ -1032,6 +1372,7 @@ func _steer_goal(hero) -> Vector3:
 	if raid != null and is_instance_valid(raid):
 		var st := str(raid.state)
 		if st == "won" and cfg["karma_route"] == "valhalla" and raid._kportal_pos != Vector3.INF:
+			_raid_goal = true
 			if int(run_state.get("valhalla_until", 0)) > 0:
 				return _karma_portal_goal(hero, raid)
 			return hero.position
@@ -1040,10 +1381,12 @@ func _steer_goal(hero) -> Vector3:
 			if baldur == Vector3.INF:
 				baldur = _map_altar_goal(hero, true)
 			if baldur != Vector3.INF:
-				return _avoid_portal(hero.position, baldur, raid.portal_pos)
+				_field_portal = raid.portal_pos
+				return baldur
 		if st == "fight" or st == "portal" or st == "intro" or st == "loading":
 			var g: Vector3 = raid.autopilot_goal(hero)
 			if g != Vector3.INF:
+				_raid_goal = true
 				return g
 	if map_wide:
 		var hold := _altar_hold_goal(hero)
@@ -1051,11 +1394,12 @@ func _steer_goal(hero) -> Vector3:
 			return hold
 	var morroc_goal: Vector3 = world.morroc.autopilot_goal()
 	if morroc_goal != Vector3.INF:
+		_raid_goal = true
 		return morroc_goal
 	var runner = world.runner
 	if runner != null and is_instance_valid(runner) and not bool(runner.dead):
 		var rp: Vector3 = runner.position
-		if Vector2(rp.x - hero.position.x, rp.z - hero.position.z).length() <= 40.0:
+		if _field_goal_available(rp) and (_flat_distance(rp, hero.position) <= 40.0 or _following_field_goal(rp)):
 			return rp
 	if map_wide:
 		var close_pick := _best_pickup(hero, GameData.ALTAR_RADIUS)
@@ -1073,14 +1417,19 @@ func _steer_goal(hero) -> Vector3:
 			return altar
 	if world.quest != null and is_instance_valid(world.quest):
 		var qg: Vector3 = world.quest.autopilot_goal()
-		if qg != Vector3.INF:
+		if _field_goal_available(qg):
 			return qg
 	var hp_ratio := float(hero.hp) / maxf(1.0, float(hero.max_hp))
 	if hp_ratio < 0.25:
 		var away := _retreat_point(hero)
-		if away != Vector3.INF:
+		if _field_goal_available(away):
 			return away
 	return Vector3.INF
+
+func _following_field_goal(goal: Vector3) -> bool:
+	var map: RoMap = world.map
+	return not _field_path.is_empty() and map.get_instance_id() == _field_path_map_id and map.tile_of(goal) == _field_tile
+
 
 
 func _best_pickup(hero, max_dist := INF) -> Vector3:
@@ -1106,7 +1455,9 @@ func _best_pickup(hero, max_dist := INF) -> Vector3:
 			limit = 22.0
 		elif kind == "ore":
 			limit = 14.0
-		if dist > minf(limit, max_dist):
+		if dist > minf(limit, max_dist) and not (max_dist == INF and _following_field_goal(at)):
+			continue
+		if not _field_goal_available(at):
 			continue
 		var score := prio - dist * 2.0
 		if kind == "chest":
@@ -1158,7 +1509,7 @@ func _best_altar(hero) -> Vector3:
 		if not free and taken.size() >= 3:
 			continue
 		var pos: Vector3 = a.get("pos", hero.position)
-		var dist := Vector2(pos.x - hero.position.x, pos.z - hero.position.z).length()
+		var dist := _flat_distance(pos, hero.position)
 		if dist > range_max:
 			continue
 		if world.enemies_in_radius(pos, 5.0).size() > 8:
@@ -1166,10 +1517,13 @@ func _best_altar(hero) -> Vector3:
 		var rank := priority.find(aid)
 		if rank < 0:
 			rank = 1000
-		if rank < best_rank or (rank == best_rank and dist < best_dist):
+		var travel := _altar_travel(hero, pos, pos, Vector3.INF)
+		if travel == INF or not _altar_lasts(hero, a, travel, world.raid.state == "portal"):
+			continue
+		if rank < best_rank or (rank == best_rank and travel < best_dist):
 			best_rank = rank
-			best_dist = dist
-			best = pos
+			best_dist = travel
+			best = hero.position if dist < GameData.ALTAR_RADIUS else pos
 	return best
 
 
@@ -1193,10 +1547,11 @@ func _avoid_portal(start: Vector3, goal: Vector3, normal: Vector3) -> Vector3:
 
 
 func _altar_skip(entry: Dictionary, reason: String) -> void:
-	if reason == "baldur_waits_portal":
-		if entry.has("waited"):
+	if reason == "baldur_waits_portal" or reason == "expires_first" or reason == "unreachable":
+		# Position and speed can change while we pursue another altar.
+		if entry.has(reason):
 			return
-		entry["waited"] = true
+		entry[reason] = true
 	else:
 		if entry.has("skip"):
 			return
@@ -1217,17 +1572,17 @@ func _observe_altars() -> void:
 	# including Baldur, which isn't counted in world.altars.taken.
 	var waiting: Array = world.altars.waiting
 	var hero = world.player
-	for a in waiting:
-		var key: int = a.node.get_instance_id()
-		if _altar_seen.has(key):
-			continue
-		var entry := {"altar": a, "dist": _flat_distance(hero.position, a.pos), "ref": key}
-		_altar_seen[key] = entry
-		var reason := _altar_rejection(str(a.id))
-		if reason != "":
-			_altar_skip(entry, reason)
-		elif a.id == "baldur" and world.raid.state == "idle":
-			_altar_skip(entry, "baldur_waits_portal")
+	if cfg["altar_policy"] == "map-wide":
+		for a in waiting:
+			var key: int = a.node.get_instance_id()
+			if _altar_seen.has(key):
+				continue
+			var entry := _altar_entry(hero, a)
+			var reason := _altar_rejection(str(a.id))
+			if reason != "":
+				_altar_skip(entry, reason)
+			elif a.id == "baldur" and world.raid.state == "idle":
+				_altar_skip(entry, "baldur_waits_portal")
 	for key in _altar_seen.keys():
 		var entry: Dictionary = _altar_seen[key]
 		var a: Dictionary = entry.altar
@@ -1248,9 +1603,13 @@ func _altar_hold_goal(hero, baldur_only := false) -> Vector3:
 			if float(_altar_channel.fill) > _altar_fill_peak:
 				_altar_fill_peak = float(_altar_channel.fill)
 				_altar_progress_clock = float(world.clock)
-			if float(world.clock) - _altar_progress_clock < ALTAR_NO_PROGRESS:
-				return _channel_altar_at(hero, _altar_channel.pos)
-			_altar_skip(_altar_entry(hero, _altar_channel), "channel_interrupted")
+			var pos: Vector3 = _altar_channel.pos
+			var target := _altar_target(hero, pos, world.raid.portal_pos if baldur_only else Vector3.INF)
+			var travel := _altar_travel(hero, pos, target, world.raid.portal_pos if baldur_only else Vector3.INF)
+			if travel != INF and _altar_lasts(hero, _altar_channel, travel, baldur_only):
+				if float(world.clock) - _altar_progress_clock < ALTAR_NO_PROGRESS:
+					return target
+				_altar_skip(_altar_entry(hero, _altar_channel), "channel_interrupted")
 		_altar_channel = {}
 	if not baldur_only:
 		for a in world.altars.waiting:
@@ -1260,13 +1619,12 @@ func _altar_hold_goal(hero, baldur_only := false) -> Vector3:
 				# Proximity alone channels altars, even if they aren't a goal.
 				var away: Vector3 = hero.position - a.pos
 				away.y = 0.0
-				return a.pos + (away.normalized() if away != Vector3.ZERO else Vector3.RIGHT) * (GameData.ALTAR_RADIUS + 1.0)
+				var dir := away.normalized() if away != Vector3.ZERO else Vector3.RIGHT
+				for angle in [0.0, 0.7, -0.7, 1.4, -1.4, PI]:
+					var goal: Vector3 = a.pos + dir.rotated(Vector3.UP, angle) * (GameData.ALTAR_RADIUS + 1.0)
+					if _field_goal_available(goal):
+						return goal
 	return Vector3.INF
-
-
-func _channel_altar_at(hero, pos: Vector3) -> Vector3:
-	_altar_direct = true
-	return hero.position if _flat_distance(hero.position, pos) < GameData.ALTAR_RADIUS else pos
 
 
 func _altar_entry(hero, altar: Dictionary) -> Dictionary:
@@ -1278,52 +1636,112 @@ func _altar_entry(hero, altar: Dictionary) -> Dictionary:
 
 func _map_altar_goal(hero, baldur_only := false) -> Vector3:
 	var priority: Array = cfg["altar_priority"]
-	var map: RoMap = world.map
-	var from := map.tile_of(hero.position)
+	var avoid: Vector3 = world.raid.portal_pos if baldur_only else Vector3.INF
 	var best: Dictionary = {}
+	var best_goal := Vector3.INF
 	var best_rank := priority.size()
 	var best_dist := INF
+	# Altars.waiting is the entire map; "near" in the game only drives visuals.
 	for a in world.altars.waiting:
 		var aid := str(a.id)
 		if (aid == "baldur") != baldur_only or _altar_rejection(aid) != "":
 			continue
-		var rank := priority.find(aid)
-		var pos: Vector3 = a.pos
-		var dist := _flat_distance(hero.position, pos)
-		if rank > best_rank or (rank == best_rank and dist >= best_dist):
-			continue
 		var entry := _altar_entry(hero, a)
 		if entry.has("skip"):
 			continue
-		if dist >= GameData.ALTAR_RADIUS and not entry.get("reachable", false):
-			var tile := map.tile_of(pos)
-			if _direct_line_blocked(map, hero.position, pos - hero.position, from, tile) \
-					and _direct_tile_path(map, from, tile).is_empty():
-				_altar_skip(entry, "unreachable")
-				continue
-			entry["reachable"] = true
-		best = a
-		best_rank = rank
-		best_dist = dist
-	if best.is_empty():
-		return Vector3.INF
-	if best_dist < GameData.ALTAR_RADIUS:
+		var pos: Vector3 = a.pos
+		var target := _altar_target(hero, pos, avoid)
+		var travel := _altar_travel(hero, pos, target, avoid)
+		if travel == INF:
+			_altar_skip(entry, "unreachable")
+			continue
+		if not _altar_lasts(hero, a, travel, baldur_only):
+			continue
+		var rank := priority.find(aid)
+		if rank < best_rank or (rank == best_rank and travel < best_dist):
+			best = a
+			best_goal = target
+			best_rank = rank
+			best_dist = travel
+	if not best.is_empty() and _flat_distance(hero.position, best.pos) < GameData.ALTAR_RADIUS:
 		_altar_channel = best
 		_altar_fill_peak = float(best.fill)
 		_altar_progress_clock = float(world.clock)
-	elif baldur_only and _flat_distance(best.pos, world.raid.portal_pos) < 1.5:
-		var portal: Vector3 = world.raid.portal_pos
-		var away: Vector3 = best.pos - portal
-		away.y = 0.0
-		if away.is_zero_approx():
-			away = Vector3.RIGHT
-		var spot := portal + away.normalized() * 1.5
-		if not map.is_walkable(spot):
-			_altar_skip(_altar_entry(hero, best), "unreachable")
-			return Vector3.INF
-		_altar_direct = true
-		return spot
-	return _channel_altar_at(hero, best.pos)
+	return best_goal
+
+
+func _altar_target(hero: Player, pos: Vector3, portal: Vector3) -> Vector3:
+	if _flat_distance(hero.position, pos) < GameData.ALTAR_RADIUS:
+		return hero.position
+	if portal == Vector3.INF or _flat_distance(pos, portal) >= PORTAL_CLEARANCE + 0.25:
+		return pos
+	var map: RoMap = world.map
+	var tile := map.tile_of(pos)
+	var best := Vector3.INF
+	var distance := INF
+	for y in range(tile.y - 2, tile.y + 3):
+		for x in range(tile.x - 2, tile.x + 3):
+			if not map.cell_walkable(x, y):
+				continue
+			var spot := map.cell_center(x, y)
+			if _flat_distance(spot, pos) >= GameData.ALTAR_RADIUS or _flat_distance(spot, portal) < PORTAL_CLEARANCE + 0.25:
+				continue
+			var d := _flat_distance(spot, hero.position)
+			if d < distance and _field_goal_available(spot):
+				distance = d
+				best = spot
+	return best
+
+
+func _altar_travel(hero: Player, altar: Vector3, goal: Vector3, avoid: Vector3) -> float:
+	var at := hero.position
+	if _flat_distance(at, altar) < GameData.ALTAR_RADIUS:
+		return 0.0
+	if not _field_goal_available(goal):
+		return INF
+	var map: RoMap = world.map
+	var tile := map.tile_of(at)
+	if tile != _altar_route_from or avoid != _altar_route_portal:
+		_altar_routes.clear()
+		_altar_route_from = tile
+		_altar_route_portal = avoid
+	if _following_field_goal(goal) and _field_path_portal == avoid and _field_path[-1] == goal:
+		return _altar_path_distance(at, altar, _field_path, _field_step)
+	if not _altar_routes.has(goal):
+		_altar_routes[goal] = _field_plan(map, at, goal, avoid)
+		_altar_route_at = at
+	return _altar_path_distance(at, altar, _altar_routes[goal], 0)
+
+
+func _altar_path_distance(at: Vector3, altar: Vector3, path: PackedVector3Array, step: int) -> float:
+	var distance := 0.0
+	for i in range(step, path.size()):
+		var goal := path[i]
+		var segment := Vector2(goal.x - at.x, goal.z - at.z)
+		var length := segment.length()
+		if length <= 0.001:
+			continue
+		var delta := Vector2(altar.x - at.x, altar.z - at.z)
+		var projected := segment.dot(delta) / length
+		var chord := GameData.ALTAR_RADIUS * GameData.ALTAR_RADIUS - (delta.length_squared() - projected * projected)
+		if chord > 0.0:
+			var entry := projected - sqrt(chord)
+			if entry >= 0.0 and entry < length:
+				return distance + entry
+		distance += length
+		at = goal
+	return INF
+
+
+func _altar_lasts(hero: Player, altar: Dictionary, distance: float, frozen: bool) -> bool:
+	if frozen:
+		return true
+	var travel := distance / maxf(hero.move_speed, 0.1)
+	var fill := maxf(0.0, float(altar.fill) - 1.5 * travel)
+	if travel + GameData.ALTAR_CHANNEL - fill + 0.1 <= float(altar.life):
+		return true
+	_altar_skip(_altar_entry(hero, altar), "expires_first")
+	return false
 
 
 func _flat_distance(a: Vector3, b: Vector3) -> float:
@@ -2423,6 +2841,103 @@ func _test_tick_blocked_portal() -> bool:
 		_end_run_safe(false)
 		return true
 	return false
+
+func _test_tick_field_charge() -> void:
+	if get_tree().paused:
+		return
+	if is_instance_valid(_test_charge_enemy):
+		if _test_charge_enemy.brain._state == "chase":
+			_end_run_safe(false)
+		return
+	var map: RoMap = world.map
+	var hero: Player = world.player
+	if not hero.doom or active_oath_points != 37 or map.blocked_in(220, 28, 249, 59) > 0:
+		_fail_session("invalid_field_charge_fixture")
+		return
+	var at := map.cell_center(235, 43)
+	var dir := Vector3.RIGHT.rotated(Vector3.UP, float(runs_started - 1) * PI * 0.5)
+	var origin := at - dir * 6.0
+	hero.position = Vector3(at.x, map.height_at(at), at.z)
+	hero.hp = minf(hero.hp, hero.max_hp * 0.15)
+	hero.revives = 0
+	hero._invuln = 0.0
+	# An altar underfoot makes the existing goal hold position through the tell.
+	world.altars.spawn("loki", at)
+	var foe: Enemy = world.spawn_enemy("baphomet", origin, true)
+	if not is_instance_valid(foe) or foe.brain == null:
+		_fail_session("missing_field_charge_enemy")
+		return
+	_test_charge_enemy = foe
+	foe._immovable = true
+	foe.max_hp *= 100.0
+	foe.hp = foe.max_hp
+	# Exclude summon to deterministically select charge via the native starter.
+	foe.brain.kind = "summoner"
+	foe.brain._last = "summon"
+	foe.brain._start_attack(world)
+	if foe.brain._state != "windup":
+		_fail_session("missing_field_charge_windup")
+
+
+func _test_tick_navigation() -> bool:
+	if get_tree().paused:
+		return false
+	var map: RoMap = world.map
+	var hero: Player = world.player
+	var start := map.cell_center(225, 50)
+	var now := float(world.clock)
+	if _test_nav.is_empty():
+		# An open Prontera patch with an added one-tile-wide, 25-tile cul-de-sac.
+		if map.blocked_in(220, 28, 249, 59) > 0:
+			_fail_session("invalid_field_navigation_fixture")
+			return true
+		for y in range(29, 55):
+			map.block_cell(224, y)
+			map.block_cell(226, y)
+		map.block_cell(225, 54)
+		_direct_grid = null
+		_field_map_id = 0
+		hero.position = Vector3(start.x, map.height_at(start), start.z)
+		var bait := map.cell_center(229, 50)
+		world.altars.spawn("freyja", bait)
+		var short: Dictionary = world.altars.waiting.back()
+		# Straight-line ETA fits; the trip around the end of the wall does not.
+		short.life = GameData.ALTAR_CHANNEL + 4.0 / hero.move_speed + 0.5
+		world.altars.spawn("loki", map.cell_center(241, 50))
+		_test_nav = {"stage": "altar", "altar": world.altars.waiting.back(), "until": now + 30.0}
+		_log("FIELD_NAVIGATION seeded")
+		return false
+	if now > float(_test_nav.until):
+		_log("FIELD_NAVIGATION timed_out stage=%s" % str(_test_nav.stage))
+		_end_run_safe(false)
+		return true
+	match str(_test_nav.stage):
+		"altar":
+			var altar: Dictionary = _test_nav.altar
+			if float(altar.fill) >= GameData.ALTAR_CHANNEL:
+				hero.position = Vector3(start.x, map.height_at(start), start.z)
+				world._drop_item(map.cell_center(237, 50), "card", "poring_card")
+				_test_nav = {"stage": "loot", "pickup": world.pickups.back(),
+					"until": now + 24.0, "progress": now, "at": start}
+		"loot":
+			if not world.pickups.has(_test_nav.pickup):
+				_log("FIELD_NAVIGATION collected")
+				hero.position = Vector3(start.x, map.height_at(start), start.z)
+				_test_nav = {"stage": "roam", "until": now + 10.0}
+			elif _flat_distance(hero.position, _test_nav.at) >= 0.25:
+				_test_nav.at = hero.position
+				_test_nav.progress = now
+			elif now - float(_test_nav.progress) > 1.25:
+				_log("FIELD_NAVIGATION stalled")
+				_end_run_safe(false)
+				return true
+		"roam":
+			if map.tile_of(hero.position).y < 28:
+				_log("FIELD_NAVIGATION escaped")
+				_end_run_safe(false)
+				return true
+	return false
+
 
 
 func _test_tick_valkyrie() -> void:

@@ -20,7 +20,11 @@ cfg = json.loads((profile / "farmer.cfg").read_bytes())
 assert cfg["display"] is (os.environ.get("FAKE_VERIFY_WATCH_MODE") == "1")
 assert sys.argv[1:] == ([] if cfg["display"] else ["--headless"])
 valkyrie_drill = os.environ.get("FARMER_TEST_VALKYRIE") == "1"
-if cfg.get("run_minutes") != 50:
+field_navigation = os.environ.get("FARMER_TEST_FIELD_NAVIGATION") == "1"
+field_charge = os.environ.get("FARMER_TEST_FIELD_CHARGE") == "1"
+if field_navigation:
+    assert cfg["altar_policy"] == "map-wide"
+elif cfg.get("run_minutes") != 50:
     assert "altar_policy" not in cfg and "karma_route" not in cfg
 checkpoint_path = profile / "farmer_session.json"
 journal_path = profile / "farmer_runs.jsonl"
@@ -39,7 +43,7 @@ verify_wishlist = os.environ.get("FARMER_TEST_WISHLIST") == "1"
 wishlist_evidence = []
 oath_costs = {"tough": [1, 2, 4], "elite": [2, 4, 6], "hunt": [1, 2, 3], "kyrie": [1, 2, 3],
               "mvp_fury": [2, 4], "hellfire": [1, 2, 3], "lex": [2, 4], "curse": [2, 4], "unlucky": [3, 6]}
-hell_rotation = cfg.get("run_minutes") == 50 and not valkyrie_drill
+hell_rotation = cfg.get("run_minutes") == 50 and not (valkyrie_drill or field_charge)
 rotation_offset = 0
 rotation_locations = [
     {"id": "prontera", "name": "Prontera Field", "unlocked": True, "min_difficulty": 1, "max_difficulty": 30},
@@ -400,6 +404,15 @@ if os.environ.get("FARMER_TEST_BLOCKED_PORTAL") == "1":
     log("BLOCKED_PORTAL seeded")
     if fault != "portal-not-entered":
         log("BLOCKED_PORTAL entered")
+if field_navigation:
+    log("FIELD_NAVIGATION seeded")
+    if fault != "altar-expired-instead":
+        log("ALTAR_SKIP id=freyja reason=expires_first")
+    log("ALTAR_TAKE id=loki from=16.0")
+    if fault != "maze-stall":
+        log("FIELD_NAVIGATION collected")
+    if fault != "pocket-stall":
+        log("FIELD_NAVIGATION escaped")
 if os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1":
     for tries in (1, 2, 3):
         log(f"RUN_STALL clock={tries * 5.0:.1f} t=12.0 tries={tries}")
@@ -407,6 +420,13 @@ if os.environ.get("FARMER_TEST_FLUSH_FAIL") == "1":
     log("FAIL flush_failed")
     status("failed", "flush_failed", 1)
     sys.exit(1)
+if field_charge:
+    for started in range(1, cfg["max_runs"] + 1):
+        run_id = f"{session}-r{started}"
+        contacts = int(fault == "charge-contact" and started == 1)
+        log(f"FIELD_CHARGE run={started} contacts={contacts} falls=0 died=false")
+        settle("")
+    finish("max_runs")
 if valkyrie_drill:
     moves = "spear spears pillars starfall judgment aegis einherjar seals charge scales".split()
     for started, ability in enumerate(moves + ["starfall"] * (cfg["max_runs"] - len(moves)), 1):

@@ -304,6 +304,24 @@ def blocked_portal(run: Run, driven: Driven, status: dict) -> None:
     _marker(run, "BLOCKED_PORTAL entered")
 
 
+def field_navigation(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    for marker in ("FIELD_NAVIGATION seeded", "ALTAR_SKIP id=freyja reason=expires_first",
+                   "ALTAR_TAKE id=loki from=16.0", "FIELD_NAVIGATION collected", "FIELD_NAVIGATION escaped"):
+        _marker(run, marker)
+
+
+def field_charge(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    log = run.artifact("farmer.log").read_text(encoding="utf-8")
+    rows = re.findall(r" FIELD_CHARGE run=(\d+) contacts=(\d+) falls=(\d+) died=(true|false)$",
+                      log, re.MULTILINE)
+    need([row[0] for row in rows] == ["1", "2", "3", "4"], "missing native charge trials")
+    need(all(row[1:] == ("0", "0", "false") for row in rows), f"field charge hit the hero: {rows}")
+
+
 def location_rotation_resume(run: Run, driven: Driven, status: dict) -> None:
     locations = _unlocked_locations(run)
     expected = (("prontera", 1), *((row["id"], row["min_difficulty"]) for row in locations[:2]))

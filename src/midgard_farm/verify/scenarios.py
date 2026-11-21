@@ -99,6 +99,13 @@ SCENARIOS = {
        partial(judges.valkyrie_drill, count=_VALKYRIE_RUNS), preset="hell-rotation.json"),
     "blocked-portal": Scenario(45, {"class": "thief", "danger": 30, "run_minutes": 0.1},
                                partial(drive.direct, FARMER_TEST_BLOCKED_PORTAL="1"), judges.blocked_portal),
+    "field-navigation": Scenario(45, {
+        "class": "thief", "stage": "prontera", "danger": 1, "altar_policy": "map-wide", "run_minutes": 1.5,
+    }, partial(drive.direct, FARMER_TEST_FIELD_NAVIGATION="1"), judges.field_navigation),
+    "field-charge-drill": Scenario(90, {
+        "class": "thief", "job_paths": {"thief": 0}, "stage": "prontera", "danger": 30,
+        "oaths": _HELL_OATHS, "max_runs": 4, "restart_seconds": 0, "endless": False,
+    }, partial(drive.direct, FARMER_TEST_FIELD_CHARGE="1"), judges.field_charge, preset="hell-rotation.json"),
     # Exit 1 + failed terminal status, flush_failed + nonzero status code, FAIL flush_failed.
     "flush-fail": Scenario(180, _SHORT | {"max_minutes": 0.5}, partial(drive.direct, FARMER_TEST_FLUSH_FAIL="1"),
                            partial(judges.failed, reason="flush_failed")),
