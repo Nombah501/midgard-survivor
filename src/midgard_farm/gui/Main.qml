@@ -289,7 +289,7 @@ ApplicationWindow {
                                     function stepLocation(step) {
                                         for (let i = currentIndex + step; i >= 0 && i < count; i += step) {
                                             if (model[i].enabled) {
-                                                shell.backend.selectLocation(model[i].id ?? "")
+                                                shell.backend.selectLocation(i)
                                                 break
                                             }
                                         }
@@ -307,7 +307,7 @@ ApplicationWindow {
                                     }
                                     onActivated: index => {
                                         if (model[index].enabled)
-                                            shell.backend.selectLocation(model[index].id ?? "")
+                                            shell.backend.selectLocation(index)
                                         else
                                             currentIndex = Qt.binding(() => shell.session.location_index)
                                     }

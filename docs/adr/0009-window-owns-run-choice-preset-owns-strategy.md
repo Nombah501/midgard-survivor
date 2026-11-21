@@ -16,3 +16,4 @@ The app spec had a preset carry location and difficulty and the window never edi
 - Character and preset are fixed at Start for the whole session. To change
   either, finish and start a new session. Location, difficulty, oaths, wishlist
   and maintenance switches can also change while paused, for the next run.
+- All locations in turn is a window-owned location choice that cycles through unlocked locations in catalog order at a shared fixed or per-location Automatic difficulty, retaining its position across same-session restarts.

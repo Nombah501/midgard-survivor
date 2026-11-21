@@ -5,11 +5,26 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 from ..platform import Platform
 
 Control = Literal["pause", "resume", "finish", "abort"]
+
+
+class LocationRotation(TypedDict):
+    mode: Literal["rotation"]
+
+
+type LocationChoice = str | LocationRotation | None
+
+
+def _decode_location(value: object) -> LocationChoice:
+    if isinstance(value, dict) and value == {"mode": "rotation"}:
+        return {"mode": "rotation"}
+    if value is None or (isinstance(value, str) and value.strip() and "\0" not in value):
+        return value
+    raise ValueError('settings.location must be a location id, null for Automatic, or {"mode":"rotation"}')
 
 MAINTENANCE_CONFIG_KEYS = {
     "upgrades": ("auto_upgrades", "auto_sage"),
@@ -27,7 +42,7 @@ class Character:
 
 @dataclass(frozen=True)
 class SessionSettings:
-    location: str | None = None
+    location: LocationChoice = None
     difficulty: int | None = None
     oaths: dict[str, int] = field(default_factory=dict)
     wishlist: list[str] = field(default_factory=list)
@@ -43,9 +58,8 @@ class SessionSettings:
             raise ValueError(
                 "settings must be an object with location, difficulty and optional oaths, wishlist and maintenance switches"
             )
-        location, difficulty = value["location"], value["difficulty"]
-        if location is not None and (not isinstance(location, str) or not location.strip() or "\0" in location):
-            raise ValueError("settings.location must be a location id or null for Automatic")
+        location = _decode_location(value["location"])
+        difficulty = value["difficulty"]
         if difficulty is not None and type(difficulty) is not int:
             raise ValueError("settings.difficulty must be an integer or null for Automatic")
         oaths = value.get("oaths", {})

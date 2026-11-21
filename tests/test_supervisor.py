@@ -188,12 +188,14 @@ def plan_game(farm, *steps):
     farm.plan.write_text("\n".join(steps))
 
 
-@pytest.mark.parametrize(("difficulty", "oaths"), [(12, {}), (30, {"tough": 2, "elite": 1})])
-def test_clean_finish_uses_character_and_preset_without_restart(farm, difficulty, oaths):
+@pytest.mark.parametrize(("location", "difficulty", "oaths"), [
+    ("payon", 12, {}), ({"mode": "rotation"}, 30, {"tough": 2, "elite": 1}),
+])
+def test_clean_finish_uses_character_and_preset_without_restart(farm, location, difficulty, oaths):
     plan_game(farm, "clean:max_runs", "crash")
     with farm.service():
         farm.send("start", character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
-                  settings={"location": "payon", "difficulty": difficulty, "oaths": oaths,
+                  settings={"location": location, "difficulty": difficulty, "oaths": oaths,
                             "wishlist": ["sacred_excalibur", "gungnir"],
                             "upgrades": False, "card_fusion": False, "star_smith": True, "storage_cleanup": True})
         outcome, directory = farm.outcome()
@@ -203,7 +205,7 @@ def test_clean_finish_uses_character_and_preset_without_restart(farm, difficulty
     assert farm.notifications() == ["stop"]
     assert farm.plan.with_suffix(".count").read_text() == "1"
     config = json.loads((farm.profile / "farmer.cfg").read_bytes())
-    assert (config["stage"], config["danger"], config["class"], config["oaths"]) == ("payon", difficulty, "archer", oaths)
+    assert (config["stage"], config["danger"], config["class"], config["oaths"]) == (location, difficulty, "archer", oaths)
     assert config["wishlist"] == ["sacred_excalibur", "gungnir"]
     assert config["auto_upgrades"] is config["auto_sage"] is config["auto_fuse"] is False
     assert config["auto_potential"] is config["auto_storage_prune"] is True
@@ -212,8 +214,12 @@ def test_clean_finish_uses_character_and_preset_without_restart(farm, difficulty
     assert json.loads(farm.preset.read_bytes())["speed"] == config["speed"] == 5
 
 
-@pytest.mark.parametrize("settings", [[], {"location": [], "difficulty": 1},
-                                      {"location": None, "difficulty": True}, {"location": None}])
+@pytest.mark.parametrize("settings", [
+    [], {"location": [], "difficulty": 1}, {"location": True, "difficulty": 1},
+    {"location": {}, "difficulty": 1}, {"location": {"mode": "random"}, "difficulty": 1},
+    {"location": {"mode": "rotation", "id": "payon"}, "difficulty": 1},
+    {"location": None, "difficulty": True}, {"location": None},
+])
 def test_malformed_start_and_resume_are_refused(farm, settings):
     with farm.service():
         for command in ("start", "resume"):
@@ -300,7 +306,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
             d["phase"] == "paused" and d["heartbeat"] - paused["heartbeat"] >= 0.9
         ))
         if structured:
-            farm.send("resume", settings={"location": "prontera", "difficulty": 30, "oaths": {"tough": 3},
+            farm.send("resume", settings={"location": {"mode": "rotation"}, "difficulty": 30, "oaths": {"tough": 3},
                                           "wishlist": ["gungnir"], "upgrades": False, "card_fusion": False,
                                           "star_smith": True, "storage_cleanup": True})
         else:
@@ -308,7 +314,7 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
         resumed = farm.status("run")
         config = json.loads((farm.profile / "farmer.cfg").read_bytes())
         assert (config["stage"], config["danger"], config["oaths"]) == (
-            ("prontera", 30, {"tough": 3}) if structured else ("payon", 12, {}))
+            ({"mode": "rotation"}, 30, {"tough": 3}) if structured else ("payon", 12, {}))
         assert config["wishlist"] == (["gungnir"] if structured else [])
         assert config["auto_upgrades"] is config["auto_sage"] is config["auto_fuse"] is (not structured)
         assert config["auto_potential"] is config["auto_storage_prune"] is structured

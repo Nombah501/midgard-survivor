@@ -216,7 +216,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     ]
     farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {"locations": locations}).encode())
     view = model.poll()
-    assert [row["enabled"] for row in view.locations] == [True, True, False, True]
+    assert [row["enabled"] for row in view.locations] == [True, True, False, True, True]
     model.select_location("payon")
     assert model.poll().location_index == 0
     model.select_location("prontera")
@@ -612,7 +612,7 @@ def test_afk_location_picker_skips_locked_locations_on_keyboard(open_dashboard, 
     window = open_dashboard("afkTab")
     location = qml_item(window, "locationPicker")
     difficulty = qml_item(window, "difficultyPicker")
-    wait_until(lambda: location.property("count") == 4)
+    wait_until(lambda: location.property("count") == 5)
     assert location.property("currentText") == "Automatic"
     assert not difficulty.property("enabled")
     click(window, "locationPicker")
@@ -634,6 +634,46 @@ def test_afk_location_picker_skips_locked_locations_on_keyboard(open_dashboard, 
     wait_until(lambda: bool(requested_commands(farm)))
     [start] = requested_commands(farm)
     assert isinstance(start, commands.Start) and start.settings == commands.SessionSettings("orc", 4)
+
+
+def test_window_remembers_and_sends_location_rotation_with_shared_difficulties(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    locations = [
+        {"id": "prontera", "name": "Prontera", "unlocked": True, "min_difficulty": 1, "max_difficulty": 5},
+        {"id": "payon", "name": "Payon Forest", "unlocked": False, "min_difficulty": 6, "max_difficulty": 10},
+        {"id": "rotation", "name": "Orc Village", "unlocked": True, "min_difficulty": 3, "max_difficulty": 7},
+    ]
+    farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {"locations": locations}).encode())
+    farm.state()
+    window = open_dashboard("afkTab")
+    location = qml_item(window, "locationPicker")
+    difficulty = qml_item(window, "difficultyPicker")
+    wait_until(lambda: location.property("count") == 5)
+    click(window, "locationPicker")
+    click(window, "locationOption4")
+    wait_until(lambda: location.property("currentText") == "All locations in turn" and difficulty.property("count") == 4)
+    difficulty.forceActiveFocus()
+    QTest.keyClick(window, Qt.Key.Key_Down)
+    wait_until(lambda: difficulty.property("currentText") == "3")
+    QTest.keyClick(window, Qt.Key.Key_End)
+    wait_until(lambda: difficulty.property("currentText") == "5")
+    click(window, "startButton")
+    wait_until(lambda: len(requested_commands(farm)) == 1)
+    [start] = requested_commands(farm)
+    assert isinstance(start, commands.Start)
+    assert start.payload()["settings"]["location"] == {"mode": "rotation"}
+    assert start.settings.difficulty == 5
+
+    farm.state("active", session_id="afk-fixture", farmer_phase="paused")
+    window = open_dashboard("afkTab")
+    wait_until(lambda: qml_item(window, "locationPicker").property("currentText") == "All locations in turn")
+    assert qml_item(window, "difficultyPicker").property("currentText") == "5"
+    click(window, "pauseButton")
+    wait_until(lambda: len(requested_commands(farm)) == 2)
+    _, resume = requested_commands(farm)
+    assert resume == commands.Resume(start.settings)
 
 
 def oath_catalog(farm):

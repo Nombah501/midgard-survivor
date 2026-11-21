@@ -34,9 +34,34 @@ verify_oaths = os.environ.get("FARMER_TEST_OATHS") == "1"
 verify_wishlist = os.environ.get("FARMER_TEST_WISHLIST") == "1"
 wishlist_evidence = []
 oath_costs = {"tough": [1, 2, 4], "elite": [2, 4, 6], "hunt": [1, 2, 3], "mvp_fury": [2, 4]}
+rotation_offset = 0
+rotation_locations = [
+    {"id": "prontera", "name": "Prontera Field", "unlocked": True, "min_difficulty": 1, "max_difficulty": 30},
+    {"id": "payon", "name": "Payon Forest", "unlocked": False, "min_difficulty": 2, "max_difficulty": 30},
+    {"id": "orc", "name": "Orc Village", "unlocked": True, "min_difficulty": 5, "max_difficulty": 30},
+]
+
+
+def rotating():
+    return cfg.get("stage") == {"mode": "rotation"}
+
+
+def rotation_location():
+    return [rotation_locations[0], rotation_locations[2]][(started - rotation_offset - 1) % 2]
+
+
+def location():
+    return rotation_location()["id"] if rotating() and started > rotation_offset else cfg.get("stage")
+
+
+def publish_rotation_catalog():
+    data = CATALOG | {"locations": rotation_locations, "unlocked_max_difficulty": 30}
+    os_.write_atomic(profile / "farmer_catalog.json", json.dumps(data).encode())
 
 
 def difficulty():
+    if rotating() and cfg.get("danger") == "auto":
+        return rotation_location()["min_difficulty"]
     return 30 if verify_oaths and cfg.get("danger") == "auto" else cfg.get("danger")
 
 
@@ -55,8 +80,9 @@ def status(phase, reason="", code=0, detail=""):
             "pid": os.getpid(), "terminal": phase in ("done", "failed"), "failed": phase == "failed",
             "finish_reason": reason, "exit_code": code, "last_transition": "transition",
             "profile": {"zeny": int(save.read_text())}, "totals": totals(), "last": last}
-    data["target"] = {"stage": cfg.get("stage"), "danger": difficulty(), "class": cfg.get("class"),
+    data["target"] = {"stage": location(), "danger": difficulty(), "class": cfg.get("class"),
                       "oath_points": oath_points() if phase != "failed" else 0}
+    data["game"] = {"stage": location(), "danger": difficulty()}
     if detail:
         data["last_error"] = detail
     if phase == "done" and os.environ.get("FARMER_TEST_PREPARATION") == "1":
@@ -159,11 +185,13 @@ def settle(force, *, wait_at_keep=False):
     row = {"session": session, "run_id": run_id, "zeny_gain": 20, "kills": 15, "game_s": 7, "victory": True,
            "endless": cfg.get("endless"), "endless_mvps": 3, "kept": [], "force_reason": force,
            "forced": os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1" and fault != "unforced-stall"}
-    row.update(stage=cfg.get("stage"), danger=difficulty(), oath_points=oath_points())
+    row.update(stage=location(), danger=difficulty(), oath_points=oath_points())
     if fault == "wrong-oath-journal-points":
         row["oath_points"] = 0
     if fault == "wrong-run-journal-target":
         row["danger"] = 29
+    if fault == "locked-rotation-location" and started == 2:
+        row["stage"] = "payon"
     if fault == "no-victory":
         row["victory"] = False
     if fault == "no-mvp":
@@ -203,6 +231,11 @@ def finish(reason):
 
 
 log(f"BOOT api=3 session={session} zeny={boot_zeny} cfg={json.dumps(cfg)}")
+if rotating():
+    publish_rotation_catalog()
+    if cfg["danger"] == 1:
+        status("failed", "invalid_difficulty", 1, "Difficulty 1 is outside the allowed range for location 'orc'.")
+        sys.exit(1)
 if cfg.get("stage") == "not-a-location":
     status("failed", "invalid_location", 1, "" if fault == "no-choice-diagnostic" else "Location 'not-a-location' is unknown.")
     sys.exit(1)
@@ -285,6 +318,9 @@ if started == 1:
                 action = command()
                 if action == "resume_settings":
                     cfg = json.loads((profile / "farmer.cfg").read_bytes())
+                    if rotating():
+                        rotation_offset = started
+                        publish_rotation_catalog()
                     break
                 if action == "resume":
                     break
@@ -294,6 +330,10 @@ if started == 1:
             status("run")
             time.sleep(0.07)  # Leave time to observe the new run.
             settle("run_timeout")
+            while rotating() and runs < cfg["max_runs"]:
+                started += 1
+                run_id = f"{session}-r{started}"
+                settle("run_timeout")
             finish("max_runs")
         if os.environ.get("FARMER_TEST_WAIT_AT_KEEP") == "1":
             time.sleep(0.07)
@@ -308,6 +348,10 @@ if os.environ.get("FARMER_TEST_FLUSH_FAIL") == "1":
     sys.exit(1)
 settle("run_timeout")
 if verify_wishlist:
+    started += 1
+    run_id = f"{session}-r{started}"
+    settle("run_timeout")
+while rotating() and runs < cfg["max_runs"]:
     started += 1
     run_id = f"{session}-r{started}"
     settle("run_timeout")

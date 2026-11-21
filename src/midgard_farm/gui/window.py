@@ -107,9 +107,11 @@ class _Backend(QObject):
     def selectPreset(self, index: int) -> None:
         self._enqueue(partial(self._model.select_preset, index))
 
-    @Slot(str)
-    def selectLocation(self, location: str) -> None:
-        self._enqueue(partial(self._model.select_location, location or None))
+    @Slot(int)
+    def selectLocation(self, index: int) -> None:
+        if 0 <= index < len(self._view.locations):
+            location = self._view.locations[index]["id"]
+            self._enqueue(partial(self._model.select_location, location))
 
     @Slot(str)
     def selectDifficulty(self, level: str) -> None:

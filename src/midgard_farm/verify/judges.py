@@ -154,7 +154,7 @@ def _journal(path: Path) -> list[dict]:
 
 
 def run_choice(run: Run, driven: Driven, status: dict, expected: tuple[tuple[str, int], ...],
-               oath_points: tuple[int, ...] = ()) -> None:
+               oath_points: tuple[int, ...] = (), *, attempts: tuple[str, ...] = ("finished",)) -> None:
     _exit(driven)
     _done(status)
     target = status.get("target") or {}
@@ -163,6 +163,8 @@ def run_choice(run: Run, driven: Driven, status: dict, expected: tuple[tuple[str
     need([r.get("run_id") for r in rows] == [f"{run.session}-r{i+1}" for i in range(len(expected))],
          "wrong run ids in journal")
     need(tuple((r.get("stage"), r.get("danger")) for r in rows) == expected, "wrong location or difficulty in journal")
+    last = status.get("last") or {}
+    need((last.get("stage"), last.get("danger")) == expected[-1], "wrong location or difficulty in status last run")
     if oath_points:
         need(tuple(r.get("oath_points") for r in rows) == oath_points, "wrong oath points in journal")
         need(target.get("oath_points") == status["last"].get("oath_points") == oath_points[-1],
@@ -173,13 +175,46 @@ def run_choice(run: Run, driven: Driven, status: dict, expected: tuple[tuple[str
         if not any(oath_points):
             need(saved["before"], "this scenario requires a profile with saved oaths to test that they are not inherited")
     outcome = driven.outcome or {}
-    need([a["outcome"] for a in outcome.get("attempts", [])] == ["finished"], "session restarted")
+    need(tuple(a["outcome"] for a in outcome.get("attempts", [])) == attempts, "wrong session attempt outcomes")
     session_notes = [r for r in read_history(run.os) if r.get("session_id") == run.session]
     need(len(session_notes) == 1, "no completed session in history")
     need(session_notes[0].get("run_choices") == [
         {key: r[key] for key in ("run_id", "stage", "danger", "oath_points", "kept", "keep_skipped")
          if key in r and (key not in ("kept", "keep_skipped") or r[key])} for r in rows
     ], "history did not retain the location, difficulty and oath points of each run")
+
+
+def _unlocked_locations(run: Run) -> list[dict]:
+    data = read_catalog(run.os, run.profile)
+    if data is None:
+        raise VerificationFailure("no valid catalog")
+    locations = [row for row in data["locations"] if row["unlocked"]]
+    need(len(locations) >= 2, "this scenario requires at least two unlocked locations")
+    return locations
+
+
+def location_rotation(run: Run, driven: Driven, status: dict, count: int) -> None:
+    locations = _unlocked_locations(run)
+    need(count > len(locations), "scenario did not cover a full rotation")
+    expected = tuple((locations[i % len(locations)]["id"], 30) for i in range(count))
+    run_choice(run, driven, status, expected, (6,) * count, attempts=("failed", "finished"))
+    game = status.get("game") or {}
+    need((game.get("stage"), game.get("danger")) == expected[-1], "the game ended at the wrong location or difficulty")
+
+
+def location_rotation_resume(run: Run, driven: Driven, status: dict) -> None:
+    locations = _unlocked_locations(run)
+    expected = (("prontera", 1), *((row["id"], row["min_difficulty"]) for row in locations[:2]))
+    run_choice(run, driven, status, expected)
+
+
+def invalid_rotation_difficulty(run: Run, driven: Driven, status: dict) -> None:
+    locations = _unlocked_locations(run)
+    need(locations[0]["min_difficulty"] == 1, "difficulty 1 is not valid for the first location")
+    incompatible = next((row["id"] for row in locations[1:] if row["min_difficulty"] > 1), None)
+    if incompatible is None:
+        raise VerificationFailure("this scenario requires an unlocked location with minimum difficulty above 1")
+    invalid_choice(run, driven, status, field="difficulty", selection=f"location '{incompatible}'")
 
 
 def wishlist_keep(run: Run, driven: Driven, status: dict) -> None:

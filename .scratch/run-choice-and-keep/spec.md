@@ -16,7 +16,7 @@ At the end screen every legendary is cashed in for legend coins, because all pre
 
 The farmer treats the character's preparation as read-only. It never changes the loadout, pet, album, distributed stats, rebirth, skill pick order or the potential of worn items, and nothing can make it.
 
-The window gains a run choice like the game's: the operator picks the character, a location (or Automatic), a difficulty (Automatic or a fixed level within the location's range) and, at difficulty 30, a rank for each oath. The window's lists come from a catalog the farmer publishes from the operator's own profile, so they show exactly the locations, ranges, legendaries and oaths this profile has. The window also owns the maintenance switches. A preset becomes only a strategy: objective, speeds, limits and the ceiling Automatic may reach.
+The window gains a run choice like the game's: the operator picks the character, a location (or Automatic or All locations in turn), a difficulty (Automatic or a fixed level valid for the choice) and, at difficulty 30, a rank for each oath. The window's lists come from a catalog the farmer publishes from the operator's own profile, so they show exactly the locations, ranges, legendaries and oaths this profile has. The window also owns the maintenance switches. A preset becomes only a strategy: objective, speeds, limits and the ceiling Automatic may reach.
 
 The operator keeps a wishlist of legendary items. At the end screen the farmer keeps an offered item only if it is on the wishlist and not already owned; everything else is cashed in or sold as now.
 
@@ -53,6 +53,7 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 24. As the operator, I want the run choice fixed when I press Start or Resume, so that every run of a session belongs to one known choice.
 25. As the operator, I want to change the run choice while paused or after Finish, so that I can redirect the farm without restarting the app.
 26. As the operator, I want the AFK screen and history to show the location, difficulty and oath points of each run, so that I can compare what each choice earned.
+49. As the operator, I want All locations in turn to cycle through unlocked locations in catalog order, without starting over after a restart of the same session.
 
 ### Catalog
 27. As the operator, I want the window's lists built from my own profile, so that unlocked locations and ranges are exactly mine.
@@ -85,10 +86,10 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 ## Implementation Decisions
 
 ### Contract between window, service and farmer
-- The Start command carries, besides the preset path and character, the run choice (location id or Automatic, difficulty level or Automatic, oath ranks), the wishlist (item ids) and the four maintenance switches. The service validates the payload's shape like it validates the character today and rejects malformed requests through the existing rejection path.
+- The Start command carries, besides the preset path and character, the run choice (location id, `null` for Automatic, or `{"mode":"rotation"}`; difficulty level or Automatic; oath ranks), the wishlist (item ids) and the four maintenance switches. The service validates the payload's shape like it validates the character today and rejects malformed requests through the existing rejection path.
 - Resume carries location, difficulty, oaths, wishlist and switches, so a choice changed while paused applies from the next run. Character and preset are fixed for the whole AFK session and change only at Start. Pause and Finish keep ADR 0004 semantics.
 - The service builds `farmer.cfg` from the preset's strategy fields plus the request's fields; the preset never supplies location, difficulty, class or oaths (ADR 0009). The existing character selection path is extended, not duplicated.
-- The farmer reads location, difficulty, oaths, wishlist and switches only from `farmer.cfg`. Automatic location keeps today's selection by objective; Automatic difficulty keeps today's adaptive selection under the preset's ceiling.
+- The farmer reads location, difficulty, oaths, wishlist and switches only from `farmer.cfg`. Its `stage` is a location id, an empty string for Automatic, or the same rotation object `{"mode":"rotation"}`. Automatic location keeps today's selection by objective; Automatic difficulty keeps today's adaptive selection under the preset's ceiling.
 - The window persists the last run choice, wishlist and switches in its per-machine state next to the remembered character and preset.
 
 ### Catalog
@@ -96,11 +97,13 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 - The smoke run after a farmer patch rebuild runs on a copy of the operator's profile; the app publishes the catalog it produced as the latest catalog, so a fresh install has one before the first AFK session.
 - The window reads the latest catalog and shows its refresh time. Without a catalog, only Automatic choices are offered and the wishlist editor is disabled.
 - At session start the farmer validates the run choice against the live game: an unknown or locked location, a difficulty outside the location's range, an oath that does not exist or a rank it does not have, or oaths with a difficulty other than 30, ends the session as a failure with a reason naming the field. The supervisor treats it like other preflight-class failures that retrying cannot fix.
+- With All locations in turn, the window offers Automatic and fixed levels in the intersection of every unlocked location's difficulty range. The farmer checks the fixed level against all live unlocked locations, names the first incompatible location in `invalid_difficulty`, and does not retry.
 
 ### Farmer behaviour
 - Maintenance no longer contains loadout, pet, album, stat, rebirth or pick-order writes; that code and its config keys are removed, not disabled. Remaining maintenance: achievements, Kafra and Sage upgrades, fusion of spare card copies, Star Smith restricted to stored items not worn by any character, storage cleanup. Each of the four switchable actions follows its switch.
 - Profile pick order and job path: the farmer reads the profile's pick order and never writes it. The job path still comes from the chosen character because the game's job change reads it per run.
 - The farmer sets the game's one-run oath override before every run and never writes the profile's own oath set. It passes selected ranks only for a fixed difficulty 30; for every other run choice (including Automatic reaching 30), it passes an empty dictionary to prevent inheriting saved oaths.
+- Rotation starts with the first unlocked location in catalog order, wraps after the last and skips locked locations. Automatic difficulty is chosen separately for each location. The checkpoint records the last location started in rotation, so the same session continues with the next one even if the previous run was lost. Resume may switch into or out of rotation; runs outside rotation do not advance its position.
 - Keep: the value-based keep and its switch are removed. An offered item is kept if and only if it is on the wishlist, is not owned (no stored item with the same id), passes the game's keep rules (not permanent, not lent, unique not already held), and either the keep is free (victory or Ymir) or the paid cost fits the zeny limit. Full storage uses the existing room-making rule. Skips are logged with a reason and recorded in the run journal. Everything not kept is settled as today.
 - Status and run journal record, per run, the location, difficulty, oath points and kept items, so the window can display them.
 
@@ -120,6 +123,7 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 - **Farmer seam: `farmer.cfg` → profile after real runs**, through the existing `midgard_farm.verify` scenarios on a sandbox copy of the profile (prior art: the bounded scenarios built from the one-run config plus a scenario override and a judge). New or extended scenarios:
   - Preparation unchanged: loadout, pet, album, stats, rebirth state, pick order and potentials of worn items are identical before and after a run with all switches on and unspent stat points present.
   - Run choice honoured: a fixed location, difficulty and oath selection appear as the run's target and oath points in status and journal; the profile's own oath set is unchanged.
+  - Location rotation: verify consecutive unlocked locations, wraparound, the chosen fixed difficulty and oaths, and continuation after a restart; verify that a fixed difficulty outside any unlocked location's range fails without retry.
   - Wishlist keep: with a wishlist containing an offered item, only that item is added to storage; an owned wishlist item is not kept again; non-wishlist legendaries are cashed in.
   - Invalid choice: a locked location ends the session as a failure with a reason naming the location.
   - Catalog: a game start writes a catalog that lists the profile's unlocked locations, oaths and legendaries.
@@ -131,7 +135,7 @@ Every choice is fixed when the AFK session starts or resumes, and remembered per
 - Any automatic optimisation of loadout, pet, cards, stats, rebirth or pick order, including opt-in switches (ADR 0008).
 - Writing the profile's own oath set.
 - Wishlist conditions beyond the item itself (potential, trait, refine), and keeping non-legendary items by rule.
-- Editing or creating presets from the window; per-run rotation of location, difficulty or character within a session.
+- Editing or creating presets from the window; per-run rotation of difficulty or character within a session.
 - Endless Tower, Hel Tower and Emperium Festival runs, which the farmer does not automate.
 - Changing the run choice in the middle of a running session without Pause or Finish.
 - Syncing choices or wishlists between the two machines.

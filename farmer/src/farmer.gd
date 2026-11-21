@@ -68,6 +68,8 @@ var active_stage := ""
 var active_danger := 1
 var active_oath_points := 0
 var next_arm_hint := ""
+var _rotating := false
+var _last_rotated_stage := ""
 
 var run_state: Dictionary = {}
 var last_run: Dictionary = {}
@@ -266,7 +268,8 @@ func _prepare_run() -> void:
 		return
 	var target := _choose_target()
 	if target.is_empty():
-		_finish("no_target")
+		if not failed:
+			_finish("no_target")
 		return
 	active_stage = str(target.get("stage", ""))
 	active_danger = int(target.get("danger", 1))
@@ -321,6 +324,8 @@ func _prepare_run() -> void:
 	_apply_autopilot()
 	Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
 	runs_started += 1
+	if _rotating:
+		_last_rotated_stage = active_stage
 	phase = "run"
 	_mark_transition("run_start")
 	_log("START #%d class=%s stage=%s danger=%d speed=%.1f" % [
@@ -1463,28 +1468,29 @@ func _auto_prune() -> void:
 
 func _validate_run_choice() -> bool:
 	var location = cfg.get("stage")
-	if not (location is String):
-		_fail_session("invalid_location", true, "Location must be a location id or Automatic.")
-		return false
-	var stage := str(location)
-	if stage != "" and not _stage_ok(stage):
-		var problem := "is locked or unavailable" if GameData.STAGES.has(stage) else "is unknown"
-		_fail_session("invalid_location", true, "Location '%s' %s." % [stage, problem])
-		return false
+	_rotating = (location is Dictionary and location.size() == 1
+		and location.get("mode") is String and location["mode"] == "rotation")
+	if not _rotating:
+		if not (location is String):
+			_fail_session("invalid_location", true, "Location must be a location id, Automatic or All locations in turn.")
+			return false
+		var stage := str(location)
+		if stage != "" and not _stage_ok(stage):
+			var problem := "is locked or unavailable" if GameData.STAGES.has(stage) else "is unknown"
+			_fail_session("invalid_location", true, "Location '%s' %s." % [stage, problem])
+			return false
 	var difficulty = cfg.get("danger")
 	var fixed_difficulty := difficulty is int or difficulty is float
-	if fixed_difficulty:
-		if stage == "":
-			stage = _fallback_stage()
-		var lo := _stage_min_danger(stage)
-		var hi := _stage_max_danger(stage)
-		if float(difficulty) != floorf(float(difficulty)) or difficulty < lo or difficulty > hi:
-			_fail_session("invalid_difficulty", true,
-				"Difficulty %s is outside the allowed integer range %d–%d for location '%s'." % [difficulty, lo, hi, stage])
-			return false
-	elif not (difficulty is String) or difficulty not in ["auto", "max", "best", "stage"]:
+	if not fixed_difficulty and (not (difficulty is String) or difficulty not in ["auto", "max", "best", "stage"]):
 		_fail_session("invalid_difficulty", true, "Difficulty must be an integer or Automatic.")
 		return false
+	if _rotating:
+		if _rotation_stage(difficulty) == "":
+			return false
+	elif fixed_difficulty:
+		var stage := str(location)
+		if not _validate_location_difficulty(difficulty, _fallback_stage() if stage == "" else stage):
+			return false
 	var oaths = cfg["oaths"]
 	if not (oaths is Dictionary):
 		_fail_session("invalid_oath", true, "Oaths must map oath ids to ranks.")
@@ -1504,10 +1510,44 @@ func _validate_run_choice() -> bool:
 	return true
 
 
+func _validate_location_difficulty(difficulty: float, stage: String) -> bool:
+	var bounds: Vector2i = GameData.stage_danger_range(stage, Save.max_danger())
+	if difficulty != floorf(difficulty) or difficulty < bounds.x or difficulty > bounds.y:
+		_fail_session("invalid_difficulty", true,
+			"Difficulty %s is outside the allowed integer range %d–%d for location '%s'." % [difficulty, bounds.x, bounds.y, stage])
+		return false
+	return true
+
+
+func _rotation_stage(difficulty: Variant) -> String:
+	var first := ""
+	var next_stage := ""
+	var after_cursor := not GameData.STAGES.has(_last_rotated_stage)
+	var fixed_difficulty := difficulty is int or difficulty is float
+	for id in GameData.STAGES:
+		var stage := str(id)
+		# The cursor is in catalog order even if that location is no longer unlocked.
+		var is_cursor := stage == _last_rotated_stage
+		if _stage_ok(stage):
+			if fixed_difficulty and not _validate_location_difficulty(difficulty, stage):
+				return ""
+			if first == "":
+				first = stage
+			if after_cursor and next_stage == "":
+				next_stage = stage
+		if is_cursor:
+			after_cursor = true
+	if first == "":
+		_fail_session("invalid_location", true, "No unlocked locations for All locations in turn.")
+	return next_stage if next_stage != "" else first
+
+
 func _choose_target() -> Dictionary:
-	var stage := str(cfg.get("stage", ""))
-	var danger := 0
 	var raw = cfg.get("danger", "auto")
+	var stage := _rotation_stage(raw) if _rotating else str(cfg.get("stage", ""))
+	if _rotating and stage == "":
+		return {}
+	var danger := 0
 	var obj := str(cfg.get("objective", "balanced"))
 	var fixed_difficulty := raw is int or raw is float
 	if stage != "" or fixed_difficulty or obj == "progress" or str(raw) in ["max", "best", "stage"]:
@@ -2028,6 +2068,7 @@ func _write_checkpoint(stage: String, pending: Dictionary = {}) -> bool:
 		"phase": stage,
 		"run_id": str(run_state.get("run_id", "")),
 		"target": {"stage": active_stage, "danger": active_danger, "class": active_class, "oath_points": active_oath_points},
+		"last_rotated_stage": _last_rotated_stage,
 		"totals": _totals(),
 		"pre_run": run_state,
 		"result": pending,
@@ -2075,6 +2116,7 @@ func _restore_checkpoint() -> bool:
 			total_materials[str(k)] = int(mats[k])
 	var target: Dictionary = cp["target"]
 	active_stage = str(target.get("stage", ""))
+	_last_rotated_stage = str(cp.get("last_rotated_stage", ""))
 	active_danger = int(target.get("danger", 1))
 	active_oath_points = int(target.get("oath_points", 0))
 	active_class = str(target.get("class", ""))

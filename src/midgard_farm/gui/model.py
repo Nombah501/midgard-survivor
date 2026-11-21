@@ -158,6 +158,11 @@ def _locations(latest: dict[str, Any] | None) -> list[dict[str, Any]]:
         if sid and name and type(lo) is int and type(hi) is int and 1 <= lo <= hi <= 30:
             options.append({"id": sid, "label": name, "enabled": row.get("unlocked") is True,
                             "min_difficulty": lo, "max_difficulty": hi})
+    if latest is not None:
+        unlocked = [row for row in options[1:] if row["enabled"]]
+        options.append({"id": {"mode": "rotation"}, "label": "All locations in turn", "enabled": True,
+                        "min_difficulty": max((row["min_difficulty"] for row in unlocked), default=1),
+                        "max_difficulty": min((row["max_difficulty"] for row in unlocked), default=0)})
     return options
 
 
@@ -439,7 +444,7 @@ class SessionModel:
         paused = state.farmer_phase == "paused"
         latest = catalog.read_latest(self._os)
         locations = _locations(latest)
-        names = self._stages | {row["id"]: row["label"] for row in locations[1:]}
+        names = self._stages | {row["id"]: row["label"] for row in locations if isinstance(row["id"], str)}
         item_names = _legendary_names(latest)
         self._refresh_history(names, item_names)
         location = self._session_settings.location
@@ -731,7 +736,7 @@ class SessionModel:
             self._preset = self._presets[index]
             self._save_picks()
 
-    def select_location(self, location: str | None) -> None:
+    def select_location(self, location: commands.LocationChoice) -> None:
         view = self.poll()
         selected = next((row for row in view.locations if row["id"] == location and row["enabled"]), None)
         if view.can_pick_run_choice and selected is not None:

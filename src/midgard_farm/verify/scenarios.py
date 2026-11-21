@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..assets import presets_dir
 from ..core import catalog, farmer_patch, patch_info, smoke
-from ..core.commands import SessionSettings
+from ..core.commands import LocationRotation, SessionSettings
 from ..core.supervisor import Policy
 from ..platform import Platform
 from . import drive, judges, soak
@@ -31,6 +31,8 @@ _COMMANDS = _SHORT | {"max_runs": 2}
 _OATH_RUNS = _SHORT | {"max_runs": 2, "danger_ceiling": 30}
 _OATH_TARGETS = (("prontera", 30), ("prontera", 30))
 _resume_settings = partial(SessionSettings, upgrades=False, card_fusion=False)
+_ROTATION: LocationRotation = {"mode": "rotation"}
+_ROTATION_RUNS = 24  # Patch 0.2.5 has 23 catalog locations; include wraparound.
 # Bounded scenarios inherit the shared one-run config, including speed 10,
 # hard exit and display false. All check exits, evidence and script errors.
 SCENARIOS = {
@@ -49,6 +51,13 @@ SCENARIOS = {
     "run-choice-resume": Scenario(180, _SHORT | {"max_runs": 2},
                                   partial(drive.supervised, resume=_resume_settings("prontera", 2)),
                                   partial(judges.run_choice, expected=(("prontera", 1), ("prontera", 2)))),
+    "location-rotation": Scenario(300, _OATH_RUNS | {
+        "stage": _ROTATION, "danger": 30, "oaths": {"tough": 3, "elite": 1}, "max_runs": _ROTATION_RUNS,
+    }, partial(drive.supervised, crash_at="settled", FARMER_TEST_OATHS="1"),
+       partial(judges.location_rotation, count=_ROTATION_RUNS)),
+    "location-rotation-resume": Scenario(180, _SHORT | {"max_runs": 3, "danger_ceiling": 1, "objective": "progress"},
+                                         partial(drive.supervised, resume=_resume_settings(_ROTATION)),
+                                         judges.location_rotation_resume),
     "oaths": Scenario(180, _OATH_RUNS | {"danger": 30, "oaths": {"tough": 3, "elite": 1}},
                       partial(drive.supervised, FARMER_TEST_OATHS="1",
                               resume=_resume_settings("prontera", 30, {"hunt": 2})),
@@ -67,6 +76,8 @@ SCENARIOS = {
                                  partial(judges.invalid_choice, field="location", selection="not-a-location")),
     "invalid-difficulty": Scenario(120, {"danger": 31}, drive.supervised,
                                    partial(judges.invalid_choice, field="difficulty", selection="31")),
+    "invalid-rotation-difficulty": Scenario(120, {"stage": _ROTATION}, drive.supervised,
+                                            judges.invalid_rotation_difficulty),
     # Done + terminal metadata, last run with kills and game time, STOP max_minutes.
     "stop": Scenario(180, {"class": "thief", "max_minutes": 1.0, "stall_seconds": 10.0, "max_runs": 0},
                      drive.direct, judges.stop),

@@ -20,8 +20,9 @@ from test_profile import make_profile
 
 ALL = (
     "one-run", "catalog", "preparation-unchanged", "wishlist-keep", "run-choice", "run-choice-resume",
+    "location-rotation", "location-rotation-resume",
     "oaths", "oaths-disabled", "invalid-oath", "invalid-oath-rank", "invalid-oath-difficulty", "invalid-location",
-    "invalid-difficulty", "stop", "endless", "flush-fail", "crash-run", "crash-settled",
+    "invalid-difficulty", "invalid-rotation-difficulty", "stop", "endless", "flush-fail", "crash-run", "crash-settled",
     "crash-journaled",
     "cmd-finish", "cmd-abort", "cmd-abort-settled", "cmd-pause-resume", "cmd-legacy", "checkpoint-corrupt",
     "supervised-kill-run", "supervised-crash-settled", "run-stall",
@@ -138,6 +139,7 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
     ("wishlist-keep", "duplicate-wishlist-item", "wrong items added to saved storage"),
     ("wishlist-keep", "no-wishlist-cash-in", "legendary offers were not cashed in"),
     ("run-choice", "wrong-run-journal-target", "wrong location or difficulty in journal"),
+    ("location-rotation", "locked-rotation-location", "wrong location or difficulty in journal"),
     ("oaths", "wrong-oath-journal-points", "wrong oath points in journal"),
     ("oaths", "changed-saved-oaths", "saved oath set changed"),
     ("invalid-location", "no-choice-diagnostic", "failure detail did not name the invalid field and value"),
