@@ -98,7 +98,7 @@ jobs:
           pattern: midgard-farm-*
           path: release-assets
           merge-multiple: true
-      - name: Verify and publish all four assets to the private repository
+      - name: Verify and publish all four assets
         working-directory: release-assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -109,7 +109,6 @@ jobs:
           linux="$base-linux-x86_64.tar.gz"
           windows="$base-windows-x86_64.zip"
           sha256sum --check "$linux.sha256" "$windows.sha256"
-          test "$(gh repo view "$GITHUB_REPOSITORY" --json isPrivate --jq .isPrivate)" = true
           test "$PRERELEASE" = true || test "$PRERELEASE" = false
           assets=("$linux" "$linux.sha256" "$windows" "$windows.sha256")
           if flags=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \

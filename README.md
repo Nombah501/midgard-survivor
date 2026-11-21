@@ -2,13 +2,13 @@
 
 ## Install from a release
 
-Download and unpack the private release archive for your OS. Open a normal terminal (no `sudo` or Administrator) in the unpacked `midgard-farm` folder and run setup:
+Download and unpack the release archive for your OS. Open a normal terminal (no `sudo` or Administrator) in the unpacked `midgard-farm` folder and run setup:
 
 | Linux | Windows PowerShell |
 | --- | --- |
 | `./midgard-farm-setup` | `.\midgard-farm-setup.exe` |
 
-Enter a fine-grained GitHub token with **Contents: Read-only** for the private release repository, or press Enter to skip it: the farm works without a token, only app self-update stays off until you rerun setup and enter one. Setup hides what you type (nothing appears; in the classic Windows console paste with a right-click) and stores the token in your app data directory, not in the archive or logs. Rerunning setup reuses the stored token.
+Enter a fine-grained GitHub token with **Contents: Read-only** for the release repository, or press Enter to skip it: the farm works without a token, only app self-update stays off until you rerun setup and enter one. Setup hides what you type (nothing appears; in the classic Windows console paste with a right-click) and stores the token in your app data directory, not in the archive or logs. Rerunning setup reuses the stored token.
 
 Setup installs the app under `versions/<release>/` in `$XDG_DATA_HOME/midgard-farm` (default `~/.local/share/midgard-farm`) or `%LOCALAPPDATA%\MidgardFarm` and prints the installed window's path. It registers a systemd user unit on Linux and a hidden, least-privilege logon task on Windows. Both run the stable launcher in `bin/`, which reads `current` on every start. Only rerunning setup refreshes the launcher; stop the service first if setup needs to replace it.
 
@@ -24,7 +24,7 @@ Open **Maintenance** on the **AFK session** screen to choose Kafra/Sage upgrades
 
 ## App updates
 
-The background service checks the private releases at startup and every 24 hours. It downloads the newest stable release, verifies its SHA-256 sidecar, and waits for the AFK session to reach its terminal outcome and the game to close. The app then switches `current` and restarts the service. If the selected service does not report ready within 60 seconds, an independent watchdog from the previous release restores it and excludes the failed version from future checks.
+The background service checks the releases at startup and every 24 hours. It downloads the newest stable release, verifies its SHA-256 sidecar, and waits for the AFK session to reach its terminal outcome and the game to close. The app then switches `current` and restarts the service. If the selected service does not report ready within 60 seconds, an independent watchdog from the previous release restores it and excludes the failed version from future checks.
 
 If systemd confirms that it refused the first start and the new service never ran, the watchdog restores the previous release without blacklisting the candidate. Windows Task Scheduler errors reported directly at restart are handled the same way. After Windows accepts a restart request, a missing readiness marker still counts as a failed release: the task's last-run result alone does not identify this handoff reliably.
 
