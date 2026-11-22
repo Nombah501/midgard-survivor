@@ -4,14 +4,17 @@ import json
 import math
 import subprocess
 import time
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from .. import assets
 from ..core import _app_releases, app_update, catalog, commands, doctor, game_update
-from ..core.history import night_summary, read_history, read_run_journal, session_timing
+from ..core.history import journal_run_counts, night_summary, read_history, read_run_journal, run_outcome, session_timing
 from ..core.profile import ProfileNotFound, find_profile
 from ..core.state import ServiceState, StateKind, read_state
 from ..core.supervisor import session_log_dir
@@ -273,37 +276,38 @@ def _tower_run_label(stage: object, floor: object) -> str:
     return f"{label} F{floor}" if type(floor) is int and floor >= 0 else label
 
 
-def _run_segment(stage: object, outcome: str, names: dict[str, str]) -> dict[str, str]:
+def _run_number(run_id: object) -> str:
+    _, separator, number = _text(run_id).rpartition("-r")
+    return number if separator and number.isascii() and number.isdecimal() else ""
+
+
+def _run_segment(stage: object, outcome: str, names: dict[str, str], number: str) -> dict[str, str]:
     key = _text(stage)
     label = names.get(key, "").strip() or _label(key).strip() or "Unknown location"
     words = label.split()
     short = words[0] + (" " + "".join(word[0] + "." for word in words[1:]) if len(words) > 1 else "")
-    return {"label": label, "short": short, "outcome": outcome}
+    return {"label": label, "short": short, "outcome": outcome, "number": number}
 
 
 def _settled_band(rows: list[dict[str, Any]], names: dict[str, str]) -> list[dict[str, str]]:
     band = []
     for row in rows:
         stage = row.get("stage")
+        number = _run_number(row.get("run_id"))
+        outcome = run_outcome(row)
         if label := _tower_run_label(stage, row.get("tower_floor_best")):
-            cause = row.get("end_cause")
-            died = cause == "death" or (cause != "finish" and row.get("died") is True)
-            outcome = "loss" if died else "aborted"
-            band.append({"label": label, "short": label, "outcome": outcome})
+            band.append({"label": label, "short": label, "outcome": outcome, "number": number})
         else:
-            band.append(_run_segment(stage, "win" if row.get("finale_won") is True
-                                     else "aborted" if row.get("forced") is True else "loss", names))
+            band.append(_run_segment(stage, outcome, names, number))
     return band
 
 
 def _session_measurements(rows: list[dict[str, Any]], band: list[dict[str, str]],
-                          totals: dict[str, Any]) -> tuple[dict[str, int | float], dict[str, int | float], float]:
+                          totals: dict[str, Any]) -> tuple[dict[str, int | float], dict[str, int | float]]:
     numbers: dict[str, int | float] = {}
     metrics: dict[str, int | float] = {}
     materials: dict[str, int | float] = {}
-    duration = 0.0
     for row in rows:
-        duration += _number(row.get("wall_s")) or 0
         for key, target, label in (("zeny_gain", numbers, "zeny"), ("kills", metrics, "Kills"),
                                    ("cards_gain", metrics, "Cards")):
             if (value := _number(row.get(key))) is not None:
@@ -319,9 +323,8 @@ def _session_measurements(rows: list[dict[str, Any]], band: list[dict[str, str]]
         materials.update({key: value for key, raw in _mapping(totals.get("materials")).items()
                           if (value := _number(raw)) is not None})
     runs = _number(totals.get("runs"))
-    if band and (runs is None or len(band) >= runs):
-        numbers.update(runs=len(band), wins=sum(mark["outcome"] == "win" for mark in band),
-                       losses=sum(mark["outcome"] == "loss" for mark in band))
+    if counts := journal_run_counts(totals, Counter(mark["outcome"] for mark in band)):
+        numbers.update(counts)
     elif runs is not None:
         numbers["runs"] = runs
         if (wins := _number(totals.get("wins"))) is not None:
@@ -333,7 +336,7 @@ def _session_measurements(rows: list[dict[str, Any]], band: list[dict[str, str]]
     metrics.update({key.replace("_", " ").title(): materials[key] for key in sorted(materials) if materials[key]})
     if cards is not None:
         metrics["Cards"] = cards
-    return numbers, metrics, duration
+    return numbers, metrics
 
 
 @dataclass(frozen=True)
@@ -432,6 +435,19 @@ def _night_view(rows: list[dict[str, Any]], today: date, active: dict[str, Any] 
     ])
 
 
+def _history_report_rows(rows: list[dict[str, Any]], journal: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    reported = []
+    for row in rows:
+        runs = journal.get(_text(row.get("session_id"))) if row["kind"] == "session" else None
+        if runs:
+            totals = _mapping(row.get("totals"))
+            # Older sessions persisted the farmer's victory counters. Prefer the journal without rewriting history.
+            if counts := journal_run_counts(totals, Counter(map(run_outcome, runs))):
+                row = row | {"totals": totals | counts}
+        reported.append(row)
+    return reported
+
+
 def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names: dict[str, str],
                   journal: dict[str, list[dict[str, Any]]], today: date) -> HistoryView:
     entries: list[HistoryRow] = []
@@ -463,8 +479,8 @@ def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names:
                         run = _mapping(value)
                         target = _target_text(run.get("stage"), run.get("danger"), names, run.get("oath_points"))
                         if target:
-                            number = _text(run.get("run_id")).rpartition("-r")[2]
-                            prefix = f"Run {number} · {target}" if number.isdecimal() else target
+                            number = _run_number(run.get("run_id"))
+                            prefix = f"Run {number} · {target}" if number else target
                             choices.append(" · ".join([prefix, *_keep_text(run, item_names)]))
                 entries.append(HistoryRow(date, f"AFK session · {_label(row.get('outcome')) or _DASH}",
                                           " · ".join(summary), session, choices,
@@ -532,7 +548,6 @@ class SessionView:
     session_numbers: dict[str, int | float] = field(default_factory=dict)
     session_metrics: dict[str, int | float] = field(default_factory=dict)
     session_duration: int = 0
-    current_number: int = 0
     last_event: str = ""
     session_id: str = ""
     active: bool = False
@@ -612,6 +627,7 @@ class SessionModel:
         self._app_check_feedback = ""
         self._rollback_request: Path | None = None
         self._history_rows: list[dict[str, Any]] = []
+        self._history_reports: list[dict[str, Any]] = []
         self._history = HistoryView()
         self._history_date: date | None = None
         self._history_stage_names: dict[str, str] = {}
@@ -713,26 +729,25 @@ class SessionModel:
         rates = _mapping(status.get("rates"))
         materials = f"{_format_number(rates.get('ore_h'), 1)} / {_format_number(rates.get('crumbs_h'), 1)}"
         totals = _mapping(status.get("totals"))
-        run, detail = self._run_text(status, totals, names)
+        run_id = _text(status.get("run_id"))
+        started = _number(totals.get("started"))
+        current_number = _run_number(run_id) or (f"{started:.0f}" if started else "")
+        run, detail = self._run_text(status, current_number, names)
         history = self._history
         journal_id = (state.session_id or "") if busy else (history.latest_session_id or self._last_journal_session)
         journal = self._journal.get(journal_id, [])
         band = _settled_band(journal, names)
-        numbers, metrics, duration = _session_measurements(journal, band, totals)
+        numbers, metrics = _session_measurements(journal, band, totals)
+        duration = 0
         started_at = _number(saved.get("started_at"))
         if busy and state.session_id and saved.get("id") == state.session_id and started_at is not None and started_at <= now:
-            settled = {key: numbers.get(key, 0) for key in ("zeny", "wins", "runs")}
-            if (_number(totals.get("runs")) or 0) >= len(journal):
-                settled.update({key: value for key in settled if (value := _number(totals.get(key))) is not None})
-            active = {"session_id": state.session_id, "started_at": started_at,
-                      "timestamp": now, "totals": settled}
-            history = replace(history, night=_night_view(self._history_rows, today, active))
-        current_number = 0
-        run_id = _text(status.get("run_id"))
+            duration = int(now - started_at)
+            active = {"session_id": state.session_id, "started_at": started_at, "timestamp": now,
+                      "totals": {key: numbers.get(key, 0) for key in ("zeny", "wins", "runs")}}
+            history = replace(history, night=_night_view(self._history_reports, today, active))
         if status.get("phase") in _RUN_PHASES and not (run_id and any(row.get("run_id") == run_id for row in journal)):
             stage = _mapping(status.get("target")).get("stage") or _mapping(status.get("game")).get("stage")
-            band.append(_run_segment(stage, "current", names))
-            current_number = int(_number(totals.get("started")) or len(band))
+            band.append(_run_segment(stage, "current", names, current_number))
         last_event = ""
         if journal:
             last = journal[-1]
@@ -757,12 +772,11 @@ class SessionModel:
             phase=phase, heartbeat_age=_heartbeat_age(state.last_heartbeat),
             zeny=_format_number(rates.get("zeny_h")), materials=materials if rates else _DASH,
             kills=_format_number(rates.get("kills_min"), 1), current_run=run, run_detail=detail,
-            run_totals=" · ".join(f"{_format_number(totals.get(key))} {label}"
-                                  for key, label in (("runs", "settled"), ("wins", "wins"), ("lost", "lost")))
-            if totals else _DASH,
+            run_totals=" · ".join(f"{_format_number(value)} {label}" for value, label in
+                                  ((numbers.get("runs"), "settled"), (numbers.get("wins"), "wins"),
+                                   (totals.get("lost"), "lost"))) if numbers else _DASH,
             session_runs=band, session_numbers=numbers, session_metrics=metrics,
-            session_duration=int(_number(status.get("uptime_s")) or duration),
-            current_number=current_number, last_event=last_event,
+            session_duration=duration, last_event=last_event,
             session_id=state.session_id or "", active=busy, paused=paused,
             can_control=can_control, can_pause=can_control and bool(farmer_phase),
             can_resume=can_resume and not choice_blocker,
@@ -799,15 +813,14 @@ class SessionModel:
         status = _object(self._os, profile / "farmer_status.json")
         return status if status.get("session") == state.session_id else {}
 
-    def _run_text(self, status: dict[str, Any], totals: dict[str, Any], names: dict[str, str]) -> tuple[str, str]:
+    def _run_text(self, status: dict[str, Any], run_number: str, names: dict[str, str]) -> tuple[str, str]:
         if status.get("phase") not in _RUN_PHASES or not status.get("run_id"):
             return _DASH, ""
         game = _mapping(status.get("game"))
         target = _mapping(status.get("target"))
         choice = _target_text(target.get("stage") or game.get("stage"), target.get("danger") or game.get("danger"),
                               names, target.get("oath_points"))
-        started = _number(totals.get("started"))
-        parts = [f"Run {started:.0f}" if started else "Run in progress"]
+        parts = [f"Run {run_number}" if run_number else "Run in progress"]
         if choice:
             parts.append(choice)
         detail = []
@@ -908,7 +921,8 @@ class SessionModel:
             self._history_stage_names = names
             self._history_item_names = item_names
             self._history_journal = self._journal
-            self._history = _history_view(rows, names, item_names, self._journal, today)
+            self._history_reports = _history_report_rows(rows, self._journal)
+            self._history = _history_view(self._history_reports, names, item_names, self._journal, today)
             self._history_date = today
             latest = max((row for row in rows if row["kind"] == "game_update" and _update_outcome(row)),
                          key=lambda row: row["timestamp"], default=None)
@@ -1247,26 +1261,31 @@ class SessionModel:
             self._patch_request = command, request
         return request
 
-    def run_diagnostics(self) -> None:
+    def run_diagnostics(self) -> Callable[[], None]:
+        """Run the I/O separately and return the update for the model worker."""
         try:
-            self._checks = doctor.run_checks(self._os)
+            checks = doctor.run_checks(self._os)
         except (OSError, RuntimeError) as exc:
-            self._checks = []
-            self._check_error = f"Could not run the diagnostic checks: {exc}"
-        else:
-            self._check_error = ""
+            return partial(self._publish_checks, [], f"Could not run the diagnostic checks: {exc}")
+        return partial(self._publish_checks, checks, "")
+
+    def _publish_checks(self, checks: list[doctor.Check], error: str) -> None:
+        self._checks, self._check_error = checks, error
+        if not error:
             self._repair_succeeded = False
             if self._repair_request is None:
                 self._repair_feedback = ""
 
-    def repair_farmer_pack(self) -> None:
-        if (not self._farmer_patch_failed() or self._pending_start
-                or self._repair_succeeded or self._repair_request is not None):
-            return
+    def repair_farmer_pack(self) -> Callable[[], None]:
+        """Recheck live eligibility and queue the request outside the model worker."""
         try:
-            self._repair_request = doctor.repair_farmer_pack(self._os)
+            request = doctor.repair_farmer_pack(self._os)
         except (OSError, RuntimeError) as exc:
-            self._repair_feedback = f"Could not request repair: {exc}"
+            return partial(self._publish_repair, None, f"Could not request repair: {exc}")
+        return partial(self._publish_repair, request, "")
+
+    def _publish_repair(self, request: Path | None, feedback: str) -> None:
+        self._repair_request, self._repair_feedback = request, feedback
 
     def check_app_updates(self) -> None:
         if not self.poll().updates.can_check_app:

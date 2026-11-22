@@ -147,6 +147,25 @@ def night_summary(rows: Iterable[dict[str, Any]], today: date,
                         downtime if timed else None, timed < sessions)
 
 
+def run_outcome(row: dict[str, Any]) -> str:
+    """Classify a settled journal row by what the game banked."""
+    if row.get("stage") in ("tower", "hel"):
+        cause = row.get("end_cause")
+        died = cause == "death" or (cause != "finish" and row.get("died") is True)
+        return "loss" if died else "aborted"
+    if row.get("finale_won", row.get("victory")) is True:
+        return "win"
+    return "aborted" if row.get("forced") is True else "loss"
+
+
+def journal_run_counts(totals: dict[str, Any], outcomes: Counter[str]) -> dict[str, int]:
+    """Prefer individual outcomes when the journal covers all known settled runs."""
+    runs = outcomes.total()
+    if not runs or runs < _number(totals.get("runs")):
+        return {}
+    return {"runs": runs, "wins": outcomes["win"], "losses": outcomes["loss"]}
+
+
 _REWARDS = {"zeny": "zeny_gain", "xp": "xp_gain", "kills": "kills", "coins": "coins_gain", "ymir": "ymir_gain"}
 
 
@@ -162,7 +181,8 @@ def session_summary(os_: Platform, profile: Path, session_id: str,
     seen: set[str] = set()
     materials: Counter[str] = Counter()
     rewards: Counter[str] = Counter()
-    runs = wins = cards = 0
+    outcomes: Counter[str] = Counter()
+    cards = 0
     choices: list[dict[str, Any]] = []
     wall_s = 0.0
     for row in rows:
@@ -183,8 +203,7 @@ def session_summary(os_: Platform, profile: Path, session_id: str,
                 if isinstance(falls := row.get("falls_by_mechanic"), dict):
                     choice["falls_by_mechanic"] = falls
                 choices.append(choice)
-        runs += 1
-        wins += row.get("victory") is True
+        outcomes[run_outcome(row)] += 1
         wall_s += _number(row.get("wall_s"))
         cards += int(_number(row.get("cards_gain")))
         for target, source in _REWARDS.items():
@@ -192,15 +211,16 @@ def session_summary(os_: Platform, profile: Path, session_id: str,
         if isinstance(delta := row.get("materials"), dict):
             materials.update({key: int(_number(value)) for key, value in delta.items()})
 
+    runs = outcomes.total()
     if not runs and isinstance(delta := status_totals.get("materials"), dict):
         materials.update({key: int(_number(value)) for key, value in delta.items()})
     # A run may have reached the journal after the last heartbeat, immediately before a crash.
     accounted = _number(status_totals.get("runs")) >= runs
-    tallies = {"runs": runs, "wins": wins, "losses": runs - wins,
+    tallies = {"runs": runs, "wins": outcomes["win"], "losses": outcomes["loss"],
                **{name: rewards[name] for name in _REWARDS}}
     totals = {**{key: _number(status_totals[key]) if accounted and key in status_totals else value
                  for key, value in tallies.items()},
               "started": max(runs, _number(status_totals.get("started"))),
               "lost": _number(status_totals.get("lost")), "wall_s": wall_s, "cards_gain": cards,
-              "materials": dict(materials)}
+              "materials": dict(materials), **journal_run_counts(status_totals, outcomes)}
     return {"totals": totals, "run_choices": choices}

@@ -536,6 +536,16 @@ ApplicationWindow {
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         clip: true
 
+        function keepRunVisible(mark) {
+            const flick = contentItem
+            const top = mark.mapToItem(flick.contentItem, 0, 0).y
+            const bottom = top + mark.height
+            if (top < flick.contentY)
+                flick.contentY = Math.max(0, top - 8)
+            else if (bottom > flick.contentY + flick.height)
+                flick.contentY = Math.min(flick.contentHeight - flick.height, bottom - flick.height + 8)
+        }
+
         Item {
             implicitWidth: scroll.availableWidth
             implicitHeight: page.implicitHeight + 32
@@ -565,10 +575,12 @@ ApplicationWindow {
                     readonly property int rotationCount: shell.session.locations
                         .filter(row => typeof row.id === "string" && row.enabled).length
 
-                    RowLayout {
+                    GridLayout {
                         Layout.fillWidth: true
                         Layout.minimumHeight: shell.compact ? 100 : 120
-                        spacing: shell.compact ? 12 : 24
+                        columns: shell.compact ? 1 : 2
+                        columnSpacing: 24
+                        rowSpacing: 8
                         ColumnLayout {
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
@@ -616,6 +628,7 @@ ApplicationWindow {
                                 elide: Text.ElideRight
                             }
                             PageTitle {
+                                objectName: "currentRunHeadline"
                                 Layout.fillWidth: true
                                 elide: Text.ElideRight
                                 text: afk.hasRun ? afk.runParts.slice(0, 2).join(" · ")
@@ -624,6 +637,10 @@ ApplicationWindow {
                                       : shell.session.service_missing ? qsTr("Start the background service")
                                       : shell.quarantine.reason ? qsTr("AFK session on hold")
                                       : qsTr("Set up an AFK session")
+                                HoverHandler { id: headlineHover }
+                                ToolTip.visible: headlineHover.hovered && truncated
+                                ToolTip.delay: 500
+                                ToolTip.text: text
                             }
                             SingleLine {
                                 visible: text.length > 0
@@ -642,30 +659,31 @@ ApplicationWindow {
                         }
                         ColumnLayout {
                             visible: afk.zenyTotal.length > 0 || afk.hasRate
-                            Layout.preferredWidth: Math.min(implicitWidth, afk.width * (shell.compact ? 0.47 : 0.45))
+                            Layout.preferredWidth: shell.compact ? implicitWidth : Math.min(implicitWidth, afk.width * 0.45)
+                            Layout.maximumWidth: afk.width
                             Layout.minimumWidth: 0
                             spacing: 0
                             Caption {
-                                Layout.alignment: Qt.AlignRight
+                                Layout.alignment: shell.compact ? Qt.AlignLeft : Qt.AlignRight
                                 visible: afk.zenyTotal.length > 0
                                 text: shell.session.active ? qsTr("Zeny this session") : qsTr("Zeny latest session")
                             }
                             Label {
                                 Layout.fillWidth: true
                                 visible: afk.zenyTotal.length > 0
-                                horizontalAlignment: Text.AlignRight
+                                horizontalAlignment: shell.compact ? Text.AlignLeft : Text.AlignRight
                                 text: afk.zenyTotal
                                 color: shell.ochre
                                 font.family: boldFont.name
                                 font.bold: true
-                                font.pixelSize: shell.compact ? 44 : 56
+                                font.pixelSize: shell.compact ? 36 : 56
                                 font.features: {"tnum": 1}
                                 fontSizeMode: Text.HorizontalFit
                                 minimumPixelSize: 28
                                 elide: Text.ElideLeft
                             }
                             RowLayout {
-                                Layout.alignment: Qt.AlignRight
+                                Layout.alignment: shell.compact ? Qt.AlignLeft : Qt.AlignRight
                                 visible: afk.hasRate
                                 spacing: 4
                                 Caption { objectName: "zenyValue"; text: shell.session.zeny }
@@ -682,7 +700,7 @@ ApplicationWindow {
                             objectName: "sessionRunBand"
                             theme: shell
                             runs: shell.session.session_runs
-                            currentNumber: shell.session.current_number
+                            onRunFocused: mark => scroll.keepRunVisible(mark)
                             heading: qsTr("Run rotation")
                             subtitle: !shell.compact && shell.session.active && afk.rotationCount > 0
                                 ? qsTr("%1 locations").arg(afk.rotationCount) : ""
@@ -857,7 +875,7 @@ ApplicationWindow {
                                     objectName: "towerSnapshotCaption"
                                     Layout.fillWidth: true
                                     visible: shell.session.tower_snapshot.length > 0
-                                    text: qsTr("Starting spends this snapshot")
+                                    text: qsTr("Starting spends your best unlocked snapshot — now:")
                                     wrapMode: Text.Wrap
                                 }
                                 BodyText {
@@ -1301,10 +1319,12 @@ ApplicationWindow {
                                     }
                                 }
                                 RunBand {
+                                    objectName: "historyRunBand" + entry.index
                                     theme: shell
                                     runs: entry.modelData.session_runs
                                     visible: runs.length > 0
                                     small: true
+                                    onRunFocused: mark => scroll.keepRunVisible(mark)
                                 }
                                 ColumnLayout {
                                     objectName: entry.latestSession ? "latestSessionDetails" : ""

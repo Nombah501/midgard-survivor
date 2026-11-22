@@ -7,10 +7,13 @@ ColumnLayout {
     required property var runs
     required property QtObject theme
     property bool small: false
-    property int currentNumber: 0
     property string heading: ""
     property string subtitle: ""
     property string emptyText: ""
+    signal runFocused(Item mark)
+    property int keyboardIndex: 0
+    readonly property int focusIndex: Math.min(keyboardIndex, runs.length - 1)
+    readonly property bool hasCurrent: runs.length > 0 && runs[runs.length - 1].outcome === "current"
     readonly property int gap: small ? 3 : 4
     readonly property int markHeight: small ? 12 : theme.compact ? 24 : 32
     readonly property int columns: Math.max(1, Math.min(runs.length,
@@ -20,37 +23,50 @@ ColumnLayout {
     Layout.fillWidth: true
     Layout.minimumWidth: 0
     spacing: 8
-    Accessible.role: Accessible.Graphic
+    Accessible.role: Accessible.Grouping
     Accessible.name: {
         if (runs.length === 0)
             return emptyText
         let wins = 0
         let losses = 0
         let aborted = 0
-        let current = 0
         for (let i = 0; i < runs.length; i++) {
             switch (runs[i].outcome) {
             case "win": wins++; break
             case "loss": losses++; break
             case "aborted": aborted++; break
-            case "current": current = ordinal(i); break
             }
         }
         const parts = [wins === 1 ? qsTr("1 win") : qsTr("%1 wins").arg(wins),
                        losses === 1 ? qsTr("1 loss") : qsTr("%1 losses").arg(losses)]
         if (aborted)
             parts.push(qsTr("%1 aborted").arg(aborted))
-        if (current)
-            parts.push(qsTr("run %1 in progress").arg(current))
+        if (hasCurrent) {
+            const number = runs[runs.length - 1].number
+            parts.push(number ? qsTr("run %1 in progress").arg(number) : qsTr("run in progress"))
+        }
         return parts.join(", ")
     }
 
-    function ordinal(index) {
-        return runs[index].outcome === "current" && currentNumber > 0 ? currentNumber : index + 1
+    function focusRun(index) {
+        if (index < 0 || index >= runs.length)
+            return false
+        bandRows.itemAt(Math.floor(index / columns)).focusRun(index % columns)
+        return true
     }
 
     function tickText(index) {
-        return String(ordinal(index)).padStart(2, "0") + " " + runs[index].short
+        const run = runs[index]
+        return run.number ? run.number.padStart(2, "0") + " " + run.short : run.short
+    }
+
+    function runLabel(index) {
+        const run = runs[index]
+        if (!run)
+            return ""
+        const outcome = outcomeLabel(run.outcome)
+        return run.number ? qsTr("Run %1 · %2 · %3").arg(run.number).arg(run.label).arg(outcome)
+                          : qsTr("%1 · %2").arg(run.label).arg(outcome)
     }
 
     function outcomeLabel(outcome) {
@@ -125,7 +141,7 @@ ColumnLayout {
             visible: band.runs.length > 0
             spacing: band.theme.compact ? 8 : 16
             Repeater {
-                model: band.currentNumber > 0 ? ["win", "loss", "current", "aborted"] : ["win", "loss", "aborted"]
+                model: band.hasCurrent ? ["win", "loss", "current", "aborted"] : ["win", "loss", "aborted"]
                 delegate: RowLayout {
                     required property string modelData
                     spacing: 4
@@ -149,18 +165,15 @@ ColumnLayout {
     }
 
     Repeater {
+        id: bandRows
         model: Math.ceil(band.runs.length / band.columns)
         delegate: Canvas {
             id: row
             required property int index
             readonly property int first: index * band.columns
             readonly property int count: Math.min(band.columns, band.runs.length - first)
-            readonly property int hoveredRun: {
-                if (!runHover.hovered || band.pitch <= 0 || runHover.point.position.y >= band.markHeight)
-                    return -1
-                const x = runHover.point.position.x
-                const col = Math.floor(x / band.pitch)
-                return col < count && x % band.pitch < band.markWidth ? first + col : -1
+            function focusRun(column) {
+                marks.itemAt(column).forceActiveFocus(Qt.OtherFocusReason)
             }
             Layout.fillWidth: true
             implicitHeight: band.markHeight + (band.small ? 0 : 20)
@@ -171,15 +184,43 @@ ColumnLayout {
             Connections {
                 target: band
                 function onRunsChanged() { row.requestPaint() }
-                function onCurrentNumberChanged() { row.requestPaint() }
+                function onMarkHeightChanged() { row.requestPaint() }
                 function onMarkWidthChanged() { row.requestPaint() }
             }
-            HoverHandler { id: runHover }
-            ToolTip.delay: 350
-            ToolTip.visible: hoveredRun >= 0
-            ToolTip.text: hoveredRun < 0 ? "" : qsTr("Run %1 · %2 · %3")
-                .arg(band.ordinal(hoveredRun)).arg(band.runs[hoveredRun].label)
-                .arg(band.outcomeLabel(band.runs[hoveredRun].outcome))
+            Repeater {
+                id: marks
+                model: row.count
+                delegate: Rectangle {
+                    id: mark
+                    required property int index
+                    readonly property int runIndex: row.first + index
+                    objectName: band.objectName + "-run-" + runIndex
+                    x: index * band.pitch
+                    width: Math.max(0, band.markWidth)
+                    height: band.markHeight
+                    color: "transparent"
+                    border.width: activeFocus ? 2 : 0
+                    border.color: band.theme.ink
+                    activeFocusOnTab: runIndex === band.focusIndex
+                    Accessible.role: Accessible.Graphic
+                    Accessible.focusable: true
+                    Accessible.name: band.runLabel(runIndex)
+                    onActiveFocusChanged: {
+                        if (activeFocus) {
+                            band.keyboardIndex = runIndex
+                            band.runFocused(mark)
+                        }
+                    }
+                    Keys.onLeftPressed: event => event.accepted = band.focusRun(runIndex - 1)
+                    Keys.onRightPressed: event => event.accepted = band.focusRun(runIndex + 1)
+                    Keys.onUpPressed: event => event.accepted = band.focusRun(runIndex - band.columns)
+                    Keys.onDownPressed: event => event.accepted = band.focusRun(runIndex + band.columns)
+                    HoverHandler { id: runHover }
+                    ToolTip.delay: activeFocus ? 0 : 350
+                    ToolTip.visible: activeFocus || runHover.hovered
+                    ToolTip.text: Accessible.name
+                }
+            }
 
             onPaint: {
                 const ctx = getContext("2d")

@@ -15,6 +15,9 @@ The reporting window from 18:00 local time on the previous calendar day up to 12
 One game run from its start to the end screen, including settlement.
 _Avoid_: game, match, attempt
 
+**Win**:
+A settled run in which the game banked the finale clear. It still counts if Finish was requested after the clear.
+
 **Location**:
 The game world a run is played in, chosen before the run; each has its own difficulty range.
 _Avoid_: stage, map, level

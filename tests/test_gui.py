@@ -117,36 +117,52 @@ def active_status(farm):
                       "time": 522, "hp": 780, "max_hp": 1000})
 
 
-def test_session_run_band_tracks_active_run_and_latest_settled_session(farm):
+def test_session_run_band_tracks_active_run_and_latest_settled_session(farm, monkeypatch):
     from midgard_farm.gui.model import SessionModel
 
+    now = datetime(2026, 7, 20, 8).timestamp()
+    monkeypatch.setattr(time, "time", lambda: now)
+    # Run 11 never settled; labels must preserve that gap.
     rows = [
         {"session": "older-afk", "run_id": "old-r1", "stage": "prontera", "finale_won": True},
-        {"session": "afk-fixture", "run_id": "run-10", "stage": "payon", "finale_won": True, "forced": True},
-        {"session": "afk-fixture", "run_id": "run-11", "stage": "prontera", "died": True},
-        {"session": "afk-fixture", "run_id": "run-12", "stage": "payon", "forced": True},
+        {"session": "afk-fixture", "run_id": "afk-fixture-r10", "stage": "payon",
+         "finale_won": True, "forced": True, "victory": False},
+        {"session": "afk-fixture", "run_id": "afk-fixture-r12", "stage": "prontera", "died": True},
+        {"session": "afk-fixture", "run_id": "afk-fixture-r13", "stage": "payon", "forced": True},
     ]
     (farm.profile / "farmer_runs.jsonl").write_text(
         "\n".join(map(json.dumps, [*rows, rows[-1]])) + '\n{"torn"', encoding="utf-8",
     )
-    append_event(farm.platform, "session", timestamp=time.time() - 60, session_id="older-afk", outcome="finished")
+    append_event(farm.platform, "session", timestamp=now - 86400, session_id="older-afk", outcome="finished")
     farm.state("active", session_id="afk-fixture", farmer_phase="run")
-    active_status(farm)
+    start = now - 3600
+    (farm.data / "session.json").write_text(json.dumps({"id": "afk-fixture", "started_at": start}))
+    totals = {"started": 14, "runs": 3, "wins": 0, "losses": 3}
+    farm.status(session="afk-fixture", run_id="afk-fixture-r14", phase="run", uptime_s=65,
+                totals=totals, target={"stage": "payon"})
     model = SessionModel(farm.platform)
     view = model.poll()
     assert view.session_runs == [
-        {"label": "Payon Forest", "short": "Payon F.", "outcome": "win"},
-        {"label": "Prontera Field", "short": "Prontera F.", "outcome": "loss"},
-        {"label": "Payon Forest", "short": "Payon F.", "outcome": "aborted"},
-        {"label": "Payon Forest", "short": "Payon F.", "outcome": "current"},
+        {"label": "Payon Forest", "short": "Payon F.", "outcome": "win", "number": "10"},
+        {"label": "Prontera Field", "short": "Prontera F.", "outcome": "loss", "number": "12"},
+        {"label": "Payon Forest", "short": "Payon F.", "outcome": "aborted", "number": "13"},
+        {"label": "Payon Forest", "short": "Payon F.", "outcome": "current", "number": "14"},
     ]
     assert [run["outcome"] for run in view.history.rows[0].session_runs] == ["win"]
+    assert view.session_numbers == {"runs": 3, "wins": 1, "losses": 1}
+    assert view.session_duration == 3600
+    assert {metric.label: metric.value for metric in view.history.night.totals}["Wins / runs"] == "1 / 3"
 
-    append_event(farm.platform, "session", session_id="afk-fixture", outcome="finished")
+    # Older history stored the farmer's victory counters even when the journal recorded a finale win.
+    append_event(farm.platform, "session", session_id="afk-fixture", outcome="finished",
+                 started_at=start, totals=totals)
     farm.state()
     idle = model.poll()
-    assert idle.session_runs == view.session_runs[:-1]
-    assert idle.session_numbers == {"runs": 3, "wins": 1, "losses": 1}
+    assert idle.session_runs == view.session_runs[:-1] == idle.history.rows[0].session_runs
+    assert idle.session_numbers == view.session_numbers
+    assert idle.history.rows[0].summary == "3 runs · 1 wins · 1 losses"
+    assert {metric.label: metric.value for metric in idle.history.totals}["Wins"] == "1"
+    assert {metric.label: metric.value for metric in idle.history.night.totals}["Wins / runs"] == "1 / 3"
 
 
 def test_start_refusal_is_correlated_and_a_new_start_clears_it(farm):
@@ -618,11 +634,11 @@ def qml_item(window, name):
     return item
 
 
-def wait_until(predicate):
+def wait_until(predicate, *, timeout=10):
     from PySide6.QtTest import QTest
 
     # CI runners publish snapshots far slower than a workstation.
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + timeout
     while not predicate():
         assert time.monotonic() < deadline, "Timed out waiting for the Qt window to update"
         QTest.qWait(20)
@@ -820,7 +836,7 @@ def test_afk_tower_picker_shows_snapshot_replaces_rules_and_sends_floor(open_das
     assert not qml_item(window, "difficultyPicker").isVisible()
     assert not qml_item(window, "oathPanel").isVisible()
     assert qml_item(window, "towerRules").property("text") == "The Tower sets Difficulty and Oaths."
-    assert qml_item(window, "towerSnapshotCaption").property("text") == "Starting spends this snapshot"
+    assert qml_item(window, "towerSnapshotCaption").property("text") == "Starting spends your best unlocked snapshot — now:"
     preview = qml_item(window, "towerSnapshot").property("text")
     expected_day = datetime.fromtimestamp(latest["tower"]["snapshots"][3]["saved_at"]).strftime("%Y-%m-%d")
     assert "High Priest" in preview and "Level 60" in preview and expected_day in preview
@@ -880,16 +896,16 @@ def test_tower_runs_are_labelled_and_styled_from_the_journal(farm):
     farm.state()
     append_event(farm.platform, "session", session_id="afk-tower", outcome="finished", reason="tower_finished")
     rows = [
-        {"session": "afk-tower", "run_id": "run-1", "stage": "tower", "tower_floor_best": 25,
+        {"session": "afk-tower", "run_id": "afk-tower-r1", "stage": "tower", "tower_floor_best": 25,
          "tower_floor_start": 11, "end_cause": "death", "died": True, "forced": True, "finale_won": False},
-        {"session": "afk-tower", "run_id": "run-2", "stage": "hel", "tower_floor_best": 7,
+        {"session": "afk-tower", "run_id": "afk-tower-r2", "stage": "hel", "tower_floor_best": 7,
          "tower_floor_start": 1, "end_cause": "finish", "died": False, "finale_won": False},
     ]
     (farm.profile / "farmer_runs.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     view = SessionModel(farm.platform).poll()
     assert view.history.rows[0].session_runs == view.session_runs == [
-        {"label": "Tower F25", "short": "Tower F25", "outcome": "loss"},
-        {"label": "Hel F7", "short": "Hel F7", "outcome": "aborted"},
+        {"label": "Tower F25", "short": "Tower F25", "outcome": "loss", "number": "1"},
+        {"label": "Hel F7", "short": "Hel F7", "outcome": "aborted", "number": "2"},
     ]
     assert view.last_event == "Hel F7 · Run finished"
 
@@ -1341,6 +1357,48 @@ def test_slow_shared_read_keeps_published_state_and_qt_responsive(qt_app, qt_war
     assert not qt_warnings
 
 
+def test_compact_afk_headline_keeps_full_location_readable(open_dashboard, farm):
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    farm.status(session="afk-fixture", run_id="afk-fixture-r38", phase="run",
+                totals={"started": 38, "runs": 37, "wins": 35, "zeny": 2086359338},
+                target={"stage": "prontera"}, rates={"zeny_h": 212172135})
+    window = open_dashboard("afkTab")
+    window.resize(640, 900)
+    headline = qml_item(window, "currentRunHeadline")
+    wait_until(lambda: headline.property("text") == "Run 38 · Prontera Field")
+    assert not window.grabWindow().isNull()
+    assert not headline.property("truncated")
+
+
+def test_afk_and_history_bands_expose_individual_runs_to_keyboard_and_accessibility(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QAccessible
+    from PySide6.QtTest import QTest
+
+    session = "afk-fixture"
+    runs = [{"session": session, "run_id": f"{session}-r1", "stage": "prontera", "finale_won": True},
+            {"session": session, "run_id": f"{session}-r3", "stage": "payon", "forced": True}]
+    (farm.profile / "farmer_runs.jsonl").write_text("\n".join(map(json.dumps, runs)), encoding="utf-8")
+    append_event(farm.platform, "session", session_id=session, outcome="finished", totals={"runs": 2, "wins": 1})
+    farm.state()
+    window = open_dashboard("afkTab")
+    wait_until(lambda: qml_item(window, "phaseValue").property("text") == "Ready to start")
+
+    for tab, band in (("afkTab", "sessionRunBand"), ("historyTab", "historyRunBand0")):
+        click(window, tab)
+        first, third = [qml_item(window, f"{band}-run-{index}") for index in range(2)]
+        names = [QAccessible.queryAccessibleInterface(mark).text(QAccessible.Text.Name) for mark in (first, third)]
+        assert names == ["Run 1 · Prontera Field · Win", "Run 3 · Payon Forest · Aborted"]
+        assert first.property("activeFocusOnTab")
+        assert not third.property("activeFocusOnTab")
+        key_click(window, first.objectName(), Qt.Key.Key_Right)
+        assert third.property("activeFocus")
+        assert third.property("activeFocusOnTab")
+        QTest.keyClick(window, Qt.Key.Key_Tab)
+        assert not third.property("activeFocus")
+        assert not first.property("activeFocus")
+
+
 def test_history_screen_renders_interleaved_rows_and_expands_latest_session(open_dashboard, farm, tmp_path):
     farm.state()
     history_fixture(farm)
@@ -1633,6 +1691,33 @@ def test_health_checks_run_only_on_demand_without_blocking_the_window(open_dashb
     wait_until(lambda: not repair.property("enabled"))
     assert qml_item(window, "repairBlocker").property("text") == "Finish the AFK session before repairing."
     assert calls == [farm.platform]
+
+
+def test_abort_and_polling_do_not_wait_for_blocked_health_checks(open_dashboard, farm, monkeypatch):
+    from midgard_farm.core import doctor
+
+    entered, release = Event(), Event()
+
+    def checks(_):
+        entered.set()
+        assert release.wait(timeout=10)
+        return []
+
+    monkeypatch.setattr(doctor, "run_checks", checks)
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    active_status(farm)
+    window = open_dashboard("quarantineTab")
+    try:
+        click(window, "runChecksButton")
+        wait_until(entered.is_set)
+        click(window, "afkTab")
+        click(window, "abortButton")
+        click(window, "confirmAbort")
+        wait_until(lambda: requested_commands(farm) == ["abort"], timeout=3)
+        farm.state("active", session_id="afk-fixture", farmer_phase="paused")
+        wait_until(lambda: qml_item(window, "pauseButton").property("text") == "Resume", timeout=3)
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize("outcome", ["ready", "failed", "refused"])

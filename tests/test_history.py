@@ -46,6 +46,23 @@ def test_session_history_retains_falls_per_run(tmp_path, monkeypatch):
     ]
 
 
+def test_session_summary_prefers_journal_outcomes_to_heartbeat_victories(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    os_ = platform.current()
+    first = {"session": "s", "run_id": "s-r1", "stage": "payon", "danger": 30}
+    rows = [
+        first | {"finale_won": True, "forced": True, "victory": False},
+        first | {"run_id": "s-r3", "finale_won": False, "victory": True},
+        first | {"run_id": "s-r4", "victory": True},
+        first | {"run_id": "s-r5", "forced": True, "victory": False},
+        first | {"run_id": "s-r6", "stage": "tower", "end_cause": "finish"},
+    ]
+    (tmp_path / "farmer_runs.jsonl").write_text("\n".join(map(json.dumps, rows)), encoding="utf-8")
+    totals = session_summary(os_, tmp_path, "s", {"runs": 5, "wins": 1, "losses": 4})["totals"]
+    assert (totals["runs"], totals["wins"], totals["losses"]) == (5, 2, 1)
+
+
 def test_session_timing_uses_elapsed_time_and_keeps_missing_time_unknown():
     row = {"timestamp": 8200, "started_at": 1000, "totals": {"wall_s": 5400}}
     timing = session_timing(row)
