@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.4.1] - 2026-11-22
+
+- App update checks reach the signed channel: the update host rejected the default Python User-Agent (Cloudflare error 1010), so 0.4.0 could not check for updates. Everything else is as in 0.4.0.
+
 ## [0.4.0] - 2026-11-22
 
 - New window design: one dark palette on Linux and Windows, the session's runs drawn as a band (win, loss, in progress, aborted), pinned action bar, layouts that fit small windows.
