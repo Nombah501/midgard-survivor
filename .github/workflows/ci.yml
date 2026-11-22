@@ -146,3 +146,6 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
           PYTHONPATH: src
         run: python packaging/publish_update.py release-assets CHANGELOG.md "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER"
+      - name: Fetch the stable channel as an installed App does
+        if: needs.package.outputs.prerelease == 'false'
+        run: python packaging/check_published.py "$GITHUB_REF_NAME"

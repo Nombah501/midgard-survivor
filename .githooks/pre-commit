@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
-# Run the farmer's static checks before every commit.
+# Run the farmer's static checks, then check that the staged tree itself compiles and its
+# tests import: commits are often staged from a worktree that holds other uncommitted work.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-exec "$ROOT/farmer/tools/check.sh"
+"$ROOT/farmer/tools/check.sh"
+
+if git diff --cached --quiet -- '*.py'; then
+  exit 0
+fi
+staged="$(mktemp -d "${TMPDIR:-/tmp}/midgard-staged.XXXXXX")"
+trap 'rm -rf "$staged"' EXIT
+git checkout-index -a --prefix="$staged/"
+cd "$staged"
+"$ROOT/.venv/bin/python" -m compileall -q src tests packaging >/dev/null \
+  || { echo "pre-commit: the staged tree does not compile" >&2; exit 1; }
+PYTHONPATH="$staged/src" QT_QPA_PLATFORM=offscreen "$ROOT/.venv/bin/python" -m pytest -q \
+  -p no:cacheprovider --collect-only tests >/dev/null \
+  || { echo "pre-commit: staged tests fail to import; run pytest --collect-only on the staged tree" >&2; exit 1; }
