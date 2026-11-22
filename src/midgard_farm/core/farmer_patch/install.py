@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -110,12 +111,47 @@ def _install(os_: Platform, profile: Path, backups: Path) -> Path:
     return backup
 
 
+def _prune_install_backups(os_: Platform, latest: Path) -> None:
+    previous = [
+        backup for backup in latest.parent.glob("install-*")
+        if backup != latest and not backup.is_symlink() and not backup.is_junction() and backup.is_dir()
+    ]
+    if not previous:
+        return
+    # Only active diagnostics pin backups. Historical session logs don't.
+    references: list[str] = []
+    for name in ("game-update.json", "quarantine.json", "state.json"):
+        path = os_.app_data_dir() / name
+        try:
+            record = json.loads(os_.read_shared(path))
+        except FileNotFoundError:
+            continue
+        if not isinstance(record, dict):
+            raise ValueError(f"{path} is not a JSON object")
+        if name == "state.json":
+            record = record.get("quarantine")
+        if isinstance(record, dict):
+            references.extend(os.path.normcase(record[key]) for key in ("detail", "log_path")
+                              if isinstance(record.get(key), str))
+    for backup in previous:
+        if not any(os.path.normcase(str(backup)) in text for text in references):
+            try:
+                shutil.rmtree(backup)
+            except OSError as exc:
+                print(f"farmer patch: could not prune {backup}: {exc}", file=sys.stderr)
+
+
 def install(os_: Platform, profile: Path, *, backup_dir: Path | None = None) -> Path:
-    """Mount the built farmer patch and return the backup directory for this install."""
+    """Mount the built farmer patch, retain its rollback and prune unreferenced old backups."""
     try:
-        return _install(os_, profile, backup_dir or patch_info.farmer_dir(os_) / "backups")
+        latest = _install(os_, profile, backup_dir or patch_info.farmer_dir(os_) / "backups")
     except (OSError, PatchInfoError, PatchStateError) as exc:
         raise InstallFailed(str(exc)) from exc
+    try:
+        _prune_install_backups(os_, latest)
+    except (OSError, ValueError) as exc:
+        print(f"farmer patch: could not inspect install backups: {exc}", file=sys.stderr)
+    return latest
 
 
 def restore(os_: Platform, profile: Path) -> None:

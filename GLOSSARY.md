@@ -8,6 +8,9 @@ A controller that plays real Midgard Survivors runs unattended. The glossary dis
 A continuous period in which the farmer runs without human intervention, from supervisor start to a terminal outcome.
 _Avoid_: farm job, bot session
 
+**Night**:
+The reporting window from 18:00 local time on the previous calendar day up to 12:00 local time today. The report combines whole AFK sessions that overlap this window; downtime is elapsed session time outside settled runs, not the gaps between sessions.
+
 **Run**:
 One game run from its start to the end screen, including settlement.
 _Avoid_: game, match, attempt

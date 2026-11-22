@@ -22,6 +22,7 @@ from .scenarios import BOUNDED_SCENARIOS, check_supported, run_scenario
 
 
 _WORKER_AUTH = "MIDGARD_VERIFY_WORKER_AUTH"
+_FAILED_SANDBOX_LIMIT = 5
 
 
 def wait_for_lock(os_: platform.Platform, path: Path, deadline: float,
@@ -162,7 +163,7 @@ def _suite(os_: platform.Platform, out: Path, source: Path, candidate: Path, gam
             break
         if row["verdict"] != "PASS":
             exit_code = 1
-    summary = {"build_sha256": info.result_sha256, "rows": rows}
+    summary = {"build_sha256": info.result_sha256, "exit": exit_code, "rows": rows}
     (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     _print_summary(rows)
     if keep or exit_code:
@@ -173,11 +174,49 @@ def _suite(os_: platform.Platform, out: Path, source: Path, candidate: Path, gam
     return exit_code
 
 
+def _failed_sandbox(out: Path) -> bool:
+    sandbox = out / "sandbox"
+    if sandbox.is_symlink() or sandbox.is_junction() or not sandbox.is_dir():
+        return False
+    try:
+        summary = json.loads((out / "summary.json").read_bytes())
+    except (FileNotFoundError, ValueError):
+        return True  # Interrupted before writing a summary.
+    if not isinstance(summary, dict):
+        return False
+    if isinstance(code := summary.get("exit"), int):
+        return code != 0
+    # Summaries predating the exit field only recorded individual verdicts.
+    rows = summary.get("rows")
+    return isinstance(rows, list) and (not rows or any(isinstance(row, dict) and row.get("verdict") == "FAIL"
+                                                      for row in rows))
+
+
+def _prune_failed_sandboxes(current: Path) -> None:
+    # Match Python verifier runs only, not the legacy shell verifier's directories.
+    try:
+        previous = [
+            out for out in current.parent.glob("verify-????????-??????-????????")
+            if out != current and not out.is_symlink() and not out.is_junction() and _failed_sandbox(out)
+        ]
+        previous.sort(key=lambda out: (out.name.rsplit("-", 1)[0], out.stat().st_mtime_ns, out.name), reverse=True)
+        available = _FAILED_SANDBOX_LIMIT - _failed_sandbox(current)
+    except OSError as exc:
+        print(f"verify: could not inspect older sandboxes: {exc}", file=sys.stderr)
+        return
+    for out in previous[available:]:
+        try:
+            shutil.rmtree(out / "sandbox")
+        except OSError as exc:
+            print(f"verify: could not prune {out / 'sandbox'}: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["_worker"]:
         return _worker(argv[1:])
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog="Only the five newest failed sandboxes are retained; "
+                                     "logs and summaries are not pruned.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--scenario", action="append", choices=(*BOUNDED_SCENARIOS, "watch-mode"),
                       help="one bounded scenario (repeatable)")
@@ -206,9 +245,11 @@ def main(argv: list[str] | None = None) -> int:
         root = (Path.cwd() / ".sandbox").resolve()
         local_lock = root / "verify.lock"  # Queue with legacy verify.sh until cutover.
         user_lock = Path.home() / ".midgard-farm-verify.lock"  # Queue across checkouts for this operator.
+        source_storage = (source.resolve(), real_app)
         if (local_lock.is_symlink() or user_lock.is_symlink()
+                or any(real.is_relative_to(root) for real in source_storage)
                 or any(p.is_relative_to(real) for p in (root, user_lock.resolve())
-                       for real in (source.resolve(), real_app, candidate))):
+                       for real in (*source_storage, candidate))):
             raise ValueError("verification storage overlaps the source profile or app data")
         seconds = float(os.environ.get("VERIFY_LOCK_WAIT", "3600"))
         if not math.isfinite(seconds) or seconds < 0:
@@ -221,8 +262,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("the game is running; close it first (verification never touches the real profile)")
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             out = Path(tempfile.mkdtemp(dir=root, prefix=f"verify-{stamp}-"))
-            return _suite(os_, out, source, candidate, game, names, hours=args.soak or 0.0,
-                          preset=preset, keep=args.keep, stop=stop)
+            try:
+                return _suite(os_, out, source, candidate, game, names, hours=args.soak or 0.0,
+                              preset=preset, keep=args.keep, stop=stop)
+            finally:
+                _prune_failed_sandboxes(out)
     except InterruptedError as exc:
         print(f"verify: {exc}", file=sys.stderr)
         return 130

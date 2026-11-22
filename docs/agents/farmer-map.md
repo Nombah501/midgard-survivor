@@ -9,14 +9,15 @@ Where the AFK farmer's behaviour lives. Function names, not line numbers: `grep 
 1. `idle` → `_prepare_run`: choose target, snapshot pre-run state, `world.start_run`, checkpoint `run`.
 2. `run` → `_tick_run`; the run ends via the game or `_end_run_safe`.
 3. `settle` → `_begin_settle` / `_check_settle` until the end screen.
-4. `keep` → `_do_keep`: keep, sell the rest, `Save.flush`, checkpoint `settled`.
-5. `maint` → `_do_maintenance`, then `_complete_run`: checkpoint `settled` again, `_account_run` (totals, journal `_append_run_log`, `_update_arm`), checkpoint `idle`.
-6. Terminal: `_finish(reason)` (verified flush via `_flush_profile_verified`, `phase=done`) or `_fail_session(reason)` (`phase=failed`).
+4. `keep` → `_do_keep`: keep, sell the rest, verify the profile save, checkpoint `settled`.
+5. `maint` → `_do_maintenance`, then `_complete_run`: verify the profile save, checkpoint `settled` again, `_account_run` (totals, journal `_append_run_log`, `_update_arm`), checkpoint `idle`.
+6. Terminal: `_finish(reason)` (verified save, `phase=done`) or `_fail_session(reason)` (`phase=failed`). An unverified save preserves the previous checkpoint and is not retried by the app supervisor.
 
 Cross-cutting:
 
 - Status (supervisor contract): `_write_status`, `_totals`.
 - Checkpoint and crash recovery: `_write_checkpoint`, `_restore_checkpoint`, `_journal_has`; session identity from `FARMER_SESSION_ID`.
+- Save verification: `_flush_profile_verified` reads this boundary's unique marker back from the game's final profile before the farmer publishes a result.
 - Lethal hits: `tools/patch_player.py` emits `Player.farmer_fell` after a native revive or before terminal death. `_on_player_fell` logs the cause and remaining leaves immediately; the result journals `falls_by_mechanic` (including the final fall), which the app retains per run in session history. Old journals without this field have unknown fall counts, not zero.
 - Operator commands and limits: `_check_command` (claims `user://farmer_command`; legacy `farmer_stop` = finish), `_check_limits` (`max_minutes`, `max_runs`, `stop_after_wins`), both ending in `_request_finish`.
 - Movement: `_steer_goal` selects the target. Raid/Morroc mechanics keep precise `_steer_direct` steering, including the blocked-portal detour. Field goals use `_steer_field`: a clear segment or a cached route over the same `RoMap.cell_walkable` tiles as the player. A blocked or stalled segment triggers a re-plan; goals that still fail cool down briefly. With no goal, `_steer_open_ground` uses per-map clearance and escape directions to leave narrow pockets while preferring the native combat direction on open ground.
@@ -27,6 +28,7 @@ Cross-cutting:
 ## Around the game
 
 - `farmer/tools/supervisor.py`: restart, backoff, quarantine (with run.sh's preflight `detail`), notifications, the single-supervisor lock, the systemd unit (`--print-unit`). Its tests are in `farmer/tests/test_supervisor.py`.
+- The app supervisor (`src/midgard_farm/core/supervisor.py`) commits Pause/Resume to `session.json` before acknowledging the command or delivering it to the game. A replacement child uses that intent at boot. `outcome.json` commits a terminal outcome together with its quarantine evidence; the per-session `quarantine.json` is a diagnostic copy.
 - The app supervisor's run-clock watchdog is independent of `_check_watchdog` in the game. A portal approach is outside the arena and still has the 180-second run-clock deadline even with fresh heartbeats. Inside the arena the deadline is 1200 seconds; Morroc's local run-clock exemption does not reset either supervisor deadline.
 - `farmer/run.sh`: preflight (exit 78 = unfixable: game/patch/build, cfg not a JSON object or using keys from `farmer/obsolete_config_keys.json`, profile dir not writable or below `FARMER_MIN_FREE_MB`), the launcher `flock` (the only single-instance guard), network isolation for supervised sessions, backups and known-good. Its tests are in `farmer/tests/test_run_sh.py`.
 - Contracts and operator docs: `farmer/README.md` (AFK session, commands, isolation/backup, status). Decisions: `docs/adr/`.
@@ -43,4 +45,5 @@ Cross-cutting:
 - `--scenario valkyrie-drill` forces early sandbox Valhalla fights at D30/37 oaths. It isolates one native ability per encounter and requires ten complete six-mark Caída waves with Doom active, no leaves, and zero contacts, piercing hits or deaths.
 - `--scenario mvp-mechanics-drill` tests five native trials each of Reginleif's Lanzas de Valhalla, Orc Lord's arena Terremoto, and the field Hibram's Golpe aplastante. It requires all strikes to resolve with zero contacts, hits, deaths or fall counts.
 - `--scenario hell-rotation-payon`, `hell-rotation-orc_dun`, `hell-rotation-nameless` and `hell-rotation-turtle` run the full Hell strategy at D30/37 in those locations, with the original `hell-rotation` finale and route checks.
+- `--scenario flush-fail` blocks the native profile write at keep and requires a failed exit, the original run checkpoint, and no journaled or credited rewards.
 - The real profile and the real install (`./install.sh`) are the operator's. Leave them to the operator.

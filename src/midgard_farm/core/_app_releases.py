@@ -1,5 +1,6 @@
-"""Download the private GitHub release without forwarding its credential."""
+"""Verify the stable App update manifest and stage an authenticated archive."""
 
+import base64
 import hashlib
 import json
 import re
@@ -7,17 +8,32 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import time
 import zipfile
-from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.client import HTTPException
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 
 from ..platform import Platform
 
-_RELEASES = "https://api.github.com/repos/Nombah501/midgard-survivor/releases"
+# Signed update channel (ADR 0010): R2 bucket midgard-farm-release behind the Operator's domain.
+UPDATE_BASE_URL = "https://updates.vibeauction.shop"
+MINISIGN_PUBLIC_KEY = "RWQs+4Pjv3LjCQyZNEjrnUPsMD6V03qW2NsY8kWAfUmYf3YP3V52dJmz"
+CHANNEL = "stable"
+MANIFEST_KEY = f"{CHANNEL}/manifest.json"
+MAX_MANIFEST_SIZE = 1 << 20
+MAX_SIGNATURE_SIZE = 4096
+_MAX_ARCHIVE_SIZE = 1 << 30
+_MAX_SAFE_INTEGER = (1 << 53) - 1
+_ARCHIVE_SUFFIXES = {"linux": "tar.gz", "windows": "zip"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 # Production release tags use X.Y.Z; also allow normalized PEP 440 post releases.
 _VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})(?:\.post(0|[1-9][0-9]{0,8}))?")
 
@@ -26,66 +42,136 @@ class ReleaseError(Exception):
     """A safe, credential-free reason to display in Updates."""
 
 
-class TokenRejected(ReleaseError):
-    pass
-
-
-class _AssetsIncomplete(ReleaseError):
-    """The latest release lacks a complete archive and checksum pair."""
-
-
 def version_key(value: object) -> tuple[int, ...] | None:
     if not isinstance(value, str) or not (match := _VERSION.fullmatch(value)):
         return None
     return tuple(int(part) if part is not None else -1 for part in match.groups())
 
 
-def _open(token: str, url: str, accept: str):
-    request = Request(url, headers={"Accept": accept, "X-GitHub-Api-Version": "2022-11-28"})
-    # GitHub can redirect private assets to a signed URL. Never forward the PAT.
-    request.add_unredirected_header("Authorization", f"Bearer {token}")
-    return urlopen(request, timeout=15)
+def archive_name(version: str, release_os: str) -> str:
+    return f"midgard-farm-{version}-{release_os}-x86_64.{_ARCHIVE_SUFFIXES[release_os]}"
+
+
+def signature_key(digest: str) -> str:
+    return f"signatures/{digest}.minisig"
+
+
+def is_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl) -> None:
+        return None
+
+
+_HTTPS = build_opener(_NoRedirect())
+
+
+def update_base_url() -> str:
+    url = urlsplit(UPDATE_BASE_URL)
+    if (url.scheme != "https" or not url.hostname or url.hostname.endswith(".invalid")
+            or url.username is not None or url.password is not None or url.query or url.fragment):
+        raise ReleaseError("App update domain is not configured")
+    return UPDATE_BASE_URL.rstrip("/")
+
+
+@contextmanager
+def _open(key: str):
+    request = Request(f"{update_base_url()}/{key}", headers={"Accept-Encoding": "identity"})
+    try:
+        with _HTTPS.open(request, timeout=15) as response:
+            yield response
+    except HTTPError as exc:
+        exc.close()
+        raise ReleaseError(f"update server returned HTTP {exc.code}") from None
+    except HTTPException:
+        raise ReleaseError("update server returned an incomplete response") from None
 
 
 @dataclass(frozen=True)
-class Release:
-    version: str
+class Archive:
     name: str
-    archive_id: int
-    checksum_id: int
+    size: int
+    sha256: str
+
+    @property
+    def object_key(self) -> str:
+        return f"archives/{self.sha256}/{self.name}"
 
 
-def latest(token: str, current: str, bad: tuple[str, ...], release_os: str) -> Release | None:
-    installed = version_key(current)
-    with _open(token, _RELEASES, "application/vnd.github+json") as response:
-        rows = json.loads(response.read(8 << 20))
-    if not isinstance(rows, list):
-        raise ReleaseError("invalid GitHub releases response")
-    candidates = []
-    for row in rows:
-        if not isinstance(row, dict) or row.get("draft") is not False or row.get("prerelease") is not False:
-            continue
-        tag = row.get("tag_name")
-        if not isinstance(tag, str) or not tag.startswith("v"):
-            continue
-        version = tag[1:]
-        key = version_key(version)
-        if key is not None and installed is not None and key > installed and version not in bad:
-            candidates.append((key, version, row))
-    if not candidates:
-        return None
-    _, version, row = max(candidates, key=lambda candidate: candidate[0])
-    extension = "zip" if release_os == "windows" else "tar.gz"
-    name = f"midgard-farm-{version}-{release_os}-x86_64.{extension}"
-    assets = row.get("assets")
-    if not isinstance(assets, list):
-        raise _AssetsIncomplete("missing release assets")
-    ids = {asset["name"]: asset["id"] for asset in assets
-           if isinstance(asset, dict) and isinstance(asset.get("name"), str)
-           and type(asset.get("id")) is int and asset["id"] > 0}
-    if name not in ids or name + ".sha256" not in ids:
-        raise _AssetsIncomplete("missing release archive or checksum")
-    return Release(version, name, ids[name], ids[name + ".sha256"])
+@dataclass(frozen=True)
+class Manifest:
+    version: str
+    sequence: int
+    expires_at: int
+    changelog: str
+    archives: dict[str, Archive]
+
+
+def verify_manifest(data: bytes, signature: bytes) -> Manifest:
+    """Verify a minisign prehashed signature before parsing any signed metadata."""
+    if not MINISIGN_PUBLIC_KEY:
+        raise ReleaseError("App update verification key is not configured")
+    if len(data) > MAX_MANIFEST_SIZE or len(signature) > MAX_SIGNATURE_SIZE:
+        raise ReleaseError("update manifest or signature is too large")
+    try:
+        key = base64.b64decode(MINISIGN_PUBLIC_KEY, validate=True)
+        untrusted, encoded_sig, trusted, encoded_global = signature.splitlines()
+        sig = base64.b64decode(encoded_sig, validate=True)
+        global_sig = base64.b64decode(encoded_global, validate=True)
+        prefix = b"trusted comment: "
+        if (len(key) != 42 or key[:2] != b"Ed" or len(sig) != 74 or sig[:2] != b"ED"
+                or sig[2:10] != key[2:10] or len(global_sig) != 64
+                or not untrusted.startswith(b"untrusted comment: ") or not trusted.startswith(prefix)):
+            raise ValueError
+        verifier = VerifyKey(key[10:])
+        verifier.verify(hashlib.blake2b(data).digest(), sig[10:])
+        verifier.verify(sig[10:] + trusted[len(prefix):], global_sig)
+    except (ValueError, BadSignatureError):
+        raise ReleaseError("invalid update manifest signature") from None
+
+    try:
+        row = json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError):
+        raise ReleaseError("invalid update manifest JSON") from None
+    if (not isinstance(row, dict) or type(row.get("schema")) is not int or row["schema"] != 1
+            or row.get("channel") != CHANNEL or version_key(row.get("version")) is None
+            or type(row.get("sequence")) is not int or not 1 <= row["sequence"] <= _MAX_SAFE_INTEGER
+            or type(row.get("expires_at")) is not int or not 1 <= row["expires_at"] <= _MAX_SAFE_INTEGER
+            or not isinstance(row.get("changelog"), str)):
+        raise ReleaseError("invalid update manifest metadata")
+    archive_rows = row.get("archives")
+    if not isinstance(archive_rows, dict) or archive_rows.keys() != _ARCHIVE_SUFFIXES.keys():
+        raise ReleaseError("update manifest must describe both OS archives")
+    archives = {}
+    version = row["version"]
+    for os_, entry in archive_rows.items():
+        if (not isinstance(entry, dict) or entry.get("name") != archive_name(version, os_)
+                or type(entry.get("size")) is not int or not 1 <= entry["size"] <= _MAX_ARCHIVE_SIZE
+                or not is_sha256(entry.get("sha256"))):
+            raise ReleaseError("invalid update manifest archive metadata")
+        archives[os_] = Archive(entry["name"], entry["size"], entry["sha256"])
+    return Manifest(version, row["sequence"], row["expires_at"], row["changelog"], archives)
+
+
+def get_manifest() -> tuple[Manifest, str]:
+    if not MINISIGN_PUBLIC_KEY:
+        raise ReleaseError("App update verification key is not configured")
+    try:
+        with _open(MANIFEST_KEY) as response:
+            data = response.read(MAX_MANIFEST_SIZE + 1)
+        if len(data) > MAX_MANIFEST_SIZE:
+            raise ReleaseError("update manifest or signature is too large")
+        digest = hashlib.sha256(data).hexdigest()
+        with _open(signature_key(digest)) as response:
+            signature = response.read(MAX_SIGNATURE_SIZE + 1)
+    except OSError:
+        raise ReleaseError("could not reach the App update server") from None
+    manifest = verify_manifest(data, signature)
+    if manifest.expires_at <= time.time():
+        raise ReleaseError("update manifest has expired")
+    return manifest, digest
 
 
 def _member_path(name: str) -> PurePosixPath:
@@ -121,57 +207,38 @@ def has_service(os_: Platform, directory: Path) -> bool:
     return not directory.is_symlink() and (directory / ("midgard-farm-service" + os_.executable_suffix)).is_file()
 
 
-def download(os_: Platform, token: str, release: Release, versions: Path) -> None:
+def download(os_: Platform, version: str, asset: Archive, versions: Path) -> None:
+    try:
+        _download(os_, version, asset, versions)
+    except (zipfile.BadZipFile, tarfile.TarError, EOFError, ValueError):
+        raise ReleaseError("invalid release archive") from None
+    except OSError:
+        raise ReleaseError("could not download or stage the release archive") from None
+
+
+def _download(os_: Platform, version: str, asset: Archive, versions: Path) -> None:
     with tempfile.TemporaryDirectory(dir=versions, prefix=".download-") as work:
         staging = Path(work)
-        with _open(token, f"{_RELEASES}/assets/{release.checksum_id}", "application/octet-stream") as response:
-            line = response.read(1024)
-        if not (checksum := re.fullmatch(rb"([0-9a-fA-F]{64}) [ *]" + re.escape(release.name.encode()) + rb"\r?\n?", line)):
-            raise ReleaseError("invalid release checksum sidecar")
-        archive = staging / release.name
-        with (_open(token, f"{_RELEASES}/assets/{release.archive_id}", "application/octet-stream") as response,
-              archive.open("wb") as output):
-            shutil.copyfileobj(response, output, length=1 << 20)
-        with archive.open("rb") as output:
-            digest = hashlib.file_digest(output, "sha256").hexdigest().encode()
-        if digest != checksum[1].lower():
-            raise ReleaseError("release archive checksum did not match")
+        archive = staging / asset.name
+        digest = hashlib.sha256()
+        remaining = asset.size
+        with _open(asset.object_key) as response, archive.open("wb") as output:
+            while chunk := response.read(min(1 << 20, remaining + 1)):
+                remaining -= len(chunk)
+                if remaining < 0:
+                    raise ReleaseError("release archive size did not match")
+                output.write(chunk)
+                digest.update(chunk)
+        if remaining:
+            raise ReleaseError("release archive size did not match")
+        if digest.hexdigest() != asset.sha256:
+            raise ReleaseError("release archive SHA-256 did not match")
         windows = os_.release_os == "windows"
         bundle = _extract(archive, staging, windows=windows)
         if (not has_service(os_, bundle) or not (bundle / ("midgard-farm" + os_.executable_suffix)).is_file()
                 or not (bundle / "_internal").is_dir()):
             raise ReleaseError("incomplete release archive")
-        destination = versions / release.version
+        destination = versions / version
         if destination.is_dir() and not destination.is_symlink():
             shutil.rmtree(destination)
         os_.replace_atomic(bundle, destination)
-
-
-def asset_key(release: Release) -> str:
-    return f"{release.version}/{release.archive_id}/{release.checksum_id}"
-
-
-def fetch(os_: Platform, token: str, current: str, bad: tuple[str, ...], versions: Path,
-          *, verified: object, invalidate: Callable[[], None]) -> Release | None:
-    try:
-        release = latest(token, current, bad, os_.release_os)
-        if release is not None:
-            changed = asset_key(release) != verified
-            if changed:
-                invalidate()
-            if changed or not has_service(os_, versions / release.version):
-                download(os_, token, release, versions)
-        return release
-    except _AssetsIncomplete:
-        invalidate()
-        raise
-    except HTTPError as exc:
-        if exc.code in (401, 403):
-            raise TokenRejected("release token rejected; enter a new token") from None
-        raise ReleaseError(f"GitHub returned HTTP {exc.code}") from None
-    except (zipfile.BadZipFile, tarfile.TarError, EOFError):
-        raise ReleaseError("invalid release archive") from None
-    except (OSError, HTTPException):
-        raise ReleaseError("release check could not reach GitHub or write the download") from None
-    except (ValueError, RecursionError, TypeError):
-        raise ReleaseError("invalid GitHub releases response") from None

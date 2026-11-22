@@ -93,7 +93,7 @@ def oath_points():
 
 
 def totals():
-    return {"started": started, "runs": runs, "lost": lost, "zeny": zeny, "wins": runs}
+    return {"started": started, "runs": runs, "lost": lost, "zeny": zeny, "wins": runs, "coins": 0, "ymir": 0}
 
 
 def status(phase, reason="", code=0, detail=""):
@@ -304,6 +304,11 @@ def settle(force, *, wait_at_keep=False):
     if not (fault == "unbanked-zeny" and started == 2):
         save.write_text(str(int(save.read_text()) + 20))
     log("SETTLE rewards")
+    if os.environ.get("FARMER_TEST_FLUSH_FAIL") == "keep":
+        print("ERROR: Save: cannot write the keep profile", file=sys.stderr, flush=True)
+        log("FAIL flush_failed")
+        status("failed", "flush_failed", 1, "Could not verify the profile save at keep.")
+        sys.exit(1)
     if wait_at_keep:
         while True:
             status("keep")
@@ -471,10 +476,6 @@ if field_navigation:
 if os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1":
     for tries in (1, 2, 3):
         log(f"RUN_STALL clock={tries * 5.0:.1f} t=12.0 tries={tries}")
-if os.environ.get("FARMER_TEST_FLUSH_FAIL") == "1":
-    log("FAIL flush_failed")
-    status("failed", "flush_failed", 1)
-    sys.exit(1)
 if field_charge:
     for started in range(1, cfg["max_runs"] + 1):
         run_id = f"{session}-r{started}"

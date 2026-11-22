@@ -6,10 +6,12 @@ import os
 import sys
 import time
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
 from midgard_farm import platform, service
+from midgard_farm.core import game_update
 from midgard_farm.core.farmer_patch import gdre
 
 from fake_notification_service import fixture_shutdown_request
@@ -49,6 +51,9 @@ def main():
         stack.enter_context(patch.object(service, "shutdown_request", fixture_shutdown_request))
         stack.enter_context(patch.object(platform, "current", return_value=FakeGamePlatform()))
         stack.enter_context(patch.object(gdre, "prepare", return_value=gdre.Gdre(command, "fake-update")))
+        if grace := os.environ.get("FAKE_UPDATE_CLOSE_GRACE"):
+            stack.enter_context(patch.object(game_update, "GameUpdatePipeline",
+                                            partial(game_update.GameUpdatePipeline, close_grace_seconds=float(grace))))
         stack.enter_context(patch.object(importlib.import_module("midgard_farm.core.farmer_patch.build"),
                                         "_SOURCE_DIR", sources))
         return service.main(policy=policy)

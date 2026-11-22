@@ -78,6 +78,7 @@ def test_game_update_night_waits_rebuilds_and_runs_one_attempt(update_service):
 @pytest.mark.parametrize("lift", ["check_again", "official_sha", "farmer_hash"])
 def test_service_refuses_start_until_retry_block_is_lifted(update_service, monkeypatch, lift):
     farm, update, sources, desktop = update_service
+    monkeypatch.setenv("FAKE_UPDATE_CLOSE_GRACE", "0.05")
     monkeypatch.setenv("FAKE_SMOKE_MODES", '["failed", "no_wins", "pass"]')
     with farm.service(runner=RUNNER):
         failure = wait_for(lambda: read_state(farm.os_), lambda state: state.quarantine is not None)
@@ -144,8 +145,52 @@ def test_service_refuses_start_until_retry_block_is_lifted(update_service, monke
     assert [entry["stage"] for entry in update.observations()] == ["build", "smoke", "smoke", "build", "smoke"]
 
 
+def test_failed_repair_keeps_the_last_session_quarantine_across_restart_and_retry(update_service, monkeypatch):
+    farm, update, _, _ = update_service
+    monkeypatch.setenv("FAKE_SMOKE_MODES", '["pass", "failed", "no_wins", "pass"]')
+    with farm.service(runner=RUNNER):
+        wait_for(lambda: read_history(farm.os_))
+        official = update.patches / "official.pck"
+        official.write_bytes(official.read_bytes() + b"\n")
+        farm.start()
+        outcome, directory = farm.outcome()
+        cause = "run: official patch changed (game updated); rebuild the farmer patch"
+        assert outcome["reason"] == "preflight_failed" and outcome["quarantine"]["detail"] == cause
+        session_state = wait_for(lambda: read_state(farm.os_), lambda state: state.last_outcome == outcome)
+        evidence = (directory / "quarantine.json").read_bytes()
+
+        check = commands.submit(farm.os_, "check_again")
+        wait_for(lambda: not check.exists())
+        failed = read_state(farm.os_)
+        assert (failed.kind, failed.reason) == (StateKind.FARMER_UNAVAILABLE, "smoke_failed")
+        assert failed.quarantine == session_state.quarantine
+        assert failed.last_outcome == outcome
+        assert [(row["kind"], row["outcome"]) for row in read_history(farm.os_)] == [
+            ("game_update", "ready"), ("session", "quarantined"), ("game_update", "quarantine"),
+        ]
+
+    with farm.service(runner=RUNNER):
+        restored = wait_for(lambda: read_state(farm.os_), lambda state: state.kind is StateKind.FARMER_UNAVAILABLE)
+        assert restored.reason == "smoke_failed" and restored.quarantine == session_state.quarantine
+        request = farm.start()
+        refusal = commands.rejection_path(farm.os_, request)
+        assert wait_for(lambda: json.loads(farm.os_.read_shared(refusal)))["reason"] == "smoke_failed"
+        assert len(read_history(farm.os_)) == 3
+
+        check = commands.submit(farm.os_, "check_again")
+        wait_for(lambda: not check.exists())
+        repaired = read_state(farm.os_)
+        assert repaired.kind is StateKind.IDLE and repaired.quarantine == session_state.quarantine
+        assert repaired.last_outcome == outcome
+        assert read_history(farm.os_)[-1]["outcome"] == "ready"
+
+    assert (directory / "quarantine.json").read_bytes() == evidence
+    assert not farm.plan.with_suffix(".count").exists()
+
+
 def test_pending_start_quarantines_at_once_without_attempting_after_smoke_failure(update_service, monkeypatch):
     farm, update, _, _ = update_service
+    monkeypatch.setenv("FAKE_UPDATE_CLOSE_GRACE", "0.05")
     monkeypatch.setenv("FAKE_SMOKE_MODES", '["failed", "no_wins"]')
     update.running.touch()
     request = farm.start()
@@ -170,7 +215,7 @@ def test_update_before_a_restart_does_not_count_as_an_attempt(update_service, mo
     farm, update, _, _ = update_service
     farm.plan.write_text("crash\nclean:goal\n", encoding="utf-8")
     monkeypatch.setenv("FAKE_SMOKE_MODES", '["pass", "pass"]')
-    with farm.service(runner=RUNNER, max_failures=2, backoff_base=2, backoff_max=2):
+    with farm.service(runner=RUNNER, max_failures=2, backoff_base=1, backoff_max=1):
         wait_for(lambda: read_history(farm.os_), lambda history: len(history) == 1)
         farm.start()
         wait_for(lambda: read_state(farm.os_), lambda state: state.reason.startswith("Restarting in"))

@@ -77,7 +77,7 @@ def _serve(os_: platform.Platform, policy: Policy, notifier: Notifier) -> int:
         return EX_TEMPFAIL
     except OSError as exc:
         return _startup_quarantine(os_, data, notifier, "app_data_unusable", "app data directory unusable", exc)
-    updater = app_update.AppUpdater(os_, assets.version(), notifier.notify)
+    updater = app_update.AppUpdater(os_, assets.version())
     with lock, shutdown_request() as requested_at, StateReporter(os_) as state, updater:
         try:
             if app_update.recover_on_start(os_, updater.version):

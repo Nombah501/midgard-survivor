@@ -21,7 +21,7 @@ def notification_data(tmp_path, monkeypatch):
 @pytest.mark.parametrize("event,priority", [
     ("fail", 3), ("quarantine", 3), ("stop", 3), ("goal", 3), ("game_update_handled", 2),
     ("build_failed", 4), ("anchors_broken", 4), ("smoke_failed", 4),
-    ("app_update_rolled_back", 4), ("token_rejected", 3),
+    ("app_update_rolled_back", 4),
 ])
 def test_event_priority_reaches_both_transports(notification_data, monkeypatch, event, priority):
     os_ = notification_data

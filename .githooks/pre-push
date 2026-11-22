@@ -3,30 +3,42 @@
 # and run the app's type check and tests there (plus the farmer tests when
 # farmer/ changed). CI tests only the tip of a push, so a commit that passed
 # only with files left uncommitted could otherwise land unnoticed.
-# Docs-only commits are skipped. Bypass in an emergency: git push --no-verify.
+# Docs-only commits are skipped; release metadata is checked separately.
+# Bypass in an emergency: git push --no-verify.
 set -euo pipefail
 
 ZERO=0000000000000000000000000000000000000000
 CODE='^(src|tests|packaging|farmer)/|^pyproject\.toml$'
-# Work next to uv's cache so the per-commit venv is hardlinked, not copied into /tmp.
+# Work next to uv's cache so venv dependencies are hardlinked, not copied into /tmp.
 WORK_PARENT="${XDG_CACHE_HOME:-$HOME/.cache}/midgard-pre-push"
 
 command -v uv >/dev/null || { echo "pre-push: uv missing; install it or push with --no-verify" >&2; exit 1; }
+unset PYTHONPATH PYTHONHOME
 
 declare -A seen=()
+declare -A tags=()
 commits=()
-while read -r _local_ref local_sha _remote_ref remote_sha; do
+while read -r _local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$ZERO" ] && continue  # Deleting a ref.
   if [ "$remote_sha" = "$ZERO" ]; then
     range=("$local_sha" --not --remotes)
   else
     range=("$remote_sha..$local_sha")
   fi
+  listing="$(git rev-list --reverse "${range[@]}")"
   while read -r commit; do
     [ -n "$commit" ] && [ -z "${seen[$commit]:-}" ] || continue
     seen[$commit]=1
     commits+=("$commit")
-  done < <(git rev-list --reverse "${range[@]}")
+  done <<<"$listing"
+  if [[ "$remote_ref" == refs/tags/v* ]]; then
+    tip="$(git rev-parse "$local_sha^{commit}")"
+    tags[$tip]+="${remote_ref#refs/tags/}"$'\n'
+    if [ -z "${seen[$tip]:-}" ]; then
+      seen[$tip]=1
+      commits+=("$tip")
+    fi
+  fi
 done
 
 work=""
@@ -42,30 +54,113 @@ run_in() {
   fi
 }
 
+# 10 means the commit still needs full validation.
+check_metadata() {
+  uv run --no-project --python 3.13 --with 'packaging>=24' python - "$work" "$1" "$2" <<'PY'
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+from packaging.version import Version
+
+
+def without_version(text):
+    config = tomllib.loads(text)
+    config["project"].pop("version", None)
+    lines = re.sub(r"(?m)^[ \t]*version[ \t]*=.*$", "version = ...", text)
+    return config, lines
+
+
+root, metadata_only, tags = sys.argv[1:]
+root = Path(root)
+text = Path("pyproject.toml").read_text(encoding="utf-8")
+previous = root / "previous.toml"
+if metadata_only == "true" and previous.exists():
+    if without_version(text) != without_version(previous.read_text(encoding="utf-8")):
+        if not tags:
+            sys.exit(10)
+        metadata_only = "false"
+
+project = tomllib.loads(text)["project"]
+version = project["version"]
+if str(Version(version)) != version:
+    sys.exit(f"pre-push: package version {version!r} is not in canonical PEP 440 form")
+for tag in tags.splitlines():
+    if tag != f"v{version}":
+        sys.exit(f"pre-push: release tag {tag!r} does not match package version {version}")
+
+changelog = Path("CHANGELOG.md")
+if changelog.is_file():
+    headings = [
+        (m[1], m[2].lower())
+        for line in changelog.read_text(encoding="utf-8").splitlines()
+        if (m := re.match(r"^##\s+\[?v?(\d[^\s\]]*)\]?(.*)$", line))
+    ]
+    newest = next((entry for entry, suffix in headings if "unreleased" not in suffix), None)
+    pending = headings[0][0] if headings and "unreleased" in headings[0][1] else None
+    if version not in (newest, pending):
+        sys.exit(f"pre-push: CHANGELOG.md must list {version} as the newest or unreleased version")
+sys.exit(0 if metadata_only == "true" else 10)
+PY
+}
+
 for commit in "${commits[@]}"; do
-  changed="$(git diff-tree --no-commit-id --name-only -r --root "$commit")"
-  grep -qE "$CODE" <<<"$changed" || continue
+  changed="$(git diff-tree --first-parent -m --no-commit-id --name-only --no-renames -r --root "$commit")"
+  metadata_only=false
+  if [ -n "$changed" ] && ! grep -qvxE 'pyproject\.toml|CHANGELOG\.md' <<<"$changed"; then
+    metadata_only=true
+  fi
+  release_tags="${tags[$commit]:-}"
+  if [ "$metadata_only" = false ] && [ -z "$release_tags" ] && ! grep -qE "$CODE" <<<"$changed"; then
+    continue
+  fi
   short="$(git log -1 --format=%h "$commit")"
   echo "pre-push: checking $(git log -1 --format='%h %s' "$commit")"
-  mkdir -p "$WORK_PARENT"
-  work="$(mktemp -d "$WORK_PARENT/check.XXXXXX")"
-  git archive "$commit" | tar -x -C "$work"
-  # A venv per commit: the checkout's editable install would make subprocess tests import
-  # the worktree (including other people's uncommitted farmer/ edits) instead of this commit.
-  uv venv -q --python 3.13 "$work/.venv"
-  run_in "$work" uv pip install -q --python "$work/.venv/bin/python" -e ".[test]" mypy
-  PY="$work/.venv/bin/python"
+  if [ -z "$work" ]; then
+    mkdir -p "$WORK_PARENT"
+    work="$(mktemp -d "$WORK_PARENT/check.XXXXXX")"
+    checkout="$work/checkout"
+  fi
+  mkdir "$checkout"
+  git archive "$commit" | tar -x -C "$checkout"
+  if [ "$metadata_only" = true ] || [ -n "$release_tags" ]; then
+    if [ "$metadata_only" = true ] && grep -Fxq 'pyproject.toml' <<<"$changed"; then
+      if ! git show "$commit^:pyproject.toml" >"$work/previous.toml" 2>/dev/null; then
+        metadata_only=false
+      fi
+    fi
+    status=0
+    (cd "$checkout" && check_metadata "$metadata_only" "$release_tags") || status=$?
+    rm -f "$work/previous.toml"
+    if [ "$status" = 0 ]; then
+      echo "pre-push: $short release metadata matches; skipping full suite"
+      rm -rf "$checkout"
+      continue
+    elif [ "$status" != 10 ]; then
+      echo "pre-push: $short release metadata failed validation" >&2
+      exit 1
+    fi
+  fi
+
+  # Every archive replaces the same checkout path so editable imports, including
+  # subprocesses and packaged farmer data, see only that commit's tracked files.
+  venv="$work/venvs/$(git rev-parse "$commit:pyproject.toml")"
+  PY="$venv/bin/python"
+  if [ ! -x "$PY" ]; then
+    uv venv -q --python 3.13 "$venv"
+    run_in "$checkout" uv pip install -q --python "$PY" -e ".[test]" mypy 'pytest-xdist>=3.6'
+  fi
   for target in linux win32; do
     other=$([ "$target" = linux ] && echo windows || echo linux)
-    run_in "$work" "$PY" -m mypy --python-version 3.13 --platform "$target" --follow-imports=silent \
+    run_in "$checkout" "$PY" -m mypy --python-version 3.13 --platform "$target" --follow-imports=silent \
       --exclude "midgard_farm/platform/${other}\.py$" src
   done
   # Pytest temp lives in $work so the trap removes it; the default /tmp/pytest-of-$USER
   # keeps ~600 MB per run and filled the /tmp quota on 2026-11-20.
-  run_in "$work" env QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q -p no:cacheprovider --basetemp="$work/.pytest-tmp" tests
+  run_in "$checkout" env QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q -p no:cacheprovider -n 4 --basetemp="$work/.pytest-tmp" tests
   if grep -q '^farmer/' <<<"$changed"; then
-    run_in "$work/farmer" "$PY" -m pytest -q -p no:cacheprovider --basetemp="$work/.pytest-tmp-farmer" tests
+    run_in "$checkout/farmer" "$PY" -m pytest -q -p no:cacheprovider -n 4 --basetemp="$work/.pytest-tmp-farmer" tests
   fi
-  rm -rf "$work"
-  work=""
+  rm -rf "$checkout" "$work/.pytest-tmp" "$work/.pytest-tmp-farmer"
 done

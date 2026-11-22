@@ -69,12 +69,18 @@ def _extract_verified(path: Path, expected_sha256: str, destination: Path) -> bo
     return True
 
 
+def cached_archive(os_: Platform) -> Path:
+    """Locate the pinned archive without creating its cache directory."""
+    release = RELEASES[os_.release_os]
+    return os_.app_data_dir() / "gdre" / _VERSION / release.url.rsplit("/", 1)[-1]
+
+
 def prepare(os_: Platform, destination: Path) -> Gdre:
     """Check the cached ZIP before unpacking; never execute a cached loose binary."""
     release = RELEASES[os_.release_os]
-    cache = os_.app_data_dir() / "gdre" / _VERSION
+    cached = cached_archive(os_)
+    cache = cached.parent
     cache.mkdir(parents=True, exist_ok=True)
-    cached = cache / release.url.rsplit("/", 1)[-1]
     try:
         cache_ok = False
         if cached.exists():

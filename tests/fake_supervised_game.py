@@ -22,6 +22,7 @@ status_path = profile / "farmer_status.json"
 stop = profile / "farmer_stop"
 command_path = profile / "farmer_command"
 seq = 0
+initial_phase = "paused" if os.environ.get("FARMER_PAUSED") == "1" else "run"
 
 
 def write_status(text):
@@ -71,7 +72,7 @@ if kind == "commands" and arg == "preboot":
         time.sleep(0.01)
     stop.unlink()
 for _ in range(3):
-    status()
+    status(initial_phase)
     time.sleep(0.05)
 if kind in {"clean", "missing-terminal", "foreign-session"}:
     status("done", arg)
@@ -103,9 +104,11 @@ if kind == "hang":
     plan.with_suffix(".grandchild").write_text(str(child.pid))
     forever()
 if kind == "commands":
-    phase = arg.removeprefix("phase-") if arg.startswith("phase-") else "run"
+    phase = arg.removeprefix("phase-") if arg.startswith("phase-") else initial_phase
     deadline = time.monotonic() + 2 if arg == "timed-stall" else None
     while True:
+        if arg == "crash-before-pause" and command_path.exists():
+            os._exit(1)
         command = ""
         try:
             claimed = profile / "farmer_command.claimed"
@@ -135,6 +138,9 @@ if kind == "commands":
             os._exit(0)
         if command == "pause":
             phase = "paused"
+            if arg == "crash-on-pause":
+                status(phase)
+                os._exit(1)
         elif command in ("resume", "resume_settings"):
             if arg == "exit-on-resume":
                 os._exit(1)

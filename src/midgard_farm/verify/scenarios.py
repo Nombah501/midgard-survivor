@@ -128,9 +128,8 @@ SCENARIOS = {
         "class": "thief", "job_paths": {"thief": 0}, "stage": "prontera", "danger": 30,
         "oaths": _HELL_OATHS, "max_runs": 4, "restart_seconds": 0, "endless": False,
     }, partial(drive.direct, FARMER_TEST_FIELD_CHARGE="1"), judges.field_charge, preset="hell-rotation.json"),
-    # Exit 1 + failed terminal status, flush_failed + nonzero status code, FAIL flush_failed.
-    "flush-fail": Scenario(180, _SHORT | {"max_minutes": 0.5}, partial(drive.direct, FARMER_TEST_FLUSH_FAIL="1"),
-                           partial(judges.failed, reason="flush_failed")),
+    # Fail the native save during keep; do not advance the checkpoint or journal rewards.
+    "flush-fail": Scenario(180, _SHORT, partial(drive.direct, FARMER_TEST_FLUSH_FAIL="keep"), judges.flush_failed_keep),
     # Hook crash, same session, 2 started / 1 lost, only r2 journaled, totals and saved zeny agree, RUN_LOST.
     "crash-run": Scenario(180, _SHORT, partial(drive.crash, point="run"),
                           partial(judges.recovered, point="run", marker="RUN_LOST")),

@@ -5,13 +5,13 @@ import math
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .. import assets
-from ..core import app_update, catalog, commands, game_update
-from ..core.history import read_history, read_run_journal
+from ..core import _app_releases, app_update, catalog, commands, game_update
+from ..core.history import night_summary, read_history, read_run_journal, session_timing
 from ..core.profile import ProfileNotFound, find_profile
 from ..core.state import ServiceState, StateKind, read_state
 from ..core.supervisor import session_log_dir
@@ -96,7 +96,7 @@ _ACTIVITY = {
     StateKind.REBUILDING: "Rebuilding",
 }
 _TOTALS = (
-    ("runs", "Runs"), ("wins", "Wins"), ("lost", "Lost"), ("wall_s", "Time in runs"),
+    ("wins", "Wins"),
     ("zeny", "Zeny"), ("xp", "XP"), ("kills", "Kills"), ("cards_gain", "Cards"), ("coins", "Coins"), ("ymir", "Ymir"),
 )
 
@@ -130,6 +130,16 @@ def _format_number(value: object, decimals: int = 0) -> str:
     if isinstance(number, int) and decimals == 0:
         return f"{number:,}"
     return f"{number:,.{decimals}f}" if number is not None else _DASH
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return _DASH
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes} min"
+    return f"{minutes} min" if minutes else f"{secs} s"
 
 
 def _heartbeat_age(timestamp: float | None) -> str:
@@ -318,12 +328,24 @@ class HistoryMetric:
 
 
 @dataclass(frozen=True)
+class NightView:
+    window: str = ""
+    totals: list[HistoryMetric] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class HistoryView:
     rows: list[HistoryRow] = field(default_factory=list)
     latest_session_id: str = ""
+    latest_session_date: str = ""
+    latest_session_zeny: str = ""
+    session_facts: list[HistoryMetric] = field(default_factory=list)
+    stop_reason: str = ""
+    failure_reasons: str = ""
     totals: list[HistoryMetric] = field(default_factory=list)
     rewards: str = ""
     materials: str = ""
+    night: NightView = field(default_factory=NightView)
 
 
 @dataclass(frozen=True)
@@ -337,8 +359,14 @@ class UpdatesView:
     action_blocker: str = "Reading service state…"
     feedback: str = ""
     app_version: str = _DASH
+    latest_app_version: str = _DASH
     check_again_feedback: str = ""
-    app_check: str = "No update check yet."
+    app_check: str = "Not checked yet"
+    app_check_reason: str = ""
+    app_last_checked: str = "Never"
+    app_update_detail: str = ""
+    can_check_app: bool = False
+    app_changelog: str = ""
     previous_app_version: str = ""
     can_rollback: bool = False
     rollback_feedback: str = ""
@@ -355,11 +383,26 @@ class QuarantineView:
     paths: list[str] = field(default_factory=list)
 
 
+def _night_view(rows: list[dict[str, Any]], today: date, active: dict[str, Any] | None = None) -> NightView:
+    summary = night_summary(rows, today, active)
+    window = f"{today - timedelta(days=1):%d %b} 18:00 – {today:%d %b} 12:00 local"
+    if not summary.sessions:
+        return NightView(window)
+    downtime = _format_duration(summary.downtime_s)
+    if summary.partial_downtime and summary.downtime_s is not None:
+        downtime = f"≥ {downtime}"
+    return NightView(window, [
+        HistoryMetric("Zeny", _format_number(summary.zeny)),
+        HistoryMetric("Wins / runs", f"{_format_number(summary.wins)} / {_format_number(summary.runs)}"),
+        HistoryMetric("Downtime", downtime),
+    ])
+
+
 def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names: dict[str, str],
-                  journal: dict[str, list[dict[str, Any]]]) -> HistoryView:
+                  journal: dict[str, list[dict[str, Any]]], today: date) -> HistoryView:
     entries: list[HistoryRow] = []
-    newest_session = ""
-    totals: dict[str, Any] = {}
+    latest: dict[str, Any] | None = None
+    latest_date = ""
     for row in sorted(rows, key=lambda row: row["timestamp"], reverse=True):
         try:
             date = datetime.fromtimestamp(row["timestamp"]).strftime("%Y-%m-%d %H:%M")
@@ -369,8 +412,8 @@ def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names:
             case "session":
                 session = _text(row.get("session_id"))
                 quantities = _mapping(row.get("totals"))
-                if session and not newest_session:
-                    newest_session, totals = session, quantities
+                if session and latest is None:
+                    latest, latest_date = row, date
                 summary = [f"{_format_number(quantities[key])} {label}"
                            for key, label in (("runs", "runs"), ("wins", "wins"), ("zeny", "zeny"), ("losses", "losses"))
                            if _number(quantities.get(key)) is not None]
@@ -405,21 +448,40 @@ def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names:
                 title = f"App update · {outcome}" if outcome else "App update"
                 entries.append(HistoryRow(date, title, _text(row.get("detail")) or _text(row.get("reason"))))
 
-    if not newest_session:
-        return HistoryView(rows=entries)
-    seconds = _number(totals.get("wall_s"))
-    hours = seconds / 3600 if seconds is not None else None
-    metrics = [HistoryMetric(label, (_format_number(hours, 1) + " h" if hours is not None else _DASH)
-                             if key == "wall_s" else _format_number(totals.get(key))) for key, label in _TOTALS]
+    night = _night_view(rows, today)
+    if latest is None:
+        return HistoryView(rows=entries, night=night)
+    totals = _mapping(latest.get("totals"))
+    timing = session_timing(latest)
+    facts = [
+        HistoryMetric("Elapsed", _format_duration(timing.elapsed_s)),
+        HistoryMetric("Time in runs", _format_duration(timing.run_s)),
+        HistoryMetric("Downtime", _format_duration(timing.downtime_s)),
+        HistoryMetric("Runs started", _format_number(totals.get("started"))),
+        HistoryMetric("Settled", _format_number(totals.get("runs"))),
+        HistoryMetric("Lost runs", _format_number(totals.get("lost"))),
+        HistoryMetric("Restarts", _format_number(latest.get("restarts"))),
+        HistoryMetric("Attempt failures", _format_number(latest.get("attempt_failure_count"))),
+    ]
+    hours = timing.elapsed_s / 3600 if timing.elapsed_s is not None else None
     rewards = " · ".join(f"{_format_number(value / hours)} {label}"
                          for key, label in (("zeny", "zeny"), ("xp", "XP"), ("coins", "coins"),
                                             ("ymir", "Ymir"), ("cards_gain", "cards"))
                          if hours and hours > 0 and (value := _number(totals.get(key))) is not None) or _DASH
     materials = [(key, count) for key, value in _mapping(totals.get("materials")).items()
                  if (count := _number(value)) is not None and count != 0]
-    return HistoryView(entries, newest_session, metrics, rewards,
-                       " · ".join(f"{key.replace('_', ' ').title()} {_format_number(count)}"
-                                  for key, count in sorted(materials, key=lambda entry: (-entry[1], entry[0]))) or _DASH)
+    failures = latest.get("attempt_failures")
+    return HistoryView(
+        rows=entries, latest_session_id=_text(latest.get("session_id")), latest_session_date=latest_date,
+        latest_session_zeny=_format_number(totals["zeny"]) if _number(totals.get("zeny")) is not None else "",
+        session_facts=facts, stop_reason=_label(latest.get("reason")) or _DASH,
+        failure_reasons=" · ".join(label for failure in failures if (label := _label(failure)))
+        if isinstance(failures, list) else "",
+        totals=[HistoryMetric(label, _format_number(totals.get(key))) for key, label in _TOTALS],
+        rewards=rewards, materials=" · ".join(f"{key.replace('_', ' ').title()} {_format_number(count)}"
+                                              for key, count in sorted(materials, key=lambda entry: (-entry[1], entry[0])))
+        or _DASH, night=night,
+    )
 
 
 @dataclass(frozen=True)
@@ -502,9 +564,15 @@ class SessionModel:
         self._action_error = ""
         self._patch_request: tuple[commands.PatchCommand, Path] | None = None
         self._app_version = assets.version()
+        try:
+            self._app_channel_configured = bool(_app_releases.MINISIGN_PUBLIC_KEY and _app_releases.update_base_url())
+        except (_app_releases.ReleaseError, ValueError):
+            self._app_channel_configured = False
+        self._app_check_feedback = ""
         self._rollback_request: Path | None = None
         self._history_rows: list[dict[str, Any]] = []
         self._history = HistoryView()
+        self._history_date: date | None = None
         self._history_stage_names: dict[str, str] = {}
         self._history_item_names: dict[str, str] = {}
         self._history_journal: dict[str, list[dict[str, Any]]] = {}
@@ -525,7 +593,9 @@ class SessionModel:
         except (OSError, ProfileNotFound):
             profile = None
         self._refresh_journal(profile)
-        self._refresh_history(names, item_names)
+        now = time.time()
+        today = datetime.fromtimestamp(now).date()
+        self._refresh_history(names, item_names, today)
         location = self._session_settings.location
         level = self._session_settings.difficulty
         location_index = next((i for i, row in enumerate(locations) if row["enabled"] and row["id"] == location),
@@ -573,9 +643,21 @@ class SessionModel:
         materials = f"{_format_number(rates.get('ore_h'), 1)} / {_format_number(rates.get('crumbs_h'), 1)}"
         totals = _mapping(status.get("totals"))
         run, detail = self._run_text(status, totals, names)
-        journal = self._journal.get((state.session_id or "") if busy else self._last_journal_session, [])
+        history = self._history
+        journal_id = (state.session_id or "") if busy else (history.latest_session_id or self._last_journal_session)
+        journal = self._journal.get(journal_id, [])
         band = _settled_band(journal, names)
         numbers, metrics, duration = _session_measurements(journal, band, totals)
+        if busy and state.session_id:
+            saved = _object(self._os, self._os.app_data_dir() / "session.json")
+            started_at = _number(saved.get("started_at"))
+            if saved.get("id") == state.session_id and started_at is not None and started_at <= now:
+                settled = {key: numbers.get(key, 0) for key in ("zeny", "wins", "runs")}
+                if (_number(totals.get("runs")) or 0) >= len(journal):
+                    settled.update({key: value for key in settled if (value := _number(totals.get(key))) is not None})
+                active = {"session_id": state.session_id, "started_at": started_at,
+                          "timestamp": now, "totals": settled}
+                history = replace(history, night=_night_view(self._history_rows, today, active))
         current_number = 0
         run_id = _text(status.get("run_id"))
         if status.get("phase") in _RUN_PHASES and not (run_id and any(row.get("run_id") == run_id for row in journal)):
@@ -631,7 +713,7 @@ class SessionModel:
             start_reason=reason or oath_blocker, start_refusal=refusal,
             resume_refusal=(oath_blocker or resume_refusal) if can_resume else resume_refusal,
             action_error=self._action_error, service_missing=missing,
-            history=self._history, updates=updates, quarantine=quarantine,
+            history=history, updates=updates, quarantine=quarantine,
         )
 
     def _read_status(self, state: ServiceState, profile: Path | None) -> dict[str, Any]:
@@ -737,18 +819,20 @@ class SessionModel:
         if self._journal_version is not None:
             self._journal_version, self._journal, self._last_journal_session = None, {}, ""
 
-    def _refresh_history(self, names: dict[str, str], item_names: dict[str, str]) -> None:
+    def _refresh_history(self, names: dict[str, str], item_names: dict[str, str], today: date) -> None:
         try:
             rows = read_history(self._os)
         except OSError:
-            return  # Retain the last readable history until the file becomes available.
+            rows = self._history_rows  # Retain the last readable history.
         if (rows != self._history_rows or names != self._history_stage_names
-                or item_names != self._history_item_names or self._journal is not self._history_journal):
+                or item_names != self._history_item_names or self._journal is not self._history_journal
+                or today != self._history_date):
             self._history_rows = rows
             self._history_stage_names = names
             self._history_item_names = item_names
             self._history_journal = self._journal
-            self._history = _history_view(rows, names, item_names, self._journal)
+            self._history = _history_view(rows, names, item_names, self._journal, today)
+            self._history_date = today
             latest = max((row for row in rows if row["kind"] == "game_update" and _update_outcome(row)),
                          key=lambda row: row["timestamp"], default=None)
             self._last_update = (_update_outcome(latest), _text(latest.get("detail"))) if latest else ("No outcome yet", "")
@@ -791,22 +875,42 @@ class SessionModel:
                     or (outcome == "restore_failed" and restore_requested_here)):
                 feedback = _text(restore.get("reason"))
         app = app_update.read_update_status(self._os)
-        check = "No update check yet."
-        if app.reason:
-            if app.last_checked is None:
-                check = f"No successful update check yet ({app.reason})."
-            else:
-                days = max(0, int((time.time() - app.last_checked) // 86400))
-                check = f"Updates not checked for {days} {'day' if days == 1 else 'days'} ({app.reason})."
-        elif app.last_checked is not None:
-            when = datetime.fromtimestamp(app.last_checked).strftime("%Y-%m-%d %H:%M")
-            check = f"Last checked: {when}."
+        running = state.kind is not StateKind.STALE
+        pending = running and app.check_pending
+        version = app.version or self._app_version
+        reason = ""
+        if not self._app_channel_configured:
+            check = "Channel not configured yet."
+        elif pending:
+            check = "Checking…"
+        elif app.last_result == "error":
+            check = "Failed"
+            reason = app.reason or "No reason was reported."
+        elif app.last_result == "up_to_date" or version == app.latest_version:
+            check = "Up to date"
+        elif app.last_result in ("staged", "excluded"):
+            check = "Update available"
+        else:
+            check = "Not checked yet"
+        when = (datetime.fromtimestamp(app.last_checked).strftime("%Y-%m-%d %H:%M")
+                if app.last_result is not None and app.last_checked is not None else "Never")
+        app_detail = self._app_check_feedback
         if app.switch_overdue:
-            check = "App update did not finish. Restart the service; if it cannot start, rerun the previous setup."
+            app_detail = "App update did not finish. Restart the service; if it cannot start, rerun the previous setup."
         elif app.switching:
-            check = "App update is waiting for the service to restart."
-        elif app.staged and app.staged != app.version and not app.reason:
-            check = f"Version {app.staged} downloaded; it will install after the AFK session and game close."
+            app_detail = "App update is waiting for the service to restart."
+        elif not app_detail:
+            if app.staged and app.staged != version and not app.reason:
+                app_detail = f"Version {app.staged} downloaded; it will install after the AFK session and game close."
+            elif app.last_result == "excluded" and app.latest_version != version:
+                app_detail = "This version will not install automatically after rollback."
+            elif self._app_channel_configured and not app.version:
+                app_detail = "App updates need an installed release."
+            elif self._app_channel_configured and not running:
+                app_detail = "Start the service to check for App updates."
+        changelog = app.changelog if app.latest_version and (
+            app.last_result != "up_to_date" or version == app.latest_version
+        ) else ""
         rollback_feedback = ""
         if self._rollback_request is not None:
             name = self._rollback_request.name
@@ -814,11 +918,20 @@ class SessionModel:
                 rollback_feedback = f"Rollback refused: {_text(refusal.get('reason'))}"
             elif self._rollback_request.exists():
                 rollback_feedback = "Rollback queued; it will run when the game is closed."
-        return UpdatesView(title, detail, activity, activity_detail, *self._last_update, blocker, feedback,
-                           app.version or self._app_version, check_again_feedback, check, app.previous or "",
-                           bool(app.previous and not blocker and not app.switching
-                                and not (self._rollback_request and self._rollback_request.exists())),
-                           rollback_feedback)
+        return UpdatesView(
+            title, detail, activity, activity_detail, *self._last_update, blocker, feedback,
+            app_version=version, latest_app_version=app.latest_version or _DASH,
+            check_again_feedback=check_again_feedback, app_check=check, app_check_reason=reason,
+            app_last_checked=when,
+            app_update_detail=app_detail,
+            can_check_app=bool(app.version and self._app_channel_configured and running
+                               and not pending and not app.switching),
+            app_changelog=changelog,
+            previous_app_version=app.previous or "",
+            can_rollback=bool(app.previous and not blocker and not app.switching
+                              and not (self._rollback_request and self._rollback_request.exists())),
+            rollback_feedback=rollback_feedback,
+        )
 
     def _start_refusal(self, state: ServiceState) -> str:
         if self._last_start is not None:
@@ -988,6 +1101,16 @@ class SessionModel:
         if request is not None:
             self._patch_request = command, request
         return request
+
+    def check_app_updates(self) -> None:
+        if not self.poll().updates.can_check_app:
+            return
+        try:
+            app_update.request_update_check(self._os)
+        except OSError:
+            self._app_check_feedback = "Could not queue the App update check: app data is unavailable."
+        else:
+            self._app_check_feedback = ""
 
     def rollback_app(self) -> Path | None:
         if not self.poll().updates.can_rollback:

@@ -102,6 +102,10 @@ class Platform(abc.ABC):
     def game_executable(self) -> Path:
         """Resolve the installed game executable, honoring per-user overrides."""
 
+    def game_executable_readonly(self) -> Path:
+        """Resolve the game executable without recording a new location."""
+        return self.game_executable()
+
     @abc.abstractmethod
     def game_pids(self) -> set[int]:
         """Processes running the game executable, from any folder."""
@@ -132,6 +136,10 @@ class Platform(abc.ABC):
     @abc.abstractmethod
     def unregister_service(self) -> None:
         """Stop and remove the background service registration."""
+
+    @abc.abstractmethod
+    def service_registered(self) -> bool:
+        """Query whether the OS knows about this user's service without changing it."""
 
     @abc.abstractmethod
     def start_service(self) -> None:

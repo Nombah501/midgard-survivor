@@ -125,7 +125,7 @@ ColumnLayout {
             visible: band.runs.length > 0
             spacing: band.theme.compact ? 8 : 16
             Repeater {
-                model: ["win", "loss", "current", "aborted"]
+                model: band.currentNumber > 0 ? ["win", "loss", "current", "aborted"] : ["win", "loss", "aborted"]
                 delegate: RowLayout {
                     required property string modelData
                     spacing: 4

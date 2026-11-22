@@ -13,21 +13,27 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal
 
 from ..platform import InstanceLock, LockHeld, Platform
 from . import _app_releases as releases
 from .commands import submit
 from .config import read_config
 from .history import append_event, read_history
+from .install import remove_legacy_release_token
 from .profile import ProfileNotFound, find_profile
 
 CHECK_INTERVAL = 86400.0
+_CHECK_REQUEST_POLL = 1.0
+_CHECK_REQUEST = "app-update-check-request"
+_CHECK_LOCK = "app-update-check.lock"
+_SEQUENCE_FLOOR = "app-update-sequence.json"
 READY_TIMEOUT = 60.0
 HANDOFF_TIMEOUT = 15.0
 POLL = 0.2
 _PLATFORM_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 type Notify = Callable[[str, str], None]
+type CheckResult = Literal["up_to_date", "staged", "excluded", "error"]
 
 
 def _load(os_: Platform, name: str) -> dict[str, Any]:
@@ -57,6 +63,45 @@ def _executable(os_: Platform, version: str) -> Path:
     return os_.app_data_dir() / "versions" / version / ("midgard-farm-service" + os_.executable_suffix)
 
 
+def request_update_check(os_: Platform) -> None:
+    """Ask the installed service to check now; results are read via read_update_status."""
+    os_.write_atomic(os_.app_data_dir() / _CHECK_REQUEST, b"")
+
+
+def _check_pending(os_: Platform) -> bool:
+    data = os_.app_data_dir()
+    lock = data / _CHECK_LOCK
+    try:
+        if (data / _CHECK_REQUEST).is_file():
+            return True
+        if lock.is_file():
+            with os_.acquire_lock(lock):
+                return False
+    except LockHeld:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def _read_floor(os_: Platform) -> tuple[int, str]:
+    try:
+        payload = json.loads(os_.read_shared(os_.app_data_dir() / _SEQUENCE_FLOOR))
+    except FileNotFoundError:
+        return 0, ""
+    except (OSError, ValueError, RecursionError):
+        raise releases.ReleaseError("could not read the saved update sequence floor") from None
+    if (not isinstance(payload, dict) or type(payload.get("sequence")) is not int
+            or payload["sequence"] < 1 or not releases.is_sha256(payload.get("manifest_sha256"))):
+        raise releases.ReleaseError("could not read the saved update sequence floor")
+    return payload["sequence"], payload["manifest_sha256"]
+
+
+def _unexpired(checked: dict[str, Any]) -> bool:
+    expires_at = checked.get("expires_at")
+    return type(expires_at) is int and expires_at > time.time()
+
+
 @dataclass(frozen=True)
 class UpdateStatus:
     version: str | None
@@ -66,21 +111,30 @@ class UpdateStatus:
     reason: str
     switching: bool
     switch_overdue: bool
+    latest_version: str | None
+    changelog: str
+    last_result: CheckResult | None
+    check_pending: bool
 
 
 def read_update_status(os_: Platform) -> UpdateStatus:
+    check_pending = _check_pending(os_)
     checked = _load(os_, "app-update-check.json")
     last = checked.get("last_checked")
     switch = _pending(os_)
     state = _load(os_, "app-update.json")
     staged = _version(checked.get("staged"))
-    if staged in _bad(state) or staged == state.get("manual_hold"):
+    if staged in _bad(state) or staged == state.get("manual_hold") or not _unexpired(checked):
         staged = None
     cutoff = (switch.deadline or switch.created + HANDOFF_TIMEOUT) if switch else None
     return UpdateStatus(_selected(os_), _version(state.get("previous")), staged,
                         last if type(last) is float and math.isfinite(last) and 0 < last < 1e11 else None,
                         reason if isinstance(reason := checked.get("reason"), str) else "",
-                        switch is not None, bool(cutoff and time.time() > cutoff))
+                        switch is not None, bool(cutoff and time.time() > cutoff),
+                        _version(checked.get("latest_version")),
+                        changelog if isinstance(changelog := checked.get("changelog"), str) else "",
+                        result if (result := checked.get("last_result")) in
+                        ("up_to_date", "staged", "excluded", "error") else None, check_pending)
 
 
 @dataclass(frozen=True)
@@ -131,10 +185,9 @@ def _queue(os_: Platform, switch: _Switch) -> None:
 class AppUpdater:
     """Check on a background thread; switch only on the supervisor's idle boundary."""
 
-    def __init__(self, os_: Platform, version: str, notify: Notify):
+    def __init__(self, os_: Platform, version: str):
         self.os = os_
         self.version = version
-        self.notify = notify
         self.enabled = _selected(os_) == version and _version(version) is not None
         self._stop = threading.Event()
         self._started = False
@@ -155,66 +208,76 @@ class AppUpdater:
             threading.Thread(target=self._check_daily, name="app-update-check", daemon=True).start()
 
     def _check_daily(self) -> None:
+        os_ = self.os
+        data = os_.app_data_dir()
+        request = data / _CHECK_REQUEST
+        next_check = time.monotonic()
         while not self._stop.is_set():
+            remaining = next_check - time.monotonic()
             try:
-                self._check()
-            except LockHeld:
-                self._stop.wait(POLL)
-                continue
-            self._stop.wait(CHECK_INTERVAL)
-
-    def _check(self) -> None:
-        with self.os.acquire_lock(self.os.app_data_dir() / "app-update.lock"):
-            if _pending(self.os) is None and _selected(self.os) == self.version:
-                self._check_locked()
+                if remaining > 0 and not request.is_file():
+                    self._stop.wait(min(_CHECK_REQUEST_POLL, remaining))
+                    continue
+                with os_.acquire_lock(data / "app-update.lock"):
+                    if _selected(os_) != self.version:
+                        return
+                    if _pending(os_) is None:
+                        with os_.acquire_lock(data / _CHECK_LOCK):
+                            request.unlink(missing_ok=True)
+                            self._check_locked()
+                        next_check = time.monotonic() + CHECK_INTERVAL
+                        continue
+            except (LockHeld, OSError):
+                pass  # The watchdog, setup, or another check can temporarily own this boundary.
+            self._stop.wait(_CHECK_REQUEST_POLL)
 
     def _check_locked(self) -> None:
         os_ = self.os
         prior = _load(os_, "app-update-check.json")
-        state = _load(os_, "app-update.json")
-        bad = _bad(state)
-        hold = _version(state.get("manual_hold"))
-        excluded = (*bad, hold) if hold else bad
-        versions = os_.app_data_dir() / "versions"
-        verified = prior.get("verified_assets")
-        rejected = False
-        stamp = None
-        token_path = os_.app_data_dir() / "release-token"
-
-        def invalidate_stage() -> None:
-            if prior.get("staged") is not None or prior.get("verified_assets") is not None:
-                prior.update(staged=None, verified_assets=None)
-                _save(os_, "app-update-check.json", prior)
-
+        result: dict[str, Any] = {key: prior[key] for key in ("latest_version", "changelog", "verified_assets")
+                                  if key in prior}
+        target = None
         try:
-            if token_path.is_symlink() or not token_path.is_file():
-                raise releases.ReleaseError("no release token; rerun setup to enter it")
-            stamp = token_path.stat().st_mtime_ns
-            token = os_.read_shared(token_path).decode().strip()
-            if not token.isascii() or not token or not token.isprintable() or any(c.isspace() for c in token):
-                raise releases.ReleaseError("invalid release token; rerun setup to replace it")
-            versions.mkdir(exist_ok=True)
-            release = releases.fetch(os_, token, self.version, excluded, versions, verified=verified,
-                                     invalidate=invalidate_stage)
-            result = {"last_checked": time.time(), "reason": "", "staged": release.version if release else None,
-                      "verified_assets": releases.asset_key(release) if release else None}
-            if not self._stop.is_set():
-                _save(os_, "app-update-check.json", result)
-                _prune(os_, self.version, release.version if release else None)
-            return
-        except releases.TokenRejected as exc:
-            result = {**prior, "reason": str(exc), "rejected_token_mtime": stamp}
-            rejected = stamp != prior.get("rejected_token_mtime")
-        except (OSError, UnicodeError, releases.ReleaseError) as exc:
-            reason = str(exc) if isinstance(exc, releases.ReleaseError) else "could not read local update data"
-            result = {**prior, "reason": reason}
+            remove_legacy_release_token(os_.app_data_dir())
+            manifest, digest = releases.get_manifest()
+            sequence, accepted_digest = _read_floor(os_)
+            if manifest.sequence < sequence:
+                raise releases.ReleaseError("update manifest sequence is below the saved floor")
+            if manifest.sequence == sequence and digest != accepted_digest:
+                raise releases.ReleaseError("update manifest sequence was reused")
+            if manifest.sequence > sequence:
+                # Advance on verified metadata even if downloading the archive fails.
+                _save(os_, _SEQUENCE_FLOOR, {"sequence": manifest.sequence, "manifest_sha256": digest})
+            result.update(latest_version=manifest.version, changelog=manifest.changelog, reason="",
+                          manifest_sha256=digest, expires_at=manifest.expires_at)
+            state = _load(os_, "app-update.json")
+            latest = releases.version_key(manifest.version)
+            current = releases.version_key(self.version)
+            if latest is None or current is None or latest <= current:
+                result["last_result"] = "up_to_date"
+            elif manifest.version in _bad(state) or manifest.version == state.get("manual_hold"):
+                result["last_result"] = "excluded"
+            else:
+                versions = os_.app_data_dir() / "versions"
+                versions.mkdir(exist_ok=True)
+                asset = manifest.archives[os_.release_os]
+                verified = f"{asset.sha256}/{manifest.version}"
+                if verified != result.get("verified_assets") or not releases.has_service(os_, versions / manifest.version):
+                    releases.download(os_, manifest.version, asset, versions)
+                if not _unexpired(result):
+                    raise releases.ReleaseError("update manifest has expired")
+                target = manifest.version
+                result.update(last_result="staged", staged=target, verified_assets=verified)
+        except (OSError, releases.ReleaseError) as exc:
+            result.update(last_result="error", reason=str(exc) if isinstance(exc, releases.ReleaseError)
+                          else "could not read or write local update data")
         if not self._stop.is_set():
             try:
-                _save(os_, "app-update-check.json", result)
+                _save(os_, "app-update-check.json", {**result, "last_checked": time.time()})
             except OSError:
-                return  # A failed check is quiet, including a temporarily unwritable data directory.
-            if rejected:
-                self.notify("token_rejected", "release token rejected; enter a new token")
+                return  # A temporarily unwritable data directory cannot publish a result.
+            if result["last_result"] != "error":
+                _prune(os_, self.version, target)
 
     def begin(self, *, manual: bool) -> tuple[bool, str]:
         """Return (handoff queued, refusal); a busy game leaves a request pending."""
@@ -234,14 +297,16 @@ class AppUpdater:
                     verified = prior.get("verified_assets")
                     key, base = releases.version_key(target), releases.version_key(self.version)
                     if (not key or not base or key <= base or not isinstance(verified, str)
-                            or not verified.startswith(target + "/") or target in _bad(state)
+                            or not verified.endswith("/" + target) or not releases.is_sha256(verified[:64])
+                            or not _unexpired(prior) or prior.get("manifest_sha256") != _read_floor(os_)[1]
+                            or target in _bad(state)
                             or target == state.get("manual_hold") or target == self._auto_refused):
                         return False, ""
                 if not _quiet(os_):
                     return False, ""
                 switch = _Switch(uuid.uuid4().hex, self.version, target, manual, time.time())
                 _save(os_, "app-update-pending.json", asdict(switch))
-        except LockHeld:
+        except (LockHeld, releases.ReleaseError):
             return False, ""
         try:
             _queue(os_, switch)

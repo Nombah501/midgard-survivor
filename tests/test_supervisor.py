@@ -21,7 +21,7 @@ import pytest
 from midgard_farm import platform
 from midgard_farm.core import commands, launch, patch_info, supervisor
 from midgard_farm.core.history import append_event, history_path, read_history
-from midgard_farm.core.state import StateKind, read_state
+from midgard_farm.core.state import StateKind, StateReporter, read_state
 from midgard_farm.core.backup import known_good_snapshot, publish_known_good
 from midgard_farm.core.farmer_patch import farmer_hash
 
@@ -347,6 +347,65 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
     assert farm.notifications() == ["stop"]
 
 
+@pytest.mark.parametrize("crash", ["crash-on-pause", "crash-before-pause"])
+def test_pause_blocks_new_runs_after_child_restart_until_resume(farm, crash):
+    plan_game(farm, f"commands:{crash}", "commands")
+    with farm.service():
+        farm.start()
+        original = farm.status("run")
+        pause = farm.send("pause")
+        paused = wait_for(lambda: json.loads(farm.os_.read_shared(farm.status_path)),
+                          lambda status: status["pid"] != original["pid"] and status["phase"] == "paused")
+        saved = json.loads((farm.data / "session.json").read_bytes())
+        assert saved["paused"] is True and not pause.exists()
+        assert paused["session"] == original["session"]
+        farm.send("resume", settings={"location": "prontera", "difficulty": 2})
+        resumed = farm.status("run")
+        assert resumed["pid"] == paused["pid"]
+        assert json.loads((farm.data / "session.json").read_bytes())["paused"] is False
+        assert json.loads((farm.profile / "farmer.cfg").read_bytes())["stage"] == "prontera"
+        farm.send("finish")
+        outcome, _ = farm.outcome()
+    assert [attempt["outcome"] for attempt in outcome["attempts"]] == ["failed", "finished"]
+
+
+@pytest.mark.parametrize("resume_committed", [False, True])
+def test_pause_and_resume_survive_supervisor_restart(farm, resume_committed):
+    plan_game(farm, "commands")
+    request = farm.start()
+    saved = json.loads(request.read_bytes())
+    session_id = "afk-" + uuid.uuid4().hex
+    resume = farm.send("resume", settings={"location": "prontera", "difficulty": 2})
+    if resume_committed:
+        saved["settings"] = json.loads(resume.read_bytes())["settings"]
+    else:
+        resume.unlink()
+    started_at = time.time() - 300
+    (farm.data / "session.json").write_text(json.dumps({
+        "id": session_id, "start": saved, "request": request.name, "profile": str(farm.profile),
+        "paused": not resume_committed, "control_request": resume.name if resume_committed else None,
+        "started_at": started_at,
+        "attempts": [{"number": 1, "delay": 0, "outcome": "failed", "reason": "exit_1_phase_run",
+                      "exit_code": 1, "detail": ""}],
+    }))
+    directory = farm.data / "logs" / f"supervisor-{session_id}"
+    directory.mkdir(parents=True)
+    (directory / "attempt-01.log").touch()
+    with farm.service():
+        if not resume_committed:
+            assert farm.status("paused")["session"] == session_id
+            resume = farm.send("resume", settings={"location": "prontera", "difficulty": 2})
+        assert farm.status("run")["session"] == session_id
+        assert json.loads((farm.profile / "farmer.cfg").read_bytes())["stage"] == "prontera"
+        assert not resume.exists() and not commands.rejection_path(farm.os_, resume).exists()
+        farm.send("finish")
+        outcome, _ = farm.outcome()
+    row, = read_history(farm.os_)
+    for record in (outcome, row):
+        assert record["started_at"] == started_at
+        assert (record["restarts"], record["attempt_failure_count"]) == (1, 1)
+
+
 @POSIX
 def test_pending_watch_mode_is_used_by_the_restarted_game(farm):
     plan_game(farm, "commands:exit-on-resume", "done-sigabrt:max_runs")
@@ -632,6 +691,8 @@ def test_repeated_run_stalls_quarantine(farm):
     assert [attempt["reason"] for attempt in outcome["attempts"]] == ["run_stalled"] * 3
     assert farm.notifications() == ["fail", "fail", "quarantine"]
     report = json.loads((directory / "quarantine.json").read_bytes())
+    assert outcome["quarantine"] == report
+    assert (outcome["restarts"], outcome["attempt_failure_count"]) == (2, 3)
     assert report["last_failure"] == "run_stalled"
     assert "Run stalled" in state.quarantine["detail"]
     assert read_history(farm.os_)[0]["attempt_failures"] == ["run_stalled"]
@@ -806,8 +867,9 @@ def test_preflight_quarantine_names_the_actual_launcher_cause(farm):
         farm.start()
         outcome, directory = farm.outcome()
         state = wait_for(lambda: read_state(farm.os_), lambda state: state.kind is StateKind.IDLE and state.quarantine)
-        check = commands.submit(farm.os_, "check_again")
-        wait_for(lambda: not check.exists())
+        # A normal idle update check must not digest-repair the pack or replace the launcher failure.
+        command = commands.submit(farm.os_, "pause")
+        wait_for(lambda: not command.exists())
         assert read_state(farm.os_).quarantine == state.quarantine
         history = read_history(farm.os_)
         assert proc.poll() is None  # Still available to the window after quarantine.
@@ -1112,6 +1174,60 @@ def test_recovering_committed_outcome_adds_history_only_if_missing(farm, already
         row, = read_history(farm.os_)
         assert row["totals"] == {"runs": 2}
     assert not farm.plan.with_suffix(".count").exists()
+
+
+def test_committed_quarantine_recovers_before_diagnostic_copy_exists(farm):
+    session_id = "afk-" + uuid.uuid4().hex
+    request = farm.start()
+    (farm.data / "session.json").write_text(json.dumps({
+        "id": session_id, "start": json.loads(request.read_bytes()),
+        "request": request.name, "profile": str(farm.profile),
+    }))
+    directory = farm.data / "logs" / f"supervisor-{session_id}"
+    directory.mkdir(parents=True)
+    evidence = {"reason": "preflight_failed", "detail": "Missing game", "attempts": []}
+    outcome = {"session": session_id, "kind": "quarantined", "reason": "preflight_failed", "attempts": [],
+               "totals": {"runs": 2}, "run_choices": [], "quarantine": evidence}
+    (directory / "outcome.json").write_text(json.dumps(outcome))
+
+    with farm.service():
+        state = wait_for(lambda: read_state(farm.os_), lambda state: state.last_outcome)
+        assert state.last_outcome == outcome
+        assert state.quarantine["detail"] == "Missing game"
+        assert json.loads((directory / "quarantine.json").read_bytes()) == evidence
+    row, = read_history(farm.os_)
+    assert row["outcome"] == "quarantined" and row["totals"] == {"runs": 2}
+    assert not farm.plan.with_suffix(".count").exists()
+
+
+def test_save_failure_commits_quarantine_before_diagnostic_copy(farm, monkeypatch):
+    detail = "Could not verify the profile save at keep."
+    status = {"phase": "failed", "failed": True, "terminal": True, "finish_reason": "flush_failed",
+              "last_error": detail}
+    monkeypatch.setattr(supervisor, "run_attempt", lambda *_, **__: launch.AttemptExit(1, status, status, None))
+    copy_attempts = []
+    write = farm.os_.write_atomic
+
+    def fail_diagnostic_copy(path, data):
+        if path.name == "quarantine.json" and path.parent.name.startswith("supervisor-"):
+            committed = json.loads((path.parent / "outcome.json").read_bytes())
+            assert committed["quarantine"] == json.loads(data)
+            copy_attempts.append(path)
+            raise PermissionError("could not copy quarantine diagnostics")
+        write(path, data)
+
+    monkeypatch.setattr(farm.os_, "write_atomic", fail_diagnostic_copy)
+    farm.start()
+    with StateReporter(farm.os_) as reporter:
+        service = supervisor.Supervisor(farm.os_, farm.profile, supervisor.Policy(),
+                                        lambda: time.monotonic() if read_state(farm.os_).last_outcome else None,
+                                        lambda *_: None, state=reporter)
+        service.run()
+    outcome, _ = farm.outcome()
+    assert outcome["kind"] == "quarantined" and outcome["reason"] == "flush_failed"
+    assert [attempt["outcome"] for attempt in outcome["attempts"]] == ["fatal"]
+    assert len(copy_attempts) == 1 and not copy_attempts[0].exists()
+    assert read_state(farm.os_).quarantine["detail"] == detail
 
 
 @pytest.mark.parametrize(("broken", "payload"), [

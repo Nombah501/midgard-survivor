@@ -390,7 +390,11 @@ ApplicationWindow {
         Layout.fillWidth: true
         Layout.alignment: Qt.AlignTop
         spacing: 4
-        Caption { text: parent.title }
+        Caption {
+            Layout.fillWidth: true
+            text: parent.title
+            wrapMode: Text.Wrap
+        }
         Label {
             id: reading
             Layout.fillWidth: true
@@ -407,6 +411,73 @@ ApplicationWindow {
             visible: text.length > 0
             text: parent.detail
             wrapMode: Text.Wrap
+        }
+    }
+
+    component SessionFacts: ColumnLayout {
+        property alias stopReasonObjectName: stopReason.objectName
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        spacing: 8
+        GridLayout {
+            Layout.fillWidth: true
+            columns: 3
+            uniformCellWidths: true
+            columnSpacing: 12
+            rowSpacing: 12
+            Repeater {
+                model: shell.history.session_facts
+                delegate: Metric {
+                    required property var modelData
+                    title: modelData.label
+                    value: modelData.value
+                }
+            }
+        }
+        Caption {
+            id: stopReason
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            text: qsTr("Stop reason: %1").arg(shell.history.stop_reason)
+        }
+        Caption {
+            Layout.fillWidth: true
+            visible: shell.history.failure_reasons.length > 0
+            wrapMode: Text.Wrap
+            text: qsTr("Attempt failures: %1").arg(shell.history.failure_reasons)
+        }
+    }
+
+    component NightReport: ColumnLayout {
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        spacing: 8
+        SectionTitle { text: qsTr("Night") }
+        Caption {
+            Layout.fillWidth: true
+            text: shell.history.night.window
+            wrapMode: Text.Wrap
+        }
+        Caption {
+            Layout.fillWidth: true
+            visible: shell.history.night.totals.length === 0
+            text: qsTr("No recorded AFK sessions overlapped this window.")
+            wrapMode: Text.Wrap
+        }
+        GridLayout {
+            visible: shell.history.night.totals.length > 0
+            Layout.fillWidth: true
+            columns: 3
+            uniformCellWidths: true
+            columnSpacing: 12
+            Repeater {
+                model: shell.history.night.totals
+                delegate: Metric {
+                    required property var modelData
+                    title: modelData.label
+                    value: modelData.value
+                }
+            }
         }
     }
 
@@ -485,7 +556,9 @@ ApplicationWindow {
                     readonly property var runParts: shell.session.current_run === "—"
                         ? [] : shell.session.current_run.split(" · ")
                     readonly property bool hasRun: runParts.length > 0
-                    readonly property bool hasZeny: shell.session.session_numbers.zeny !== undefined
+                    readonly property string zenyTotal: shell.session.active
+                        ? shell.amount(shell.session.session_numbers.zeny)
+                        : shell.history.latest_session_zeny
                     readonly property bool hasRate: shell.session.zeny !== "—"
                     readonly property int rotationCount: shell.session.locations
                         .filter(row => typeof row.id === "string" && row.enabled).length
@@ -566,20 +639,20 @@ ApplicationWindow {
                             }
                         }
                         ColumnLayout {
-                            visible: afk.hasZeny || afk.hasRate
+                            visible: afk.zenyTotal.length > 0 || afk.hasRate
                             Layout.preferredWidth: Math.min(implicitWidth, afk.width * (shell.compact ? 0.47 : 0.45))
                             Layout.minimumWidth: 0
                             spacing: 0
                             Caption {
                                 Layout.alignment: Qt.AlignRight
-                                visible: afk.hasZeny
-                                text: shell.session.active ? qsTr("Zeny tonight") : qsTr("Zeny last session")
+                                visible: afk.zenyTotal.length > 0
+                                text: shell.session.active ? qsTr("Zeny this session") : qsTr("Zeny latest session")
                             }
                             Label {
                                 Layout.fillWidth: true
-                                visible: afk.hasZeny
+                                visible: afk.zenyTotal.length > 0
                                 horizontalAlignment: Text.AlignRight
-                                text: shell.amount(shell.session.session_numbers.zeny)
+                                text: afk.zenyTotal
                                 color: shell.ochre
                                 font.family: boldFont.name
                                 font.bold: true
@@ -608,10 +681,11 @@ ApplicationWindow {
                             theme: shell
                             runs: shell.session.session_runs
                             currentNumber: shell.session.current_number
-                            heading: shell.session.active || runs.length === 0 ? qsTr("Run rotation") : qsTr("Last session")
+                            heading: qsTr("Run rotation")
                             subtitle: !shell.compact && shell.session.active && afk.rotationCount > 0
                                 ? qsTr("%1 locations").arg(afk.rotationCount) : ""
                             emptyText: shell.session.active ? qsTr("Waiting for the first run to appear.")
+                                : shell.history.latest_session_id.length > 0 ? qsTr("No settled runs in the latest session.")
                                 : qsTr("Completed runs will appear here in rotation order.")
                         }
                         Rule { Layout.topMargin: shell.width >= 1000 ? 12 : 4 }
@@ -825,18 +899,35 @@ ApplicationWindow {
                                     checked: shell.session.keep_unowned_legendaries
                                     enabled: shell.session.can_pick_run_choice
                                     onToggled: shell.backend.setKeepUnownedLegendaries(checked)
+                                    Layout.alignment: Qt.AlignTop
                                 }
-                                StoneSwitch {
-                                    objectName: "showGameWindow"
-                                    text: qsTr("Show game window")
-                                    readonly property string helpText: qsTr("Applies at the next game launch. Closing the game window is treated as a game exit; the supervisor may restart it.")
-                                    Accessible.description: helpText
-                                    ToolTip.text: helpText
-                                    ToolTip.visible: hovered || activeFocus
-                                    ToolTip.delay: 350
-                                    checked: shell.session.show_game_window
-                                    enabled: !shell.runLocked && shell.session.can_change_show_game_window
-                                    onToggled: shell.backend.setShowGameWindow(checked)
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    Layout.alignment: Qt.AlignTop
+                                    spacing: 0
+                                    StoneSwitch {
+                                        id: windowSwitch
+                                        objectName: "showGameWindow"
+                                        text: qsTr("Show game window")
+                                        readonly property string helpText: qsTr("Applies at the next game launch. Closing the game window is treated as a game exit; the supervisor may restart it.")
+                                        Accessible.description: checked ? helpText + " " + windowIncomeWarning.text : helpText
+                                        ToolTip.text: helpText
+                                        ToolTip.visible: hovered || activeFocus
+                                        ToolTip.delay: 350
+                                        checked: shell.session.show_game_window
+                                        enabled: !shell.runLocked && shell.session.can_change_show_game_window
+                                        onToggled: shell.backend.setShowGameWindow(checked)
+                                    }
+                                    Caption {
+                                        id: windowIncomeWarning
+                                        objectName: "windowIncomeWarning"
+                                        Layout.fillWidth: true
+                                        visible: windowSwitch.checked
+                                        color: shell.warning
+                                        text: qsTr("Windowed mode roughly halves income.")
+                                        wrapMode: Text.Wrap
+                                    }
                                 }
                             }
 
@@ -991,7 +1082,37 @@ ApplicationWindow {
                         }
 
                         ColumnLayout {
+                            visible: !shell.session.active
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.alignment: Qt.AlignTop
+                            spacing: 12
+                            RowLayout {
+                                Layout.fillWidth: true
+                                SectionTitle {
+                                    objectName: "latestSessionHeading"
+                                    Layout.fillWidth: true
+                                    text: qsTr("Latest session")
+                                }
+                                Caption { text: shell.history.latest_session_date }
+                            }
+                            Caption {
+                                Layout.fillWidth: true
+                                visible: shell.history.latest_session_id.length === 0
+                                text: qsTr("No completed AFK session yet.")
+                                wrapMode: Text.Wrap
+                            }
+                            SessionFacts {
+                                visible: shell.history.latest_session_id.length > 0
+                                stopReasonObjectName: "latestSessionStopReason"
+                            }
+                            Rule {}
+                            NightReport { objectName: "afkNightReport" }
+                        }
+
+                        ColumnLayout {
                             id: tally
+                            visible: shell.session.active
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
                             Layout.alignment: Qt.AlignTop
@@ -1012,8 +1133,7 @@ ApplicationWindow {
                                 spacing: 12
                                 SectionTitle {
                                     Layout.fillWidth: true
-                                    text: !shell.session.active && tally.numbers.runs !== undefined
-                                        ? qsTr("Last session totals") : qsTr("Session so far")
+                                    text: qsTr("Session so far")
                                 }
                                 Caption {
                                     visible: shell.session.session_duration >= 60
@@ -1024,8 +1144,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 visible: tally.numbers.runs === undefined
                                 wrapMode: Text.Wrap
-                                text: shell.session.active ? qsTr("Totals appear as the farmer reports its progress.")
-                                                          : qsTr("No recorded session yet.")
+                                text: qsTr("Totals appear as the farmer reports its progress.")
                             }
                             RowLayout {
                                 Layout.fillWidth: true
@@ -1090,6 +1209,7 @@ ApplicationWindow {
                         width: parent.width
                         spacing: 12
                         PageTitle { text: qsTr("History") }
+                        NightReport { objectName: "historyNightReport" }
                         Caption {
                             visible: shell.history.rows.length === 0
                             text: qsTr("Completed AFK sessions and update events will appear here.")
@@ -1103,9 +1223,9 @@ ApplicationWindow {
                                 id: entry
                                 required property var modelData
                                 required property int index
-                                readonly property bool lastNight: modelData.session_id !== ""
+                                readonly property bool latestSession: modelData.session_id !== ""
                                     && modelData.session_id === shell.history.latest_session_id
-                                readonly property bool expandable: lastNight || modelData.run_choices.length > 0
+                                readonly property bool expandable: latestSession || modelData.run_choices.length > 0
                                 readonly property bool expanded: expandable
                                     && historyPanel.expandedSession === modelData.session_id
                                 Layout.fillWidth: true
@@ -1122,12 +1242,12 @@ ApplicationWindow {
                                         text: entry.modelData.title + (entry.modelData.summary ? " · " + entry.modelData.summary : "")
                                     }
                                     ActionButton {
-                                        objectName: entry.lastNight ? "lastNightDisclosure" : ""
+                                        objectName: entry.latestSession ? "latestSessionDisclosure" : ""
                                         visible: entry.expandable
                                         text: entry.expanded ? qsTr("Hide details")
-                                              : entry.lastNight ? qsTr("Last night") : qsTr("Run choices")
-                                        Accessible.name: !entry.expanded && entry.lastNight
-                                                         ? qsTr("Show details for the last night") : text
+                                              : entry.latestSession ? qsTr("Latest session") : qsTr("Run choices")
+                                        Accessible.name: !entry.expanded && entry.latestSession
+                                                         ? qsTr("Show details for the latest session") : text
                                         onClicked: historyPanel.expandedSession = entry.expanded ? "" : entry.modelData.session_id
                                     }
                                 }
@@ -1138,12 +1258,41 @@ ApplicationWindow {
                                     small: true
                                 }
                                 ColumnLayout {
-                                    objectName: entry.lastNight ? "lastNightDetails" : ""
+                                    objectName: entry.latestSession ? "latestSessionDetails" : ""
                                     visible: entry.expanded
                                     Layout.fillWidth: true
                                     Layout.topMargin: 4
                                     Layout.bottomMargin: 8
                                     spacing: 12
+                                    SessionFacts { visible: entry.latestSession && entry.expanded }
+                                    GridLayout {
+                                        visible: entry.latestSession
+                                        Layout.fillWidth: true
+                                        columns: shell.compact ? 3 : 5
+                                        uniformCellWidths: true
+                                        columnSpacing: 12
+                                        rowSpacing: 12
+                                        Repeater {
+                                            model: entry.expanded && entry.latestSession ? shell.history.totals : []
+                                            delegate: Metric {
+                                                required property var modelData
+                                                title: modelData.label
+                                                value: modelData.value
+                                            }
+                                        }
+                                    }
+                                    Metric {
+                                        visible: entry.latestSession
+                                        title: qsTr("Rewards per elapsed hour")
+                                        value: shell.history.rewards
+                                        valueObjectName: "latestSessionRewards"
+                                    }
+                                    Metric {
+                                        visible: entry.latestSession
+                                        title: qsTr("Materials")
+                                        value: shell.history.materials
+                                        valueObjectName: "latestSessionMaterials"
+                                    }
                                     Caption { text: qsTr("Session %1").arg(entry.modelData.session_id) }
                                     Repeater {
                                         model: entry.expanded ? entry.modelData.run_choices : []
@@ -1155,34 +1304,6 @@ ApplicationWindow {
                                             text: modelData
                                             wrapMode: Text.Wrap
                                         }
-                                    }
-                                    GridLayout {
-                                        visible: entry.lastNight
-                                        Layout.fillWidth: true
-                                        columns: shell.compact ? 3 : 5
-                                        uniformCellWidths: true
-                                        columnSpacing: 12
-                                        rowSpacing: 12
-                                        Repeater {
-                                            model: entry.expanded && entry.lastNight ? shell.history.totals : []
-                                            delegate: Metric {
-                                                required property var modelData
-                                                title: modelData.label
-                                                value: modelData.value
-                                            }
-                                        }
-                                    }
-                                    Metric {
-                                        visible: entry.lastNight
-                                        title: qsTr("Rewards per hour in runs")
-                                        value: shell.history.rewards
-                                        valueObjectName: "lastNightRewards"
-                                    }
-                                    Metric {
-                                        visible: entry.lastNight
-                                        title: qsTr("Materials")
-                                        value: shell.history.materials
-                                        valueObjectName: "lastNightMaterials"
                                     }
                                 }
                             }
@@ -1263,27 +1384,72 @@ ApplicationWindow {
                         }
                         Rule {}
                         SectionTitle { text: qsTr("App update") }
-                        Metric {
-                            title: qsTr("Installed version")
-                            value: shell.updates.app_version
-                            valueObjectName: "installedAppVersion"
-                        }
-                        Caption {
-                            objectName: "appUpdateCheck"
-                            text: shell.updates.app_check
+                        GridLayout {
                             Layout.fillWidth: true
-                            wrapMode: Text.Wrap
+                            columns: 2
+                            uniformCellWidths: true
+                            columnSpacing: 24
+                            rowSpacing: 12
+                            Metric {
+                                title: qsTr("Installed version")
+                                value: shell.updates.app_version
+                                valueObjectName: "installedAppVersion"
+                            }
+                            Metric {
+                                title: qsTr("Latest available version")
+                                value: shell.updates.latest_app_version
+                                valueObjectName: "latestAppVersion"
+                            }
+                            Metric {
+                                title: qsTr("Check status")
+                                value: shell.updates.app_check
+                                valueObjectName: "appUpdateCheck"
+                                detailObjectName: "appUpdateCheckReason"
+                                detail: shell.updates.app_check_reason
+                            }
+                            Metric {
+                                title: qsTr("Last checked")
+                                value: shell.updates.app_last_checked
+                                valueObjectName: "appUpdateLastChecked"
+                            }
                         }
-                        ActionButton {
-                            objectName: "rollbackAppButton"
-                            visible: Boolean(shell.updates.previous_app_version)
-                            enabled: shell.updates.can_rollback
-                            text: qsTr("Roll back to %1").arg(shell.updates.previous_app_version)
-                            onClicked: shell.backend.rollbackApp()
+                        BodyText {
+                            text: shell.updates.app_update_detail
+                            visible: text.length > 0
+                        }
+                        RowLayout {
+                            spacing: 8
+                            ActionButton {
+                                objectName: "checkAppUpdatesButton"
+                                text: qsTr("Check for updates")
+                                enabled: shell.updates.can_check_app
+                                onClicked: shell.backend.checkAppUpdates()
+                            }
+                            ActionButton {
+                                objectName: "rollbackAppButton"
+                                visible: Boolean(shell.updates.previous_app_version)
+                                enabled: shell.updates.can_rollback
+                                text: qsTr("Roll back to %1").arg(shell.updates.previous_app_version)
+                                onClicked: shell.backend.rollbackApp()
+                            }
                         }
                         BodyText {
                             text: shell.updates.rollback_feedback
                             visible: text.length > 0
+                        }
+                        ColumnLayout {
+                            visible: Boolean(shell.updates.app_changelog)
+                            Layout.fillWidth: true
+                            Layout.maximumWidth: 660
+                            Layout.topMargin: 6
+                            spacing: 8
+                            SectionTitle {
+                                text: qsTr("Changelog for %1").arg(shell.updates.latest_app_version)
+                            }
+                            BodyText {
+                                objectName: "appUpdateChangelog"
+                                text: shell.updates.app_changelog
+                            }
                         }
                     }
                 }

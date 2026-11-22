@@ -1,5 +1,6 @@
 """Drive the installed service, update watchdog and release transport with fakes only."""
 
+import base64
 import hashlib
 import io
 import json
@@ -16,6 +17,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 
 import pytest
+from nacl.signing import SigningKey
 
 from midgard_farm import assets, platform, service
 from midgard_farm.core import _app_releases, app_update, commands, farmer_patch, patch_info, supervisor
@@ -78,6 +80,8 @@ def archive(os_, variant="good"):
     files = {f"midgard-farm/midgard-farm-service{suffix}": b"service",
              f"midgard-farm/midgard-farm{suffix}": b"window",
              "midgard-farm/_internal/payload": b"data"}
+    if variant == "changed":
+        files["midgard-farm/_internal/payload"] = b"replacement"
     if variant == "traversal":
         files["midgard-farm/../../escaped"] = b"escape"
     output = io.BytesIO()
@@ -95,43 +99,59 @@ def archive(os_, variant="good"):
 
 
 class FakeReleases:
-    token = "fixture-secret-never-log"
+    _key = SigningKey.generate()
+    _key_id = b"test-key"
+    public_key = base64.b64encode(b"Ed" + _key_id + bytes(_key.verify_key)).decode()
 
     def __init__(self, os_):
         self.os = os_
         self.version = "2.0.0"
+        self.sequence = 10
+        self.expires_at = int(time.time()) + 600
+        self.changelog = "- Updates without a token.\n"
         self.status = 0
-        self.corrupt = False
-        self.unsafe = False
+        self.failure = ""
+        self.body = archive(os_)
         self.hits = []
-        self.asset_id = 11
-        self.checksum_id = 12
-        self.missing_checksum = False
+        self.signatures = {}
 
     def open(self, request, *, timeout):
-        url = request.full_url
-        assert request.get_header("Authorization") == f"Bearer {self.token}"
-        self.hits.append(url.rsplit("/", 1)[-1])
+        assert request.full_url.startswith("https://updates.test/")
+        assert request.get_header("Authorization") is None
+        key = request.full_url.removeprefix("https://updates.test/")
+        self.hits.append(key.split("/", 1)[0])
         if self.status:
-            raise HTTPError(url, self.status, self.token, {}, None)
-        platform_name = "windows-x86_64.zip" if self.os.executable_suffix else "linux-x86_64.tar.gz"
-        name = f"midgard-farm-{self.version}-{platform_name}"
-        body = archive(self.os, "traversal" if self.unsafe else "good")
-        if url.endswith("/releases"):
-            release_assets = [{"name": name, "id": self.asset_id}]
-            if not self.missing_checksum:
-                release_assets.append({"name": name + ".sha256", "id": self.checksum_id})
-            payload = [{"tag_name": "v9.0.0rc1", "draft": False, "prerelease": False, "assets": []},
-                       {"tag_name": "v8.0.0", "draft": False, "prerelease": True, "assets": []},
-                       {"tag_name": "v" + self.version, "draft": False, "prerelease": False,
-                        "assets": release_assets}]
-            return io.BytesIO(json.dumps(payload).encode())
-        assert request.get_header("Accept") == "application/octet-stream"
-        if url.endswith(f"/{self.checksum_id}"):
-            digest = "a" * 64 if self.corrupt else hashlib.sha256(body).hexdigest()
-            return io.BytesIO(f"{digest}  {name}\n".encode())
-        assert url.endswith(f"/{self.asset_id}")
-        return io.BytesIO(body)
+            raise HTTPError(request.full_url, self.status, "private diagnostic", {}, None)
+        if key == "stable/manifest.json":
+            body = self.body
+            digest = "a" * 64 if self.failure == "sha" else hashlib.sha256(body).hexdigest()
+            size = len(body) + {"short": 1, "long": -1}.get(self.failure, 0)
+            names = {"linux": "linux-x86_64.tar.gz", "windows": "windows-x86_64.zip"}
+            payload = json.dumps({
+                "schema": 1, "channel": "stable", "version": self.version, "sequence": self.sequence,
+                "expires_at": self.expires_at, "changelog": self.changelog, "archives": {
+                    os_: {"name": f"midgard-farm-{self.version}-{name}", "size": size, "sha256": digest}
+                    for os_, name in names.items()
+                },
+            }).encode()
+            signed = payload + b"tampered" if self.failure == "signature" else payload
+            self.signatures[hashlib.sha256(payload).hexdigest()] = self.sign(signed)
+            return io.BytesIO(payload)
+        if key.startswith("signatures/"):
+            return io.BytesIO(self.signatures[Path(key).stem])
+        assert key.startswith("archives/")
+        return io.BytesIO(self.body)
+
+    @classmethod
+    def sign(cls, payload):
+        comment = b"test trusted comment"
+        signature = cls._key.sign(hashlib.blake2b(payload).digest()).signature
+        return b"\n".join((
+            b"untrusted comment: fixture",
+            base64.b64encode(b"ED" + cls._key_id + signature),
+            b"trusted comment: " + comment,
+            base64.b64encode(cls._key.sign(signature + comment).signature),
+        )) + b"\n"
 
 
 @pytest.fixture
@@ -142,10 +162,11 @@ def installed(tmp_path, monkeypatch):
     current_dir.mkdir(parents=True)
     (current_dir / ("midgard-farm-service" + os_.executable_suffix)).touch()
     os_.write_atomic(os_.app_data_dir() / "current", b"1.0.0\n")
-    os_.write_atomic(os_.app_data_dir() / "release-token", (FakeReleases.token + "\n").encode())
     releases = FakeReleases(os_)
     monkeypatch.setattr(platform, "current", lambda: os_)
-    monkeypatch.setattr(_app_releases, "urlopen", releases.open)
+    monkeypatch.setattr(_app_releases, "UPDATE_BASE_URL", "https://updates.test")
+    monkeypatch.setattr(_app_releases, "MINISIGN_PUBLIC_KEY", releases.public_key)
+    monkeypatch.setattr(_app_releases._HTTPS, "open", releases.open)
     monkeypatch.setattr(app_update, "READY_TIMEOUT", 0.9)
     monkeypatch.setattr(app_update, "POLL", 0.02)
     monkeypatch.setattr(assets, "version", lambda: "1.0.0")
@@ -206,10 +227,10 @@ def test_awaits_closed_game_then_commits_after_selected_service_is_ready(install
             assert sorted(p.name for p in bundle_path(os_, "1.0.0").parent.iterdir()) == ["1.0.0", "2.0.0"]
             wait_for(lambda: [row["outcome"] for row in read_history(os_) if row["kind"] == "app_update"],
                      lambda outcomes: outcomes == ["installed"])
-    assert "11" in releases.hits and "12" in releases.hits
+    assert releases.hits[:3] == ["stable", "signatures", "archives"]
 
 
-def test_stale_marker_cannot_prevent_rollback_and_bad_version_is_never_downloaded_again(installed, monkeypatch, capsys):
+def test_stale_marker_cannot_prevent_rollback_and_bad_version_is_never_downloaded_again(installed, monkeypatch):
     os_, _, releases = installed
     with running_service(monkeypatch) as old:
         assert old.result(timeout=5) == 0
@@ -220,30 +241,51 @@ def test_stale_marker_cannot_prevent_rollback_and_bad_version_is_never_downloade
     assert any(message == "update to 2.0.0 rolled back" and priority == "high"
                for _, message, priority in os_.notifications)
     with running_service(monkeypatch):
-        wait_for(lambda: releases.hits.count("releases") == 2)
-        assert releases.hits.count("11") == 1
+        wait_for(lambda: app_update.read_update_status(os_).last_result == "excluded")
+        assert releases.hits.count("archives") == 1
         assert len(os_.watchdogs) == 1
-    assert FakeReleases.token not in (out := capsys.readouterr()).out + out.err
 
 
-@pytest.mark.parametrize("status", [401, 403, 500])
-def test_only_rejected_token_notifies_once_without_leaking_the_token(installed, monkeypatch, capsys, status):
+def test_check_now_surfaces_manifest_and_failure_on_running_service(installed, monkeypatch):
     os_, _, releases = installed
-    releases.status = status
-    for attempt in (1, 2):
-        with running_service(monkeypatch):
-            wait_for(lambda: releases.hits.count("releases") == attempt)
-    assert current(os_) == "1.0.0" and not os_.watchdogs
-    assert sum("token_rejected" in title for title, *_ in os_.notifications) == (status in (401, 403))
-    assert FakeReleases.token not in (out := capsys.readouterr()).out + out.err
-
-
-@pytest.mark.parametrize("unsafe", [False, True])
-def test_does_not_switch_to_corrupt_or_unsafe_release(installed, monkeypatch, unsafe):
-    os_, _, releases = installed
-    releases.corrupt, releases.unsafe = not unsafe, unsafe
+    os_.game = True
     with running_service(monkeypatch):
-        wait_for(lambda: app_update.read_update_status(os_).reason)
+        first = wait_for(lambda: app_update.read_update_status(os_), lambda status: status.staged == "2.0.0")
+        assert first.version == "1.0.0"
+        assert first.latest_version == "2.0.0"
+        assert first.changelog == "- Updates without a token.\n"
+        assert first.last_result == "staged" and first.last_checked
+        releases.status = 503
+        app_update.request_update_check(os_)
+        failed = wait_for(lambda: app_update.read_update_status(os_), lambda status: status.last_result == "error")
+        assert failed.last_checked > first.last_checked
+        assert failed.reason == "update server returned HTTP 503"
+        assert failed.staged is None and failed.latest_version == first.latest_version
+        releases.status = 0
+        releases.version, releases.sequence = "2.1.0", 11
+        releases.changelog = "- A newer release.\n"
+        app_update.request_update_check(os_)
+        recovered = wait_for(lambda: app_update.read_update_status(os_), lambda status: status.staged == "2.1.0")
+        assert recovered.last_checked > failed.last_checked
+        assert recovered.latest_version == "2.1.0" and recovered.changelog == "- A newer release.\n"
+        assert recovered.last_result == "staged" and recovered.reason == ""
+        assert not os_.notifications
+    assert current(os_) == "1.0.0" and not os_.watchdogs
+
+
+@pytest.mark.parametrize("failure, reason", [
+    ("sha", "archive SHA-256 did not match"), ("short", "archive size did not match"),
+    ("long", "archive size did not match"), ("traversal", "unsafe release archive path"),
+])
+def test_does_not_switch_to_corrupt_or_unsafe_release(installed, monkeypatch, failure, reason):
+    os_, _, releases = installed
+    if failure == "traversal":
+        releases.body = archive(os_, failure)
+    else:
+        releases.failure = failure
+    with running_service(monkeypatch):
+        status = wait_for(lambda: app_update.read_update_status(os_), lambda status: status.last_result == "error")
+        assert reason in status.reason
     assert current(os_) == "1.0.0"
     assert not bundle_path(os_, "2.0.0").exists() and not os_.watchdogs
     assert not (os_.app_data_dir() / "escaped").exists()
@@ -254,8 +296,8 @@ def test_service_checks_again_without_restarting_or_redownloading(installed, mon
     os_.game = True
     monkeypatch.setattr(app_update, "CHECK_INTERVAL", 0.05)
     with running_service(monkeypatch):
-        wait_for(lambda: releases.hits.count("releases") >= 3)
-        assert releases.hits.count("11") == 1
+        wait_for(lambda: releases.hits.count("stable") >= 3)
+        assert releases.hits.count("archives") == 1
         assert current(os_) == "1.0.0" and not os_.watchdogs
 
 
@@ -281,7 +323,7 @@ def test_verified_release_waits_for_afk_terminal_outcome_before_handoff(installe
         status = {"phase": "done", "terminal": True, "finish_reason": "max_runs"}
         return AttemptExit(0, status, status, None)
 
-    monkeypatch.setattr(_app_releases, "urlopen", wait_for_fake_game)
+    monkeypatch.setattr(_app_releases._HTTPS, "open", wait_for_fake_game)
     monkeypatch.setattr(supervisor, "run_attempt", farm_once)
     request = commands.submit(os_, commands.Start(None, tmp_path / "preset.json"))
     with running_service(monkeypatch) as old:
@@ -355,14 +397,17 @@ def test_dying_before_pointer_publication_does_not_flag_the_release_bad(installe
     assert not state.exists() or "2.0.0" not in json.loads(state.read_bytes()).get("bad", [])
 
 
-def test_same_tag_new_asset_ids_recheck_the_archive(installed, monkeypatch):
+def test_new_manifest_with_changed_asset_digest_rechecks_the_archive(installed, monkeypatch):
     os_, _, releases = installed
     os_.game = True
-    monkeypatch.setattr(app_update, "CHECK_INTERVAL", 0.05)
     with running_service(monkeypatch):
-        wait_for(lambda: app_update.read_update_status(os_).staged == "2.0.0")
-        releases.asset_id, releases.checksum_id = 13, 14
-        wait_for(lambda: "13" in releases.hits and "14" in releases.hits, seconds=3)
+        first = wait_for(lambda: app_update.read_update_status(os_), lambda status: status.staged == "2.0.0")
+        releases.body = archive(os_, "changed")
+        releases.sequence += 1
+        app_update.request_update_check(os_)
+        wait_for(lambda: app_update.read_update_status(os_),
+                 lambda status: status.last_checked > first.last_checked and status.staged == "2.0.0")
+        assert releases.hits.count("archives") == 2
 
 
 def test_begin_reloads_stage_after_acquiring_update_lock(installed, monkeypatch):
@@ -380,28 +425,65 @@ def test_begin_reloads_stage_after_acquiring_update_lock(installed, monkeypatch)
         return lock
 
     monkeypatch.setattr(os_, "acquire_lock", invalidate_stage_when_lock_is_taken)
-    updater = app_update.AppUpdater(os_, "1.0.0", lambda *_: None)
+    updater = app_update.AppUpdater(os_, "1.0.0")
     assert updater.begin(manual=False) == (False, "")
     assert not os_.watchdogs
     assert current(os_) == "1.0.0"
 
 
-@pytest.mark.parametrize("failure, reason", [("corrupt", "checksum did not match"),
-                                            ("missing_checksum", "missing release archive or checksum")])
-def test_failed_asset_replacement_invalidates_the_verified_stage(installed, monkeypatch, failure, reason):
+@pytest.mark.parametrize("failure, reason", [
+    ("signature", "invalid update manifest signature"), ("expired", "update manifest has expired"),
+    ("replay", "update manifest sequence is below the saved floor"),
+    ("reuse", "update manifest sequence was reused"), ("sha", "release archive SHA-256 did not match"),
+])
+def test_failed_manifest_or_asset_invalidates_the_verified_stage(installed, monkeypatch, failure, reason):
     os_, _, releases = installed
     os_.game = True
-    monkeypatch.setattr(app_update, "CHECK_INTERVAL", 0.05)
     with running_service(monkeypatch):
         wait_for(lambda: app_update.read_update_status(os_).staged == "2.0.0")
-        setattr(releases, failure, True)
-        releases.asset_id, releases.checksum_id = 13, 14
-        status = wait_for(lambda: app_update.read_update_status(os_), lambda view: reason in view.reason)
+    # A fresh service must observe the saved sequence even after a local version change.
+    os_.write_atomic(os_.app_data_dir() / "current", b"0.9.0\n")
+    monkeypatch.setattr(assets, "version", lambda: "0.9.0")
+    if failure == "expired":
+        releases.expires_at = int(time.time()) - 1
+    elif failure == "replay":
+        releases.sequence -= 1
+    elif failure == "reuse":
+        releases.changelog = "- Different text at the same sequence."
+    else:
+        releases.sequence += 1
+        releases.failure = failure
+    with running_service(monkeypatch):
+        status = wait_for(lambda: app_update.read_update_status(os_), lambda view: view.last_result == "error")
+        assert status.reason == reason
+        assert releases.hits.count("archives") == (2 if failure == "sha" else 1)
         assert status.staged is None
         os_.game = False
-        assert app_update.AppUpdater(os_, "1.0.0", lambda *_: None).begin(manual=False) == (False, "")
+        assert app_update.AppUpdater(os_, "0.9.0").begin(manual=False) == (False, "")
         assert not os_.watchdogs
-        assert current(os_) == "1.0.0"
+        assert current(os_) == "0.9.0"
+        if failure == "sha":
+            releases.sequence -= 1
+            releases.failure = ""
+            app_update.request_update_check(os_)
+            wait_for(lambda: app_update.read_update_status(os_).reason ==
+                     "update manifest sequence is below the saved floor")
+            assert releases.hits.count("archives") == 2
+
+
+def test_staged_release_cannot_begin_after_its_manifest_expires(installed, monkeypatch):
+    os_, _, releases = installed
+    os_.game = True
+    with running_service(monkeypatch):
+        wait_for(lambda: app_update.read_update_status(os_).staged == "2.0.0")
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app_update, "time", SimpleNamespace(time=lambda: releases.expires_at))
+    os_.game = False
+    assert app_update.read_update_status(os_).staged is None
+    assert app_update.AppUpdater(os_, "1.0.0").begin(manual=False) == (False, "")
+    assert not os_.watchdogs
 
 
 @pytest.mark.parametrize("had_started", [False, True])
@@ -534,7 +616,7 @@ def test_setup_and_watchdog_share_the_selection_lock(installed):
         for name in names:
             (folder / (name + os_.executable_suffix)).write_bytes(b"fixture")
     with os_.acquire_lock(os_.app_data_dir() / "app-update.lock"), pytest.raises(platform.LockHeld):
-        install(os_, source, "3.0.0", lambda: pytest.fail("token already stored"))
+        install(os_, source, "3.0.0")
     assert current(os_) == "1.0.0"
 
 
@@ -572,7 +654,7 @@ def test_active_supervisor_keeps_rollback_in_service_queue(installed, monkeypatc
 
 
 
-def test_manual_rollback_restarts_previous_version_and_does_not_reinstall_current(installed, monkeypatch):
+def test_manual_rollback_keeps_the_sequence_floor_and_does_not_reinstall_current(installed, monkeypatch):
     os_, _, releases = installed
     new = bundle_path(os_, "2.0.0")
     new.mkdir()
@@ -582,6 +664,7 @@ def test_manual_rollback_restarts_previous_version_and_does_not_reinstall_curren
     monkeypatch.setattr(assets, "version", lambda: "2.0.0")
     os_.game = True
     with running_service(monkeypatch) as latest:
+        wait_for(lambda: app_update.read_update_status(os_).last_result == "up_to_date")
         assert service.main(["rollback-app"]) == 0
         wait_for(lambda: read_state(os_).reason == "waiting for the game to close")
         assert not os_.watchdogs
@@ -593,25 +676,29 @@ def test_manual_rollback_restarts_previous_version_and_does_not_reinstall_curren
         wait_for(lambda: os_.restarts == ["1.0.0"])
         assert app_update.read_update_status(os_).previous == "1.0.0"
         monkeypatch.setattr(assets, "version", lambda: "1.0.0")
-        previous_checks = releases.hits.count("releases")
         with running_service(monkeypatch):
             assert rollback.result(timeout=5) == 0
             assert current(os_) == "1.0.0"
             assert app_update.read_update_status(os_).previous == "2.0.0"
-            wait_for(lambda: releases.hits.count("releases") > previous_checks)
-    assert releases.hits.count("11") == 0 and len(os_.watchdogs) == 1
+            wait_for(lambda: app_update.read_update_status(os_).last_result == "excluded")
+            releases.version, releases.sequence = "1.5.0", 9
+            app_update.request_update_check(os_)
+            result = wait_for(lambda: app_update.read_update_status(os_), lambda status: status.last_result == "error")
+            assert result.reason == "update manifest sequence is below the saved floor"
+    assert releases.hits.count("archives") == 0 and len(os_.watchdogs) == 1
 
 
 def test_updates_view_shows_check_failures_and_dispatches_rollback(installed):
     os_, _, _ = installed
     os_.write_atomic(os_.app_data_dir() / "app-update.json", b'{"previous":"0.9.0"}')
-    os_.write_atomic(os_.app_data_dir() / "app-update-check.json", b'{"reason":"GitHub returned HTTP 500"}')
+    os_.write_atomic(os_.app_data_dir() / "app-update-check.json",
+                     b'{"last_result":"error","reason":"update server returned HTTP 500"}')
     with StateReporter(os_) as state:
         state.set(StateKind.IDLE)
         model = SessionModel(os_)
         view = model.poll().updates
         assert view.app_version == "1.0.0"
-        assert "GitHub returned HTTP 500" in view.app_check
+        assert view.app_check == "Failed" and "update server returned HTTP 500" in view.app_check_reason
         assert view.can_rollback
         request = model.rollback_app()
         assert commands.decode(json.loads(request.read_bytes())) == "rollback_app"

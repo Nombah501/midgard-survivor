@@ -27,8 +27,9 @@ class GameUpdateState(StrEnum):
 
 
 @dataclass(frozen=True)
-class _MountedPatch:
+class PatchInstallation:
     official: Path
+    bridge: str
     mounted: bool
     same_base: bool
     info: PatchInfo | None
@@ -41,12 +42,37 @@ class _MountedPatch:
             return GameUpdateState.CURRENT
         return GameUpdateState.FARMER_REMOVED_OR_STALE
 
+    def bridge_digest(self) -> str:
+        path = self.official.parent / self.bridge
+        return sha256(path) if self.bridge and path.is_file() else ""
+
+    def integrity_issue(self, fingerprint: str | None = None) -> str | None:
+        """Hash the mounted packs on demand, never in the idle observation loop."""
+        if not self.mounted:
+            return "The farmer patch is not mounted."
+        info = self.info
+        if not self.same_base or info is None:
+            return "No matching build metadata for the mounted farmer patch."
+        installed = self.official.parent / INSTALLED_PACK
+        if not installed.is_file():
+            return "The installed farmer pack is missing."
+        if sha256(self.official) != info.patch_sha256:
+            return "The official patch digest differs from the farmer build."
+        if self.bridge_digest() != info.bridge_sha256:
+            return "The official bridge digest differs from the farmer build."
+        if sha256(installed) != info.result_sha256:
+            return "The installed farmer pack digest differs from the farmer build."
+        if info.farmer_hash != (fingerprint if fingerprint is not None else _farmer_hash(None)):
+            return "The mounted farmer patch was built for a different Farmer hash."
+        return None
+
 
 def _read_shared(os_: Platform, path: Path) -> bytes:
     return os_.read_shared(path)
 
 
-def _inspect(os_: Platform, profile: Path) -> _MountedPatch | None:
+def inspect_patch(os_: Platform, profile: Path) -> PatchInstallation | None:
+    """Identify the official patch and its matching app metadata without hashing packs."""
     patches = profile / "patches"
     state_path = patches / STATE
     try:
@@ -71,7 +97,7 @@ def _inspect(os_: Platform, profile: Path) -> _MountedPatch | None:
     except PatchInfoError:
         info = None
     same_base = info is not None and identity == (info.patch_file, info.patch_version, info.bridge_file)
-    return _MountedPatch(patches / identity[0], mounted, same_base, info)
+    return PatchInstallation(patches / identity[0], identity[2], mounted, same_base, info)
 
 
 def _farmer_hash(sources: Path | None) -> str:
@@ -83,7 +109,7 @@ def _farmer_hash(sources: Path | None) -> str:
 
 def classify(os_: Platform, profile: Path) -> GameUpdateState:
     """Read state and app metadata, not the contents of any game pack."""
-    mounted = _inspect(os_, profile)
+    mounted = inspect_patch(os_, profile)
     return mounted.classify(_farmer_hash(None)) if mounted is not None else GameUpdateState.GAME_REINSTALL
 
 
@@ -200,13 +226,17 @@ class GameUpdatePipeline:
         self._was_running = False
         self._closed_until = 0.0
         self._reinstall_reported = False
+        self._verify_digests = False
         self._journal = os_.app_data_dir() / "game-update.json"
         self._official_digest: tuple[tuple[Path, int, int, int, int, int], str] | None = None
 
-    def run(self, *, check_again: bool = False, unattended: bool = True, prepare: bool = True) -> PipelineResult:
+    def run(self, *, check_again: bool = False, unattended: bool = True, prepare: bool = True,
+            allow_digest_repair: bool = True) -> PipelineResult:
         """Prepare once; call again on Wait. With prepare=False, only observe the patch."""
         if self._stop_requested():
             return Stopped()
+        # Keep an explicit idle check pending through the game-close grace period.
+        self._verify_digests = prepare and allow_digest_repair and (check_again or self._verify_digests)
         pending = self._load() if prepare else None
         if check_again and pending is not None and pending.reason is not None:
             pending = replace(pending, stage=_Stage.BUILD, reason=None, detail="", log_path=None, unattended=False)
@@ -220,7 +250,8 @@ class GameUpdatePipeline:
         if now < self._closed_until:
             return self._wait(WAITING_FOR_GAME)
 
-        mounted = _inspect(self.os, self.profile)
+        verify_digests, self._verify_digests = self._verify_digests, False
+        mounted = inspect_patch(self.os, self.profile)
         if mounted is None or not self._official_available(mounted.official):
             return self._reinstall()
 
@@ -228,6 +259,16 @@ class GameUpdatePipeline:
             self._fingerprint = _farmer_hash(self.sources)
         fingerprint = self._fingerprint
         classification = mounted.classify(fingerprint)
+        if verify_digests and classification is GameUpdateState.CURRENT:
+            try:
+                if mounted.integrity_issue(fingerprint):
+                    classification = GameUpdateState.FARMER_REMOVED_OR_STALE
+            except FileNotFoundError:
+                if not self._official_available(mounted.official):
+                    return self._reinstall()
+                classification = GameUpdateState.FARMER_REMOVED_OR_STALE
+            except OSError as exc:
+                raise PreflightError(f"cannot verify farmer patch digests: {exc}") from exc
         if not prepare or (pending is None and classification is GameUpdateState.CURRENT):
             self.events.classification(classification)
             self._reinstall_reported = False
@@ -263,6 +304,11 @@ class GameUpdatePipeline:
             mounted.same_base and info is not None and (info.patch_sha256, info.farmer_hash) == key
             and candidate.is_file()
         )
+        if has_candidate and info is not None:
+            try:
+                has_candidate = mounted.bridge_digest() == info.bridge_sha256
+            except OSError as exc:
+                raise PreflightError(f"cannot read official bridge: {exc}") from exc
         if pending is None:
             # An interrupted build may already have published a candidate for the new key without smoking it.
             stage = _Stage.BUILD
@@ -292,7 +338,7 @@ class GameUpdatePipeline:
             self._reinstall_reported = True
         return Blocked(START_GAME_AND_UPDATE)
 
-    def _prepare(self, pending: _Transaction, mounted: _MountedPatch, unattended: bool) -> PipelineResult:
+    def _prepare(self, pending: _Transaction, mounted: PatchInstallation, unattended: bool) -> PipelineResult:
         try:
             if self._stop_requested():
                 return Stopped()
@@ -347,7 +393,7 @@ class GameUpdatePipeline:
         return self._ready()
 
     def _fail(
-        self, pending: _Transaction, mounted: _MountedPatch, reason: FailureReason, detail: str, log_path: Path | None,
+        self, pending: _Transaction, mounted: PatchInstallation, reason: FailureReason, detail: str, log_path: Path | None,
     ) -> PipelineResult:
         if self._stop_requested():
             return Stopped()

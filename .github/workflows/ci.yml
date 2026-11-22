@@ -93,6 +93,9 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v5
         with:
           pattern: midgard-farm-*
@@ -121,3 +124,25 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
               --prerelease="$PRERELEASE" "${assets[@]}"
           fi
+      - uses: actions/setup-python@v6
+        if: needs.package.outputs.prerelease == 'false'
+        with:
+          python-version: "3.13"
+      - name: Install stable channel publishing tools
+        if: needs.package.outputs.prerelease == 'false'
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends minisign
+          python -m pip install 'PyNaCl>=1.6,<2'
+      - name: Publish immutable archives and then the signed stable manifest to R2
+        if: needs.package.outputs.prerelease == 'false'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          AWS_EC2_METADATA_DISABLED: "true"
+          PYTHONPATH: src
+        run: python packaging/publish_update.py release-assets CHANGELOG.md "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER"

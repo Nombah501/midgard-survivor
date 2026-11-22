@@ -3,6 +3,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, time as local_time
 from pathlib import Path
 from threading import Event
 
@@ -128,7 +129,7 @@ def test_session_run_band_tracks_active_run_and_latest_settled_session(farm):
     (farm.profile / "farmer_runs.jsonl").write_text(
         "\n".join(map(json.dumps, [*rows, rows[-1]])) + '\n{"torn"', encoding="utf-8",
     )
-    append_event(farm.platform, "session", session_id="older-afk", outcome="finished")
+    append_event(farm.platform, "session", timestamp=time.time() - 60, session_id="older-afk", outcome="finished")
     farm.state("active", session_id="afk-fixture", farmer_phase="run")
     active_status(farm)
     model = SessionModel(farm.platform)
@@ -141,6 +142,7 @@ def test_session_run_band_tracks_active_run_and_latest_settled_session(farm):
     ]
     assert [run["outcome"] for run in view.history.rows[0].session_runs] == ["win"]
 
+    append_event(farm.platform, "session", session_id="afk-fixture", outcome="finished")
     farm.state()
     idle = model.poll()
     assert idle.session_runs == view.session_runs[:-1]
@@ -367,35 +369,41 @@ def test_retired_preset_and_implicit_character_fall_back_to_window_choices(farm)
     assert view.characters[view.character_index] == view.characters[0]
 
 
-def history_fixture(farm):
+def history_fixture(farm, today=None):
+    def stamp(hour, minute):
+        return datetime.combine(today or date.today(), local_time(hour, minute)).timestamp()
+
     farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {
         "legendaries": [{"id": "sacred_excalibur", "name": "Sacred Excalibur"},
                         {"id": "gungnir", "name": "Gungnir"}],
     }).encode())
-    append_event(farm.platform, "session", timestamp=1_704_067_500, session_id="previous-night",
-                 outcome="stopped", reason="abort", totals={"runs": 3, "wins": 2, "zeny": 6000})
-    append_event(farm.platform, "app_update", timestamp=1_704_067_620, outcome="rolled_back", future={"foo": 1})
-    append_event(farm.platform, "game_update", timestamp=1_704_067_560,
-                 classification="game_update", outcome="ready")
-    append_event(farm.platform, "session", timestamp=1_704_067_680, session_id="last-night",
-                 outcome="finished", reason="max_minutes",
+    append_event(farm.platform, "session", timestamp=stamp(1, 30), started_at=stamp(0, 0),
+                 session_id="previous-night", outcome="stopped", reason="abort",
+                 totals={"runs": 3, "wins": 2, "zeny": 6000, "wall_s": 4500})
+    append_event(farm.platform, "app_update", timestamp=stamp(2, 0), outcome="rolled_back", future={"foo": 1})
+    append_event(farm.platform, "game_update", timestamp=stamp(1, 45), classification="game_update", outcome="ready")
+    append_event(farm.platform, "session", timestamp=stamp(4, 30), started_at=stamp(3, 30), session_id="last-night",
+                 outcome="finished", reason="max_minutes", restarts=2, attempt_failure_count=2,
+                 attempt_failures=["run_stalled"],
                  run_choices=[{"run_id": "last-night-r1", "stage": "prontera", "danger": 2},
                               {"run_id": "last-night-r2", "stage": "payon", "danger": 30, "oath_points": 4,
                                "kept": ["sacred_excalibur"],
                                "keep_skipped": [{"id": "gungnir", "reason": "already_owned"}]}],
-                 totals={"runs": 12, "wins": 10, "lost": 1, "wall_s": 1800, "zeny": 7200, "xp": 560,
+                 totals={"started": 13, "runs": 12, "wins": 10, "lost": 1, "wall_s": 1800, "zeny": 7200, "xp": 560,
                          "kills": 40, "coins": 3, "ymir": 2, "cards_gain": 4, "materials": {"ore": 4, "star_crumb": 2},
                          "future": ["skip"]})
-    append_event(farm.platform, "future", timestamp=1_704_067_740, future=True)
+    append_event(farm.platform, "future", timestamp=stamp(5, 0), future=True)
     with history_path(farm.platform).open("ab") as file:
         file.write(b'{"v":1,"kind":"game_update"')
 
 
-def test_history_is_interleaved_in_timestamp_order_with_last_night_detailed(farm):
+def test_history_is_interleaved_with_latest_session_and_whole_night(farm, monkeypatch):
     from midgard_farm.gui.model import SessionModel
 
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(time, "time", lambda: datetime(2026, 7, 20, 8).timestamp())
     farm.state()
-    history_fixture(farm)
+    history_fixture(farm, today)
     history = SessionModel(farm.platform).poll().history
     assert [row.title for row in history.rows] == [
         "AFK session · Finished", "App update · Rolled back", "Game update · Handled", "AFK session · Stopped",
@@ -409,12 +417,58 @@ def test_history_is_interleaved_in_timestamp_order_with_last_night_detailed(farm
         "Run 2 · Payon Forest · Difficulty 30 · Oath points: 4 · Kept: Sacred Excalibur"
         " · Wishlist skipped: Gungnir (already owned)",
     ]
-    assert dict((metric.label, metric.value) for metric in history.totals) == {
-        "Runs": "12", "Wins": "10", "Lost": "1", "Time in runs": "0.5 h",
-        "Zeny": "7,200", "XP": "560", "Kills": "40", "Cards": "4", "Coins": "3", "Ymir": "2",
+    assert {metric.label: metric.value for metric in history.session_facts} == {
+        "Elapsed": "1 h 0 min", "Time in runs": "30 min", "Downtime": "30 min",
+        "Runs started": "13", "Settled": "12", "Lost runs": "1", "Restarts": "2", "Attempt failures": "2",
     }
-    assert history.rewards == "14,400 zeny · 1,120 XP · 6 coins · 4 Ymir · 8 cards"
+    assert {metric.label: metric.value for metric in history.totals} == {
+        "Wins": "10", "Zeny": "7,200", "XP": "560", "Kills": "40", "Cards": "4", "Coins": "3", "Ymir": "2",
+    }
+    assert history.stop_reason == "Max minutes" and history.failure_reasons == "Run stalled"
+    assert history.rewards == "7,200 zeny · 560 XP · 3 coins · 2 Ymir · 4 cards"
     assert history.materials == "Ore 4 · Star Crumb 2"
+    assert {metric.label: metric.value for metric in history.night.totals} == {
+        "Zeny": "13,200", "Wins / runs": "12 / 15", "Downtime": "45 min",
+    }
+
+
+def test_a_daytime_stop_does_not_replace_night_and_night_rolls_over_without_new_history(farm, monkeypatch):
+    from midgard_farm.gui.model import SessionModel
+
+    now = datetime(2026, 7, 20, 14).timestamp()
+    monkeypatch.setattr(time, "time", lambda: now)
+    history_fixture(farm, date(2026, 7, 20))
+    append_event(farm.platform, "session", session_id="daytime", started_at=now - 60, timestamp=now,
+                 reason="abort", totals={"runs": 0, "wins": 0, "zeny": 0, "wall_s": 0})
+    model = SessionModel(farm.platform)
+    history = model.poll().history
+    assert history.latest_session_id == "daytime"
+    assert history.night.totals[0].value == "13,200"
+    assert "19 Jul 18:00" in history.night.window
+
+    now = datetime(2026, 7, 21, 0).timestamp()
+    history = model.poll().history
+    assert history.latest_session_id == "daytime"
+    assert not history.night.totals
+    assert "20 Jul 18:00" in history.night.window
+
+
+def test_night_counts_live_settlements_once_but_waits_for_terminal_downtime(farm, monkeypatch):
+    from midgard_farm.gui.model import SessionModel
+
+    now = datetime(2026, 7, 20, 8).timestamp()
+    monkeypatch.setattr(time, "time", lambda: now)
+    history_fixture(farm, date(2026, 7, 20))
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    totals = {"runs": 1, "wins": 1, "zeny": 200, "wall_s": 1800}
+    farm.status(session="afk-fixture", phase="run", totals=totals)
+    start = now - 3600
+    (farm.data / "session.json").write_text(json.dumps({"id": "afk-fixture", "started_at": start}))
+    model = SessionModel(farm.platform)
+    assert [metric.value for metric in model.poll().history.night.totals] == ["13,400", "13 / 16", "≥ 45 min"]
+
+    append_event(farm.platform, "session", session_id="afk-fixture", started_at=start, totals=totals)
+    assert [metric.value for metric in model.poll().history.night.totals] == ["13,400", "13 / 16", "1 h 15 min"]
 
 
 @pytest.mark.parametrize(("classification", "kind", "state_title", "activity", "opens_game"), [
@@ -495,13 +549,14 @@ def test_updates_drops_restore_feedback_after_check_again(farm, outcome, message
     assert model.poll().updates.feedback == ""
 
 
-def test_bundled_main_qml_matches_source():
+@pytest.mark.parametrize("name", ["Main.qml", "RunBand.qml", "fonts/OFL.txt"])
+def test_bundled_gui_resource_matches_source(name):
     from PySide6.QtCore import QFile, QIODevice
 
     from midgard_farm.gui import _resources  # noqa: F401  # Import registers the resource in Qt.
 
-    source = Path(__file__).resolve().parents[1] / "src/midgard_farm/gui/Main.qml"
-    resource = QFile(":/midgard-farm/Main.qml")
+    source = Path(__file__).resolve().parents[1] / "src/midgard_farm/gui" / name
+    resource = QFile(f":/midgard-farm/{name}")
     assert resource.open(QIODevice.OpenModeFlag.ReadOnly), resource.errorString()
     assert bytes(resource.readAll()) == source.read_bytes(), "Regenerate _resources.py with pyside6-rcc"
 
@@ -578,15 +633,29 @@ def capture(window, tmp_path, name):
     assert image.save(str(tmp_path / f"{name}.png"))
 
 
+def ready_item(window, name):
+    item = qml_item(window, name)
+    wait_until(lambda: item.property("visible") and item.property("enabled"))
+    return item
+
+
 def click(window, name):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
 
+    item = ready_item(window, name)
     # A published snapshot can change visibility and enablement before Qt polishes the layout.
     assert not window.grabWindow().isNull()
-    item = qml_item(window, name)
-    wait_until(lambda: item.property("visible") and item.property("enabled"))
     QTest.mouseClick(window, Qt.MouseButton.LeftButton, pos=item.mapToScene(item.boundingRect().center()).toPoint())
+
+
+def key_click(window, name, key, *modifiers):
+    from PySide6.QtTest import QTest
+
+    item = ready_item(window, name)
+    item.forceActiveFocus()
+    wait_until(lambda: item.property("activeFocus"))
+    QTest.keyClick(window, key, *modifiers)
 
 
 def requested_commands(farm):
@@ -659,17 +728,15 @@ def test_afk_location_picker_skips_locked_locations_on_keyboard(open_dashboard, 
     locked = qml_item(window, "locationOption2")
     assert not locked.property("enabled")
     assert "locked" in locked.property("text")
+    ready_item(window, "locationOption1")  # Escape is handled by the open popup, not the picker.
     QTest.keyClick(window, Qt.Key.Key_Escape)
 
-    wait_until(lambda: location.property("count") > 1)
-    location.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "locationPicker", Qt.Key.Key_Down)
     wait_until(lambda: location.property("currentIndex") == 1)
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "locationPicker", Qt.Key.Key_Down)
     wait_until(lambda: location.property("currentText") == "Orc Village")
-    assert difficulty.property("count") == 4 and difficulty.property("enabled")
-    difficulty.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "difficultyPicker", Qt.Key.Key_Down)
+    assert difficulty.property("count") == 4
     wait_until(lambda: difficulty.property("currentText") == "4")
     click(window, "startButton")
     wait_until(lambda: bool(requested_commands(farm)))
@@ -679,7 +746,6 @@ def test_afk_location_picker_skips_locked_locations_on_keyboard(open_dashboard, 
 
 def test_window_remembers_and_sends_location_rotation_with_shared_difficulties(open_dashboard, farm):
     from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
 
     locations = [
         {"id": "prontera", "name": "Prontera", "unlocked": True, "min_difficulty": 1, "max_difficulty": 5},
@@ -695,10 +761,9 @@ def test_window_remembers_and_sends_location_rotation_with_shared_difficulties(o
     click(window, "locationPicker")
     click(window, "locationOption4")
     wait_until(lambda: location.property("currentText") == "All locations in turn" and difficulty.property("count") == 4)
-    difficulty.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "difficultyPicker", Qt.Key.Key_Down)
     wait_until(lambda: difficulty.property("currentText") == "3")
-    QTest.keyClick(window, Qt.Key.Key_End)
+    key_click(window, "difficultyPicker", Qt.Key.Key_End)
     wait_until(lambda: difficulty.property("currentText") == "5")
     click(window, "startButton")
     wait_until(lambda: len(requested_commands(farm)) == 1)
@@ -733,7 +798,6 @@ def oath_catalog(farm):
 
 def test_oath_panel_enables_only_at_fixed_30_and_shows_catalog_ranks(open_dashboard, farm):
     from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
 
     oath_catalog(farm)
     farm.state()
@@ -743,28 +807,24 @@ def test_oath_panel_enables_only_at_fixed_30_and_shows_catalog_ranks(open_dashbo
     location = qml_item(window, "locationPicker")
     # The catalog-backed snapshot can publish after the window opens.
     wait_until(lambda: location.property("count") > 1)
-    location.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "locationPicker", Qt.Key.Key_Down)
     difficulty = qml_item(window, "difficultyPicker")
     wait_until(lambda: difficulty.property("count") == 3)
     assert not panel.property("enabled")
-    difficulty.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "difficultyPicker", Qt.Key.Key_Down)
     wait_until(lambda: difficulty.property("currentText") == "29")
     assert not panel.property("enabled")
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "difficultyPicker", Qt.Key.Key_Down)
     wait_until(lambda: panel.property("enabled"))
     click(window, "oathPanel")
     pick = qml_item(window, "oathPicker0")
     assert pick.property("count") == 4 and pick.property("currentIndex") == 0
     assert qml_item(window, "oathLabel1").property("text") == "Cacería salvaje"
     assert qml_item(window, "oathPicker1").property("count") == 2
-    pick.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_End)
+    key_click(window, "oathPicker0", Qt.Key.Key_End)
     wait_until(lambda: qml_item(window, "oathPoints").property("text") == "Oath points: 4")
     assert qml_item(window, "oathRankDetail0").property("text") == "+100% HP"
-    difficulty.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Up)
+    key_click(window, "difficultyPicker", Qt.Key.Key_Up)
     wait_until(lambda: not panel.property("enabled"))
 
 
@@ -835,7 +895,6 @@ def test_removed_saved_oath_blocks_launch_until_turned_off(farm, action, difficu
 
 def test_paused_window_explains_the_oath_blocker_and_can_clear_it(open_dashboard, farm):
     from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
 
     from midgard_farm.gui.model import SessionModel
 
@@ -862,8 +921,7 @@ def test_paused_window_explains_the_oath_blocker_and_can_clear_it(open_dashboard
     click(window, "oathPanel")
     rank = qml_item(window, "oathPicker0")
     assert rank.property("currentIndex") == -1
-    rank.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Down)
+    key_click(window, "oathPicker0", Qt.Key.Key_Down)
     wait_until(lambda: resume.property("enabled") and not reason.property("visible"))
     click(window, "pauseButton")
     wait_until(lambda: requested_commands(farm) == [commands.Resume(commands.SessionSettings("prontera", 30))])
@@ -909,7 +967,6 @@ def test_wishlist_is_remembered_and_only_editable_before_start_or_resume(farm):
 
 def test_wishlist_editor_searches_names_and_marks_owned_items(open_dashboard, farm):
     from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
 
     farm.state()
     window = open_dashboard("afkTab")
@@ -920,27 +977,21 @@ def test_wishlist_editor_searches_names_and_marks_owned_items(open_dashboard, fa
                         {"id": "gungnir", "name": "Gungnir"}],
         "owned_item_ids": ["sacred_excalibur"],
     }).encode())
-    wait_until(lambda: panel.property("enabled"))
-    panel.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
-    search = qml_item(window, "wishlistSearch")
+    key_click(window, "wishlistPanel", Qt.Key.Key_Space)
     picker = qml_item(window, "wishlistPicker")
     action = qml_item(window, "wishlistAction")
-    search.forceActiveFocus()
     for letter in "SAGRADA":
-        QTest.keyClick(window, Qt.Key(ord(letter)), Qt.KeyboardModifier.ShiftModifier)
+        key_click(window, "wishlistSearch", Qt.Key(ord(letter)), Qt.KeyboardModifier.ShiftModifier)
     assert picker.property("count") == 1
     assert picker.property("displayText") == "Espada Sagrada (owned)"
-    action.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
+    key_click(window, "wishlistAction", Qt.Key.Key_Space)
     wait_until(lambda: action.property("text") == "Remove")
-    QTest.keyClick(window, Qt.Key.Key_Space)
+    key_click(window, "wishlistAction", Qt.Key.Key_Space)
     wait_until(lambda: action.property("text") == "Add")
 
 
 def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_dashboard, farm):
     from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
 
     from midgard_farm.gui.model import SessionModel
 
@@ -953,15 +1004,13 @@ def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_das
     switches = {name: qml_item(window, "maintenance-" + name) for name in defaults}
     wait_until(lambda: all(item.property("visible") and item.property("enabled") for item in switches.values()))
     assert {name: item.property("checked") for name, item in switches.items()} == defaults
-    for name, item in switches.items():
-        item.forceActiveFocus()
-        QTest.keyClick(window, Qt.Key.Key_Space)
+    for name in switches:
+        key_click(window, "maintenance-" + name, Qt.Key.Key_Space)
         wait_until(lambda: SessionModel(farm.platform).poll().maintenance[name] is not defaults[name])
     changed = {name: not value for name, value in defaults.items()}
     assert SessionModel(farm.platform).poll().maintenance == changed
 
-    qml_item(window, "startButton").forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
+    key_click(window, "startButton", Qt.Key.Key_Space)
     wait_until(lambda: all(not item.property("enabled") for item in switches.values()))
     session = "afk-fixture"
     farm.state("active", session_id=session, farmer_phase="run")
@@ -970,10 +1019,8 @@ def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_das
 
     farm.state("active", session_id=session, farmer_phase="paused")
     wait_until(lambda: all(item.property("enabled") for item in switches.values()))
-    switches["star_smith"].forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
-    qml_item(window, "pauseButton").forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
+    key_click(window, "maintenance-star_smith", Qt.Key.Key_Space)
+    key_click(window, "pauseButton", Qt.Key.Key_Space)
     wait_until(lambda: all(not item.property("enabled") for item in switches.values()))
     start, resume = requested_commands(farm)
     assert isinstance(start, commands.Start) and start.settings.maintenance() == changed
@@ -986,35 +1033,34 @@ def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_das
 ])
 def test_session_switch_is_remembered_and_submitted_at_start_and_resume(open_dashboard, farm, control, setting):
     from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
 
     from midgard_farm.gui.model import SessionModel
 
     farm.state()
     window = open_dashboard("afkTab")
-    switch = qml_item(window, control)
-    wait_until(lambda: switch.property("visible") and switch.property("enabled"))
+    switch = ready_item(window, control)
     assert not switch.property("checked")
     if control == "showGameWindow":
         assert "treated as a game exit" in switch.property("helpText")
-    switch.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
+        warning = qml_item(window, "windowIncomeWarning")
+        assert not warning.property("visible")
+    key_click(window, control, Qt.Key.Key_Space)
     wait_until(lambda: getattr(SessionModel(farm.platform).poll(), setting))
-    qml_item(window, "startButton").forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
+    key_click(window, "startButton", Qt.Key.Key_Space)
     wait_until(lambda: not switch.property("enabled"))
 
     farm.state("active", session_id="afk-fixture", farmer_phase="run")
     wait_until(lambda: qml_item(window, "phaseValue").property("text") == "Run in progress")
     assert not switch.property("enabled")
+    if control == "showGameWindow":
+        assert warning.property("visible") and "roughly halves income" in warning.property("text")
     farm.state("active", session_id="afk-fixture", farmer_phase="paused")
-    wait_until(lambda: switch.property("enabled"))
-    switch.forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
+    key_click(window, control, Qt.Key.Key_Space)
     wait_until(lambda: not getattr(SessionModel(farm.platform).poll(), setting))
-    qml_item(window, "pauseButton").forceActiveFocus()
-    QTest.keyClick(window, Qt.Key.Key_Space)
+    key_click(window, "pauseButton", Qt.Key.Key_Space)
     wait_until(lambda: len(requested_commands(farm)) == 2)
+    if control == "showGameWindow":
+        assert not warning.property("visible")
     start, resume = requested_commands(farm)
     assert isinstance(start, commands.Start) and getattr(start.settings, setting) is True
     assert isinstance(resume, commands.Resume) and getattr(resume.settings, setting) is False
@@ -1183,7 +1229,7 @@ def test_slow_shared_read_keeps_published_state_and_qt_responsive(qt_app, qt_war
     assert not qt_warnings
 
 
-def test_history_screen_renders_interleaved_rows_and_expands_last_night(open_dashboard, farm, tmp_path):
+def test_history_screen_renders_interleaved_rows_and_expands_latest_session(open_dashboard, farm, tmp_path):
     farm.state()
     history_fixture(farm)
     window = open_dashboard("historyTab")
@@ -1192,16 +1238,27 @@ def test_history_screen_renders_interleaved_rows_and_expands_last_night(open_das
     assert "12 runs · 10 wins · 7,200 zeny" in rows[0]
     assert rows[1:3] == ["App update · Rolled back", "Game update · Handled"]
     assert "3 runs · 2 wins · 6,000 zeny" in rows[3]
-    assert not qml_item(window, "lastNightDetails").property("visible")
+    assert qml_item(window, "historyNightReport").property("visible")
+    assert not qml_item(window, "latestSessionDetails").property("visible")
     capture(window, tmp_path, "history")
-    click(window, "lastNightDisclosure")
-    assert qml_item(window, "lastNightDetails").property("visible")
+    click(window, "latestSessionDisclosure")
+    assert qml_item(window, "latestSessionDetails").property("visible")
     assert qml_item(window, "historyRunChoice0-1").property("text") == (
         "Run 2 · Payon Forest · Difficulty 30 · Oath points: 4 · Kept: Sacred Excalibur"
         " · Wishlist skipped: Gungnir (already owned)")
-    assert qml_item(window, "lastNightRewards").property("text").startswith("14,400 zeny")
-    assert qml_item(window, "lastNightMaterials").property("text") == "Ore 4 · Star Crumb 2"
+    assert qml_item(window, "latestSessionRewards").property("text").startswith("7,200 zeny")
+    assert qml_item(window, "latestSessionMaterials").property("text") == "Ore 4 · Star Crumb 2"
     capture(window, tmp_path, "history-expanded")
+
+
+def test_afk_idle_shows_latest_session_and_night(open_dashboard, farm):
+    farm.state()
+    history_fixture(farm)
+    window = open_dashboard("afkTab")
+    stop = qml_item(window, "latestSessionStopReason")
+    wait_until(lambda: stop.property("visible") and stop.property("text") == "Stop reason: Max minutes")
+    assert qml_item(window, "latestSessionHeading").property("text") == "Latest session"
+    assert qml_item(window, "afkNightReport").property("visible")
 
 
 def test_history_screen_renders_empty_history(open_dashboard, farm, tmp_path):
@@ -1232,9 +1289,110 @@ def test_updates_screen_renders_states_and_outcomes(open_dashboard, farm, tmp_pa
     guidance = qml_item(window, "gameUpdateDetail").property("text")
     assert ("Open the game" in guidance) == (classification == "game_reinstall")
     assert qml_item(window, "installedAppVersion").property("text") == version("midgard-farm")
-    assert qml_item(window, "appUpdateCheck").property("text") == "No update check yet."
     suffix = kind if activity else classification
     capture(window, tmp_path, f"updates-{suffix.replace('_', '-')}")
+
+
+@pytest.mark.parametrize(("url", "key"), [
+    ("https://updates.test", ""),
+    ("https://updates.invalid", "configured"),
+])
+def test_app_update_shows_an_unconfigured_channel(open_dashboard, farm, monkeypatch, url, key):
+    from midgard_farm.core import _app_releases
+
+    monkeypatch.setattr(_app_releases, "UPDATE_BASE_URL", url)
+    monkeypatch.setattr(_app_releases, "MINISIGN_PUBLIC_KEY", key)
+    (farm.data / "current").write_text("1.0.0", encoding="utf-8")
+    farm.state()
+    window = open_dashboard("updatesTab")
+    wait_until(lambda: qml_item(window, "installedAppVersion").property("text") == "1.0.0")
+    assert qml_item(window, "latestAppVersion").property("text") == "—"
+    assert qml_item(window, "appUpdateCheck").property("text") == "Channel not configured yet."
+    assert qml_item(window, "appUpdateLastChecked").property("text") == "Never"
+    assert not qml_item(window, "checkAppUpdatesButton").property("enabled")
+    assert not qml_item(window, "appUpdateChangelog").property("visible")
+
+
+def test_app_update_check_submits_separately_during_an_afk_session(open_dashboard, farm, monkeypatch):
+    from midgard_farm.core import _app_releases, app_update
+
+    monkeypatch.setattr(_app_releases, "UPDATE_BASE_URL", "https://updates.test")
+    monkeypatch.setattr(_app_releases, "MINISIGN_PUBLIC_KEY", "configured")
+    (farm.data / "current").write_text("1.0.0", encoding="utf-8")
+    (farm.data / "app-update-check.json").write_text(json.dumps({
+        "reason": "no release token; rerun setup to enter it", "last_checked": time.time(),
+    }), encoding="utf-8")
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    window = open_dashboard("updatesTab")
+    check = ready_item(window, "checkAppUpdatesButton")
+    assert check.property("text") == "Check for updates"
+    assert not qml_item(window, "checkAgainButton").property("enabled")
+    assert qml_item(window, "appUpdateCheck").property("text") == "Not checked yet"
+    assert not qml_item(window, "appUpdateCheckReason").property("visible")
+    click(window, "checkAppUpdatesButton")
+    request = farm.data / "app-update-check-request"
+    wait_until(request.is_file)
+    status = qml_item(window, "appUpdateCheck")
+    wait_until(lambda: status.property("text") == "Checking…")
+    assert not check.property("enabled")
+    assert not requested_commands(farm)
+
+    notes = "- Fixed a crash when opening Updates.\n- Show <b>literally</b>."
+    received, respond = Event(), Event()
+
+    def get_manifest():
+        received.set()
+        assert respond.wait(timeout=10)
+        return _app_releases.Manifest("1.0.0", 1, int(time.time()) + 3600, notes, {}), "0" * 64
+
+    monkeypatch.setattr(_app_releases, "get_manifest", get_manifest)
+    with app_update.AppUpdater(farm.platform, "1.0.0"):
+        try:
+            wait_until(received.is_set)
+            assert not request.exists()
+            assert app_update.read_update_status(farm.platform).check_pending
+            assert not check.property("enabled")
+        finally:
+            respond.set()
+        wait_until(lambda: status.property("text") == "Up to date")
+        assert check.property("enabled")
+    assert qml_item(window, "appUpdateChangelog").property("text") == notes
+
+
+def test_app_update_keeps_latest_notes_after_failure_and_scrolls_at_minimum_size(open_dashboard, farm, monkeypatch):
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtTest import QTest
+
+    from midgard_farm.core import _app_releases
+
+    monkeypatch.setattr(_app_releases, "UPDATE_BASE_URL", "https://updates.test")
+    monkeypatch.setattr(_app_releases, "MINISIGN_PUBLIC_KEY", "configured")
+    (farm.data / "current").write_text("1.0.0", encoding="utf-8")
+    (farm.data / "app-update.json").write_text('{"previous":"0.9.0"}', encoding="utf-8")
+    farm.state()
+    notes = "\n".join(f"- Change {i}: the App supports longer release notes." for i in range(30))
+    checked = datetime(2026, 11, 22, 9, 42).timestamp()
+    farm.platform.write_atomic(farm.data / "app-update-check.json", json.dumps({
+        "latest_version": "1.1.0", "changelog": notes, "last_result": "error", "last_checked": checked,
+        "reason": "could not reach the App update server",
+    }).encode())
+    window = open_dashboard("updatesTab")
+    window.resize(640, 520)
+    wait_until(lambda: qml_item(window, "appUpdateCheck").property("text") == "Failed")
+    assert qml_item(window, "appUpdateCheckReason").property("text") == "could not reach the App update server"
+    assert qml_item(window, "appUpdateLastChecked").property("text") == "2026-11-22 09:42"
+    assert qml_item(window, "latestAppVersion").property("text") == "1.1.0"
+    assert qml_item(window, "rollbackAppButton").property("enabled")
+    changelog = qml_item(window, "appUpdateChangelog")
+    assert changelog.property("text") == notes
+    assert not window.grabWindow().isNull()
+
+    def notes_bottom():
+        return changelog.mapToScene(QPointF(0, changelog.height())).y()
+
+    assert notes_bottom() > window.height()
+    QTest.wheelEvent(window, QPoint(320, 460), QPoint(0, -2880))
+    wait_until(lambda: notes_bottom() <= window.height())
 
 
 def test_updates_buttons_submit_without_confirmation_and_restore_disables_during_session(

@@ -95,6 +95,15 @@ class LinuxPlatform(Platform):
         unit.unlink(missing_ok=True)
         self._systemctl("daemon-reload")
 
+    def service_registered(self) -> bool:
+        try:
+            load_state = self._systemctl("show", "--property=LoadState", "--value", UNIT_NAME).strip()
+        except subprocess.CalledProcessError as exc:
+            if (exc.stdout or "").strip() == "not-found":
+                return False
+            raise
+        return bool(load_state) and load_state != "not-found"
+
     @staticmethod
     def _unit_path() -> Path:
         return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user" / UNIT_NAME

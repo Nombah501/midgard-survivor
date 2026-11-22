@@ -152,6 +152,10 @@ class _Backend(QObject):
             self._enqueue(partial(self._model.patch_command, cast(PatchCommand, action)))
 
     @Slot()
+    def checkAppUpdates(self) -> None:
+        self._enqueue(self._model.check_app_updates)
+
+    @Slot()
     def rollbackApp(self) -> None:
         self._enqueue(self._model.rollback_app)
 

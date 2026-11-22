@@ -86,6 +86,9 @@ var last_run: Dictionary = {}
 var arms: Dictionary = {}
 var last_maint: Dictionary = {}
 
+var _arena_map_id := 0
+var _arena_timing: Dictionary = {}
+
 var _altar_seen: Dictionary = {}
 var _altar_channel: Dictionary = {}
 var _altar_fill_peak := 0.0
@@ -176,6 +179,7 @@ func _ready() -> void:
 	# The supervisor keeps one id for the whole AFK session so a restarted
 	# farmer continues its checkpoint; a one-off launch starts a new session.
 	session_id = OS.get_environment("FARMER_SESSION_ID")
+	_pause_requested = session_id != "" and OS.get_environment("FARMER_PAUSED") == "1"
 	if session_id == "":
 		session_id = "%s-%d" % [Time.get_datetime_string_from_system().replace(":", "").replace("-", "").replace("T", "-"), OS.get_process_id()]
 	_test_wait_at_keep = _test_env("WAIT_AT_KEEP") == "1"
@@ -365,6 +369,9 @@ func _prepare_run() -> void:
 	run_state["settle_start"] = 0
 	run_state["died"] = false
 	run_state["falls_by_mechanic"] = {}
+	run_state["arena_timings"] = []
+	_arena_map_id = 0
+	_arena_timing = {}
 	run_state["kills"] = 0
 	run_state["run_zeny"] = 0
 	run_state["run_mvps"] = 0
@@ -442,6 +449,7 @@ func _set_autopilot_flags(on: bool) -> void:
 # ---------------------------------------------------------------------------
 
 func _tick_run(now: int) -> void:
+	_observe_arena_timing(now)
 	if _test_blocked_portal and _test_tick_blocked_portal():
 		return
 	_apply_autopilot()
@@ -484,6 +492,55 @@ func _tick_run(now: int) -> void:
 		_check_timeout(now)
 	if phase == "run" and not world.running:
 		_begin_settle(now)
+
+
+func _observe_arena_timing(now: int) -> void:
+	var raid: MvpRaid = world.raid
+	if not world.running or not is_instance_valid(raid):
+		return
+	var state := raid.state
+	if state != "intro" and state != "fight" and state != "won":
+		return
+	var map_id: int = world.map.get_instance_id()
+	if map_id != _arena_map_id:
+		if state != "intro":
+			return
+		_arena_map_id = map_id
+		var timings: Array = run_state["arena_timings"]
+		_arena_timing = {
+			"arena_n": timings.size() + 1,
+			"kind": "valkyrie" if raid.mvp == "reginleif" and world.karma.route == "light" else "mvp",
+			"boss": raid.mvp,
+			"entry_ms": now,
+			"first_damage_ms": null,
+			"kill_ms": null,
+			"entry_to_first_damage_ms": null,
+			"entry_to_kill_ms": null,
+			"first_damage_to_kill_ms": null,
+		}
+		timings.append(_arena_timing)
+		_log_arena_timing("ENTRY", now)
+	if _arena_timing["kill_ms"] != null:
+		return
+	# These are first observations on a process frame, not hit callbacks.
+	# A lethal first hit can have the same timestamp as the kill.
+	if _arena_timing["first_damage_ms"] == null and is_instance_valid(raid.boss) \
+			and raid.boss.hp < raid.boss.max_hp and is_instance_valid(raid.boss.last_hit_by):
+		_arena_timing["first_damage_ms"] = now
+		_arena_timing["entry_to_first_damage_ms"] = now - int(_arena_timing["entry_ms"])
+		_log_arena_timing("FIRST_DAMAGE", now)
+	if state == "won":
+		_arena_timing["kill_ms"] = now
+		_arena_timing["entry_to_kill_ms"] = now - int(_arena_timing["entry_ms"])
+		if _arena_timing["first_damage_ms"] != null:
+			_arena_timing["first_damage_to_kill_ms"] = now - int(_arena_timing["first_damage_ms"])
+		_log_arena_timing("KILL", now)
+
+
+func _log_arena_timing(event: String, now: int) -> void:
+	_log("ARENA_%s run=%s arena_n=%d kind=%s boss=%s mono_ms=%d game_s=%.1f" % [
+		event, run_state["run_id"], _arena_timing["arena_n"], _arena_timing["kind"],
+		_arena_timing["boss"], now, float(world.time)])
 
 
 func _handle_victory(now: int) -> void:
@@ -2052,7 +2109,8 @@ func _do_keep() -> void:
 		world.menus._keep_offer = []
 		world.menus._keep_pending = false
 	_record_local_progress()
-	Save.flush()
+	if not _flush_profile_verified("keep"):
+		return
 	if run_state.has("progress"):
 		world.board.child_entered_tree.disconnect(_test_progress_board_request)
 		run_state["progress"]["after"] = _progress_snapshot(Save._read(Save.PATH))
@@ -2117,7 +2175,6 @@ func _append_storage(it: Dictionary) -> bool:
 		copy["pot"] = pot
 	st.append(copy)
 	Save.mark_dirty()
-	Save.flush()
 	return true
 
 
@@ -2191,10 +2248,6 @@ func _do_maintenance() -> void:
 		_auto_potential()
 	if bool(cfg.get("auto_storage_prune", false)):
 		_auto_prune()
-	Save.flush()
-	last_maint["zeny"] = Save.zeny()
-	last_maint["storage"] = Save.storage().size()
-	_log("MAINT " + JSON.stringify(last_maint))
 
 
 func _claim_achievements() -> void:
@@ -2365,7 +2418,6 @@ func _auto_potential() -> void:
 		Save.add_material("star_crumb", -cost)
 		_potential_script.roll(it, locks)
 		Save.mark_dirty()
-		Save.flush()
 		rolls += 1
 	if rolls > 0:
 		last_maint["pot_rolls"] = rolls
@@ -2879,6 +2931,11 @@ func _record_run() -> bool:
 
 
 func _complete_run(now: int) -> void:
+	if not _flush_profile_verified("maintenance"):
+		return
+	last_maint["zeny"] = Save.zeny()
+	last_maint["storage"] = Save.storage().size()
+	_log("MAINT " + JSON.stringify(last_maint))
 	# Refresh the pending result after maintenance before it goes to the journal.
 	if not _record_run():
 		return
@@ -3529,6 +3586,7 @@ func _build_result() -> Dictionary:
 		"finale_won": bool(run_state.get("finale_won", false)),
 		"died": bool(run_state.get("died", false)),
 		"falls_by_mechanic": run_state["falls_by_mechanic"],
+		"arena_timings": run_state["arena_timings"],
 		"forced": bool(run_state.get("forced", false)),
 		"force_reason": str(run_state.get("force_reason", "")),
 		"endless": bool(world.endless) if world != null and is_instance_valid(world) else false,
@@ -3935,26 +3993,23 @@ func _mark_transition(label: String) -> void:
 	last_transition = "%s@%d" % [label, int(Time.get_unix_time_from_system())]
 
 
-func _profile_fingerprint() -> String:
-	if not FileAccess.file_exists(Save.PATH):
-		return ""
-	var bytes := FileAccess.get_file_as_bytes(Save.PATH)
-	if bytes.is_empty():
-		return ""
-	return "%d:%d:%d" % [FileAccess.get_modified_time(Save.PATH), bytes.size(), hash(bytes)]
-
-
-func _flush_profile_verified() -> bool:
-	# Test-only seam used by verify.sh.
-	if _test_env("FLUSH_FAIL") == "1":
-		return false
-	var before := _profile_fingerprint()
-	# Force a content change so a successful write must alter the fingerprint.
-	Save.set_setting("farmer_flush_marker", "%s-%d" % [session_id, _now()])
-	Save.mark_dirty()
+func _flush_profile_verified(boundary: String) -> bool:
+	# The native flush returns no outcome; require this write's unique marker
+	# in the readable final profile, not just a changed file or a cleared flag.
+	var marker := Crypto.new().generate_random_bytes(16).hex_encode()
+	Save.set_setting("farmer_flush_marker", marker)
+	var temp_path: String = Save.TMP_PATH
+	var fault := _test_env("FLUSH_FAIL")
+	if fault == boundary or (fault == "1" and boundary == "finish"):
+		Save.TMP_PATH = Save.PATH.path_join("unwritable-test-save")
 	Save.flush()
-	var after := _profile_fingerprint()
-	return after != "" and after != before
+	Save.TMP_PATH = temp_path
+	var settings = Save._read(Save.PATH).get("settings")
+	if settings is Dictionary and settings.get("farmer_flush_marker") == marker and not marker.is_empty():
+		return true
+	last_maint = {}
+	_fail_session("flush_failed", false, "Could not verify the profile save at %s." % boundary)
+	return false
 
 
 func _now() -> int:
@@ -3995,8 +4050,7 @@ func _finish(reason: String) -> void:
 		return
 	finish_reason = reason
 	exit_code = 0
-	if not _flush_profile_verified():
-		_fail_session("flush_failed", false)
+	if not _flush_profile_verified("finish"):
 		return
 	if _test_preparation.has("before"):
 		_test_preparation["after"] = _preparation_snapshot(Save._read(Save.PATH))

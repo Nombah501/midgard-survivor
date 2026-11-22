@@ -155,6 +155,23 @@ def failed(run: Run, driven: Driven, status: dict, reason: str) -> None:
     _marker(run, f"FAIL {reason}")
 
 
+def flush_failed_keep(run: Run, driven: Driven, status: dict) -> None:
+    failed(run, driven, status, "flush_failed")
+    need("at keep" in status.get("last_error", ""), "failure does not identify the keep boundary")
+    need(any(b"Save: cannot write" in path.read_bytes() for path in driven.outputs),
+         "native save did not report a failed write")
+    _marker(run, "SETTLE ")
+    checkpoint = json.loads(run.artifact("checkpoint.json").read_bytes())
+    totals = status["totals"]
+    need(checkpoint.get("phase") == "run" and checkpoint.get("run_id") == status.get("run_id")
+         and checkpoint.get("session") == run.session, "checkpoint advanced despite the failed save")
+    need(totals == checkpoint.get("totals") and totals["started"] == 1 and totals["runs"] == 0
+         and totals["zeny"] == 0 and totals["coins"] == 0 and totals["ymir"] == 0,
+         "failed run was credited")
+    need(not checkpoint.get("result") and not status.get("last") and not _journal(run.artifact("journal.jsonl")),
+         "failed run was published")
+
+
 def checkpoint_corrupt(run: Run, driven: Driven, status: dict) -> None:
     failed(run, driven, status, "checkpoint_corrupt")
     snapshot, = (run.work / "install-backups").glob("install-*/profile.json")

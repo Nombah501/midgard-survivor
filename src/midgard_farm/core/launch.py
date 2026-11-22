@@ -103,6 +103,7 @@ def run_attempt(
     os_: Platform, profile: Path, preset: Path | None, session_id: str | None, *,
     take_service_lock: bool = False, character: Character | None = None,
     settings: SessionSettings | None = None,
+    paused: bool = False,
     log_path: Path | None = None, watch: Callable[[dict | None], str | None] | None = None,
     poll_interval: float = 0.05,
 ) -> AttemptExit:
@@ -156,6 +157,7 @@ def run_attempt(
             with tempfile.NamedTemporaryFile(dir=log_dir, prefix="run-", suffix=".log", delete=False) as temporary:
                 log_path = Path(temporary.name)
         env = {**os.environ, "FARMER_SESSION": "1"}
+        env["FARMER_PAUSED"] = "1" if paused else "0"
         if session_id:
             env["FARMER_SESSION_ID"] = session_id
         else:

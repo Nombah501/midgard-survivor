@@ -14,14 +14,17 @@ excludes = [f"midgard_farm.platform.{other_platform}"]
 
 # Data comes from the installed wheel: setuptools owns the asset allowlist.
 assets = collect_data_files("midgard_farm", subdir="_farmer", include_py_files=True) + copy_metadata("midgard-farm")
+# PyNaCl's native libsodium binding imports the CFFI backend at runtime.
+crypto_imports = ["_cffi_backend"]
 service = Analysis(
     [str(scripts / "service_entry.py")],
     datas=assets,
+    hiddenimports=crypto_imports,
     excludes=excludes,
 )
 window = Analysis(
     [str(scripts / "window_entry.py")],
-    hiddenimports=["PySide6.QtQuick"],  # QtQml's hook collects the QtQuick QML modules and Fusion.
+    hiddenimports=["PySide6.QtQuick", *crypto_imports],  # QtQml's hook collects QtQuick and Fusion.
     excludes=excludes,
 )
 setup = Analysis([str(scripts / "setup_entry.py")], datas=copy_metadata("midgard-farm"), excludes=excludes)

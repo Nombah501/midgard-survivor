@@ -18,7 +18,6 @@ _EVENT_PRIORITY: dict[str, NotificationPriority] = {
     "anchors_broken": "high",
     "smoke_failed": "high",
     "app_update_rolled_back": "high",
-    "token_rejected": "normal",
 }
 _NTFY_PRIORITY = {"low": "2", "normal": "3", "high": "4"}
 

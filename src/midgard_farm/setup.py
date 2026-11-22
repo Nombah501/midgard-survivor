@@ -3,23 +3,13 @@
 import argparse
 import subprocess
 import sys
-import warnings
 from collections.abc import Sequence
-from getpass import GetPassWarning, getpass
 from pathlib import Path
 
 from . import assets, platform
 from .core.farmer_patch import GameRunning, PatchStateError
 from .core.install import SetupError, install, service_registration_command, uninstall
 from .core.profile import ProfileNotFound
-
-
-def _prompt_token() -> str:
-    with warnings.catch_warnings():
-        # getpass would otherwise fall back to typing the token in the clear.
-        warnings.simplefilter("error", GetPassWarning)
-        # Hidden input: nothing echoes, and the classic Windows console pastes with a right-click.
-        return getpass("Release token for app updates (typing is hidden; Enter to skip): ")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -38,14 +28,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             if not getattr(sys, "frozen", False):
                 raise SetupError("run midgard-farm-setup from an unpacked release archive")
-            target = install(os_, Path(sys.executable).parent, assets.version(), _prompt_token)
+            target = install(os_, Path(sys.executable).parent, assets.version())
             for warning in os_.setup_warnings():
                 print(f"Warning: {warning}", file=sys.stderr)
             print(f"Midgard Farm installed. Open {target / ('midgard-farm' + os_.executable_suffix)}.")
-    except (EOFError, GetPassWarning):
-        print("midgard-farm-setup: enter the release token in an interactive terminal (input must be hidden)",
-              file=sys.stderr)
-        return 1
     except platform.LockHeld:
         print("midgard-farm-setup: another service or legacy farmer is still running; stop it and retry",
               file=sys.stderr)

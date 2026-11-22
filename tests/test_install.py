@@ -73,15 +73,7 @@ def bundle(tmp_path, monkeypatch):
     return root
 
 
-def test_setup_selects_the_version_stores_the_token_privately_and_can_be_rerun(fake, bundle, monkeypatch, capsys):
-    secret = "fixture-read-only-secret"
-    prompts = []
-
-    def enter_token(prompt):
-        prompts.append(prompt)
-        return secret
-
-    monkeypatch.setattr(setup, "getpass", enter_token)
+def test_setup_selects_the_version_without_credentials_and_can_be_rerun(fake, bundle, monkeypatch, capsys):
     assert setup.main([]) == 0
     data = fake.app_data_dir()
     installed = data / "versions" / "2.1.0"
@@ -97,23 +89,16 @@ def test_setup_selects_the_version_stores_the_token_privately_and_can_be_rerun(f
     assert current_service(fake) == installed / f"midgard-farm-service{suffix}"
     output = capsys.readouterr()
     assert "fake platform warning" in output.err
-    assert secret not in output.out + output.err
-    token = data / "release-token"
-    assert token.read_text(encoding="utf-8") == secret + "\n"
-    assert not (bundle / "release-token").exists()
+    assert not (data / "release-token").exists()
     assert not (data / "logs").exists()
     if sys.platform == "linux":
-        assert stat.S_IMODE(token.stat().st_mode) == 0o600
         assert stat.S_IMODE(current_service(fake).stat().st_mode) == 0o755
     copied_at = (installed / "_internal" / "data").stat().st_mtime_ns
-    token_at = token.stat().st_mtime_ns
     for executable in (sys.executable, installed / Path(sys.executable).name):
         monkeypatch.setattr(sys, "executable", str(executable))
         assert setup.main([]) == 0
-    assert len(prompts) == 1
     assert fake.registration == [str(launcher)]
     assert (installed / "_internal" / "data").stat().st_mtime_ns == copied_at
-    assert token.stat().st_mtime_ns == token_at
     assert [p.name for p in (data / "versions").iterdir()] == ["2.1.0"]
     (launcher.parent / "_internal" / "data").write_bytes(b"old launcher runtime")
     assert setup.main([]) == 0
@@ -121,18 +106,21 @@ def test_setup_selects_the_version_stores_the_token_privately_and_can_be_rerun(f
     assert fake.registration == [str(launcher)]
 
 
-def test_setup_installs_without_a_token_when_the_operator_skips_it(fake, bundle, monkeypatch):
-    monkeypatch.setattr(setup, "getpass", lambda _: "")
+def test_setup_removes_a_legacy_token_without_resetting_the_update_sequence(fake, bundle):
+    data = fake.app_data_dir()
+    data.mkdir()
+    (data / "release-token").write_text("obsolete-token\n", encoding="utf-8")
+    floor = data / "app-update-sequence.json"
+    floor.write_bytes(b'{"sequence":12}')
 
     assert setup.main([]) == 0
-    data = fake.app_data_dir()
     assert (data / "current").read_bytes() == b"2.1.0\n"
     assert fake.registration
     assert not (data / "release-token").exists()
+    assert floor.read_bytes() == b'{"sequence":12}'
 
 
-def test_setup_repairs_an_empty_installed_version_before_selecting_it(fake, bundle, monkeypatch):
-    monkeypatch.setattr(setup, "getpass", lambda _: "fixture-token")
+def test_setup_repairs_an_empty_installed_version_before_selecting_it(fake, bundle):
     data = fake.app_data_dir()
     target = data / "versions" / "2.1.0"
     target.mkdir(parents=True)
@@ -146,7 +134,6 @@ def test_setup_repairs_an_empty_installed_version_before_selecting_it(fake, bund
 
 
 def test_cannot_select_an_incomplete_version_if_repair_fails(fake, bundle, monkeypatch, capsys):
-    monkeypatch.setattr(setup, "getpass", lambda _: "fixture-token")
     data = fake.app_data_dir()
     target = data / "versions" / "2.1.0"
     target.mkdir(parents=True)
@@ -176,8 +163,7 @@ def test_setup_prints_the_launcher_registration_without_installing(fake, capsys)
     assert not fake.calls
 
 
-def test_current_pointer_changes_service_without_reregistering(fake, bundle, monkeypatch):
-    monkeypatch.setattr(setup, "getpass", lambda _: "fixture-token")
+def test_current_pointer_changes_service_without_reregistering(fake, bundle):
     assert setup.main([]) == 0
     first_registration = fake.registration
     first = current_service(fake)

@@ -274,6 +274,35 @@ def test_sandbox_install_backs_up_profile_and_restores_exact_official_state(farm
     assert all(item.exists() for item in profile_files)
 
 
+def test_successful_install_keeps_latest_rollback_and_active_diagnostic_backups(farm):
+    os_, profile, _, _, _, _, gdre = farm
+    manifest = build(os_, profile, gdre=gdre)
+    backups = farmer_dir(os_) / "backups"
+    journal, quarantine, state, stale, unrelated = (
+        backups / name for name in ("install-journal0", "install-isolated", "install-state000", "install-stale000", "known-good")
+    )
+    for old in (journal, quarantine, state, stale, unrelated):
+        old.mkdir(parents=True)
+        (old / INSTALLED_PACK).touch()
+    data = os_.app_data_dir()
+    active = {
+        "game-update.json": {"detail": f"install: rollback failed; backup at {journal}"},
+        "quarantine.json": {"log_path": str(quarantine / "diagnostic.log")},
+        "state.json": {"quarantine": {"detail": f"rollback failed; backup at {state}"}},
+    }
+    for name, record in active.items():
+        (data / name).write_text(json.dumps(record), encoding="utf-8")
+
+    first = install(os_, profile)
+    assert set(backups.iterdir()) == {first, journal, quarantine, state, unrelated}
+    for name in active:
+        (data / name).unlink()
+    latest = install(os_, profile)
+    assert set(backups.iterdir()) == {latest, unrelated}
+    assert digest(latest / INSTALLED_PACK) == manifest.result_sha256
+    assert json.loads((latest / "state.json").read_bytes())["file"] == INSTALLED_PACK
+
+
 def test_failed_replacement_restores_state_pack_and_official_snapshot(farm, monkeypatch):
     os_, profile, state, _, _, _, gdre = farm
     build(os_, profile, gdre=gdre)
@@ -282,6 +311,8 @@ def test_failed_replacement_restores_state_pack_and_official_snapshot(farm, monk
     installed.write_bytes(b"old unmounted farmer patch")
     snapshot_official_state(os_, profile)
     replace_atomic = os_.replace_atomic
+    previous = farmer_dir(os_) / "backups" / "install-previous"
+    previous.mkdir(parents=True)
 
     def corrupt_install(src, dst):
         # Inject a failure after publication, not a fake backup or profile.
@@ -295,6 +326,7 @@ def test_failed_replacement_restores_state_pack_and_official_snapshot(farm, monk
     assert state.read_bytes() == original
     assert installed.read_bytes() == b"old unmounted farmer patch"
     assert (state.parent / "official-state.json").read_bytes() == original
+    assert previous.is_dir()
 
 
 def test_stale_build_cannot_replace_a_new_official_state(farm):

@@ -341,11 +341,20 @@ class WindowsPlatform(Platform):
         return _env_dir("LOCALAPPDATA") / "MidgardFarm"
 
     def game_executable(self) -> Path:
+        return self._game_executable(remember=True)
+
+    def game_executable_readonly(self) -> Path:
+        return self._game_executable(remember=False)
+
+    def _game_executable(self, *, remember: bool) -> Path:
         if game_dir := os.environ.get("GAME_DIR"):
             return Path(game_dir) / self.game_exe_name
         if configured := read_config(self).game_dir:
             return configured / self.game_exe_name
-        if executable := self._known_game() or self._remember_game(self.game_pids()):
+        if executable := self._known_game():
+            return executable
+        pids = self.game_pids()
+        if executable := (self._remember_game(pids) if remember else self._running_game(pids)):
             return executable
         raise RuntimeError("start the game once so the app can find it")
 
@@ -365,20 +374,23 @@ class WindowsPlatform(Platform):
         return (executable.is_absolute() and executable.name.casefold() == self.game_exe_name.casefold()
                 and executable.is_file())
 
-    def _remember_game(self, pids: set[int]) -> Path | None:
+    def _running_game(self, pids: set[int]) -> Path | None:
         for pid in sorted(pids):
             executable = _process_image(pid)
             # The PID may have been reused since tasklist took its snapshot.
-            if executable is None or not self._is_game_executable(executable):
-                continue
+            if executable is not None and self._is_game_executable(executable):
+                return executable
+        return None
+
+    def _remember_game(self, pids: set[int]) -> Path | None:
+        if executable := self._running_game(pids):
             location = self._game_location_path()
             try:
                 location.parent.mkdir(parents=True, exist_ok=True)
                 self.write_atomic(location, str(executable).encode("utf-8"))
             except OSError as exc:
                 print(f"midgard-farm-service: could not remember game location: {exc}", file=sys.stderr)
-            return executable
-        return None
+        return executable
 
     def render_service(self, argv: Sequence[str]) -> str:
         return self._render_task(argv, watchdog=False)
@@ -421,6 +433,16 @@ class WindowsPlatform(Platform):
         except subprocess.CalledProcessError as exc:
             if not _scheduler_error(exc, ERROR_FILE_NOT_FOUND):
                 raise
+
+    def service_registered(self) -> bool:
+        try:
+            # XML query avoids depending on a localized task listing.
+            _system_tool("schtasks.exe", "/Query", "/TN", SERVICE_TASK_NAME, "/XML")
+        except subprocess.CalledProcessError as exc:
+            if _scheduler_error(exc, ERROR_FILE_NOT_FOUND):
+                return False
+            raise
+        return True
 
     def start_service(self) -> None:
         try:

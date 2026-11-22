@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -16,7 +16,6 @@ from .patch_info import INSTALLED_PACK
 from .profile import AmbiguousProfile
 
 _CURRENT = "current"
-_TOKEN = "release-token"
 _LAUNCHER = "midgard-farm-launcher"
 _SERVICE = "midgard-farm-service"
 _VERSION = re.compile(
@@ -98,7 +97,12 @@ def _bundle_complete(path: Path, suffix: str) -> bool:
             and all(exe.is_file() and exe.stat().st_size > 0 for exe in executables))
 
 
-def install(os_: Platform, source: Path, version: str, prompt_token: Callable[[], str]) -> Path:
+def remove_legacy_release_token(data: Path) -> None:
+    """Retire the old credential even if the operator later rolls back locally."""
+    (data / "release-token").unlink(missing_ok=True)
+
+
+def install(os_: Platform, source: Path, version: str) -> Path:
     data, source = os_.app_data_dir().resolve(), source.resolve()
     target = _version_dir(data, version)
     suffix = os_.executable_suffix
@@ -108,29 +112,12 @@ def install(os_: Platform, source: Path, version: str, prompt_token: Callable[[]
         raise SetupError("unpack the release outside the app's data directory")
     data.mkdir(parents=True, exist_ok=True)
     with os_.acquire_lock(data / "app-update.lock"):
-        return _install_locked(os_, source, target, version, prompt_token)
+        return _install_locked(os_, source, target, version)
 
 
-def _install_locked(os_: Platform, source: Path, target: Path, version: str,
-                    prompt_token: Callable[[], str]) -> Path:
+def _install_locked(os_: Platform, source: Path, target: Path, version: str) -> Path:
     data = os_.app_data_dir().resolve()
     suffix = os_.executable_suffix
-    token_file = data / _TOKEN
-    if token_file.is_symlink():
-        raise SetupError("the release-token must be a regular file in the app's data directory")
-    try:
-        token_present = bool(os_.read_shared(token_file).strip())
-    except FileNotFoundError:
-        token_present = False
-    if not token_present:
-        token = prompt_token().strip()
-        # Empty skips: the farm runs without a token, only app self-update stays off until setup reruns.
-        if token:
-            if not token.isprintable() or any(character.isspace() for character in token):
-                raise SetupError("enter a read-only release token without whitespace, or press Enter to skip")
-            # Platform.write_atomic starts from mkstemp (0600 on Linux); no token in argv or logs.
-            os_.write_atomic(token_file, (token + "\n").encode("utf-8"))
-
     if not _bundle_complete(target, suffix):
         if target == source:
             raise SetupError("the installed release is incomplete; rerun setup from a complete unpacked release")
@@ -150,6 +137,7 @@ def _install_locked(os_: Platform, source: Path, target: Path, version: str,
         previous = os_.read_shared(pointer)
     except FileNotFoundError:
         previous = None
+    remove_legacy_release_token(data)
     if previous != selected:
         os_.write_atomic(pointer, selected)
         (data / "app-update-pending.json").unlink(missing_ok=True)

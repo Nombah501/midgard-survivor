@@ -254,6 +254,10 @@ def fake_cli(verification, tmp_path):
     harness.mkdir()
     (harness / "sitecustomize.py").write_text(
         "from test_verify import VerifyGamePlatform\n"
+        "import os\n"
+        "from midgard_farm.verify import scenarios\n"
+        "if os.environ.get('FAKE_VERIFY_SMALL_ALL'):\n"
+        "    scenarios.BOUNDED_SCENARIOS = ('one-run', 'supervised-kill-run')\n"
         "from midgard_farm import platform\nplatform.current = VerifyGamePlatform\n", encoding="utf-8",
     )
     env.update(PYTHONPATH=os.pathsep.join((str(harness), str(Path(__file__).resolve().parent))),
@@ -266,35 +270,89 @@ def fake_cli(verification, tmp_path):
     return os_, real, profile, candidate, work, invoke
 
 
+def retained_sandbox(root, day, *, failed, legacy=False):
+    # A clock correction can make the current run's timestamp appear older.
+    out = root / f"verify-210001{day:02d}-120000-abcdefgh"
+    (out / "sandbox").mkdir(parents=True)
+    (out / "sandbox" / "profile.json").touch()
+    summary = {"rows": [{"verdict": "FAIL" if failed else "PASS"}]}
+    if not legacy:
+        summary["exit"] = int(failed)
+    (out / "summary.json").write_text(json.dumps(summary))
+    (out / "one-run.run.log").touch()
+    return out
+
+
 @pytest.mark.parametrize(("keep", "fault"), [(False, ""), (True, ""), (False, "no-victory")])
 def test_cli_retains_logs_and_only_keeps_requested_or_failed_sandboxes(fake_cli, tmp_path, keep, fault):
     os_, real, profile, candidate, _, invoke = fake_cli
-    flags = ["--keep"] if keep else []
-    result = invoke("--scenario", "one-run", "--candidate-dir", str(candidate), *flags, FAKE_VERIFY_FAULT=fault)
+    root = tmp_path / ".sandbox"
+    failed = [retained_sandbox(root, day, failed=True, legacy=day == 3) for day in range(1, 8)]
+    kept = retained_sandbox(root, 8, failed=False, legacy=True)
+    legacy = root / "verify-20260101-120000"
+    (legacy / "sandbox").mkdir(parents=True)
+    if not keep and not fault:
+        result = invoke("--all", "--candidate-dir", str(candidate), FAKE_VERIFY_SMALL_ALL="1",
+                        FAKE_VERIFY_RELEASE_OS="windows")
+    else:
+        flags = ["--keep"] if keep else []
+        result = invoke("--scenario", "one-run", "--candidate-dir", str(candidate), *flags, FAKE_VERIFY_FAULT=fault)
     assert result.returncode == bool(fault), result.stdout + result.stderr
-    out, = (tmp_path / ".sandbox").glob("verify-*")
+    out, = set(root.glob("verify-*")) - {*failed, kept, legacy}
     summary = json.loads((out / "summary.json").read_bytes())
     assert summary["rows"][0]["verdict"] == ("FAIL" if fault else "PASS")
+    if not keep and not fault:
+        assert [(row["scenario"], row["verdict"]) for row in summary["rows"]] == [
+            ("one-run", "PASS"), ("supervised-kill-run", "SKIP"),
+        ]
+        assert not (out / "supervised-kill-run.worker.log").exists()
     assert (out / "one-run.run.log").is_file()
     assert (out / "sandbox").exists() == bool(keep or fault)
+    assert [saved for saved in failed if (saved / "sandbox").is_dir()] == failed[-(4 if fault else 5):]
+    assert all((saved / "summary.json").is_file() and (saved / "one-run.run.log").is_file() for saved in failed)
+    assert (kept / "sandbox/profile.json").is_file() and (legacy / "sandbox").is_dir()
     assert (profile / "profile.json").read_text() == "100"
     assert not (real / os_.app_data_dir().name).exists()
 
 
-def test_cli_all_runs_supported_scenarios_and_reports_windows_skip(fake_cli, tmp_path):
-    _, _, _, candidate, _, invoke = fake_cli
-    result = invoke("--all", "--candidate-dir", str(candidate), timeout=4 * len(ALL), FAKE_VERIFY_RELEASE_OS="windows")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "supervised-kill-run is Linux only (unsupported on this OS)" in result.stdout
+@pytest.mark.parametrize("release_os", ["linux", "windows"])
+def test_cli_all_selects_the_registry_and_skips_unsupported_scenarios(
+    verification, tmp_path, monkeypatch, release_os,
+):
+    from midgard_farm.verify import __main__ as cli
+
+    os_, source, candidate, _, _, _ = verification
+    monkeypatch.setattr(os_, "release_os", release_os)
+    monkeypatch.setattr(platform, "current", lambda: os_)
+    monkeypatch.setattr(cli, "find_profile", lambda _: source)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    launched = []
+
+    def launch(os_, out, source, candidate, game, name, hours, preset, stop):
+        launched.append(name)
+        (out / f"{name}.result.json").write_text(json.dumps(
+            {"scenario": name, "verdict": "PASS", "exit": 0, "reason": ""},
+        ))
+        return 0
+
+    monkeypatch.setattr(cli, "_launch_worker", launch)
+    assert cli.main(["--all", "--candidate-dir", str(candidate)]) == 0
     out, = (tmp_path / ".sandbox").glob("verify-*")
     rows = json.loads((out / "summary.json").read_bytes())["rows"]
+    skipped = {"supervised-kill-run"} if release_os == "windows" else set()
+    assert launched == [name for name in ALL if name not in skipped]
     assert [(row["scenario"], row["verdict"]) for row in rows] == [
-        (name, "SKIP" if name == "supervised-kill-run" else "PASS") for name in ALL
+        (name, "SKIP" if name in skipped else "PASS") for name in ALL
     ]
-    assert not (out / "supervised-kill-run.worker.log").exists()
 
-    explicit = invoke("--scenario", "supervised-kill-run", FAKE_VERIFY_RELEASE_OS="windows")
-    assert explicit.returncode == 2 and "unsupported on this OS" in explicit.stderr
+
+def test_cli_explicitly_requested_unsupported_scenario_is_refused(fake_cli, tmp_path):
+    _, _, _, _, _, invoke = fake_cli
+    result = invoke("--scenario", "supervised-kill-run", FAKE_VERIFY_RELEASE_OS="windows")
+    assert result.returncode == 2 and "unsupported on this OS" in result.stderr
+    assert not (tmp_path / ".sandbox").exists()
 
 
 def test_cli_refuses_to_start_while_game_is_running(fake_cli, tmp_path):
@@ -303,6 +361,18 @@ def test_cli_refuses_to_start_while_game_is_running(fake_cli, tmp_path):
     assert result.returncode == 2 and "the game is running" in result.stderr
     assert not list((tmp_path / ".sandbox").glob("verify-*"))
     assert (profile / "profile.json").read_text() == "100"
+
+
+def test_cli_refuses_source_profile_inside_prunable_storage(fake_cli, tmp_path):
+    os_, _, profile, candidate, _, invoke = fake_cli
+    data = tmp_path / ".sandbox" / "verify-21000101-120000-abcdefgh" / "sandbox"
+    godot, _ = os_.godot_sandbox(data)
+    godot.mkdir(parents=True)
+    moved = godot / profile.name
+    shutil.move(profile, moved)
+    result = invoke("--scenario", "one-run", "--candidate-dir", str(candidate), **os_.app_sandbox_environment(data))
+    assert result.returncode == 2 and "verification storage overlaps" in result.stderr
+    assert (moved / "profile.json").read_text() == "100"
 
 
 def test_direct_worker_cannot_bypass_suite_locks(fake_cli):

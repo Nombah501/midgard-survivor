@@ -5,7 +5,9 @@ import math
 import os
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from datetime import date, datetime, time as local_time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -62,10 +64,87 @@ def read_run_journal(os_: Platform, path: Path) -> Iterator[dict[str, Any]]:
         return iter(())
 
 
-def _number(value: object) -> int | float:
+def _finite_number(value: object) -> int | float | None:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
-    return value if isinstance(value, float) and math.isfinite(value) else 0
+    return value if isinstance(value, float) and math.isfinite(value) else None
+
+
+def _number(value: object) -> int | float:
+    return _finite_number(value) or 0
+
+
+@dataclass(frozen=True)
+class SessionTiming:
+    elapsed_s: float | None
+    run_s: float | None
+
+    @property
+    def downtime_s(self) -> float | None:
+        if self.elapsed_s is None or self.run_s is None:
+            return None
+        return max(0, self.elapsed_s - self.run_s)
+
+
+def session_timing(row: dict[str, Any]) -> SessionTiming:
+    """Read session elapsed time separately from the journal's settled-run time."""
+    start, end = _finite_number(row.get("started_at")), _finite_number(row.get("timestamp"))
+    totals = row.get("totals")
+    run_s = _finite_number(totals.get("wall_s")) if isinstance(totals, dict) else None
+    elapsed = end - start if start is not None and end is not None and end >= start else None
+    return SessionTiming(elapsed, run_s if run_s is not None and run_s >= 0 else None)
+
+
+@dataclass(frozen=True)
+class NightSummary:
+    sessions: int
+    zeny: int | float | None
+    wins: int | float | None
+    runs: int | float | None
+    downtime_s: float | None
+    partial_downtime: bool
+
+
+def night_summary(rows: Iterable[dict[str, Any]], today: date,
+                  active: dict[str, Any] | None = None) -> NightSummary:
+    """Sum whole overlapping sessions; the journal cannot cut rewards at clock boundaries."""
+    start = datetime.combine(today - timedelta(days=1), local_time(18)).timestamp()
+    end = datetime.combine(today, local_time(12)).timestamp()
+    sessions = timed = 0
+    amounts: dict[str, int | float | None] = dict.fromkeys(("zeny", "wins", "runs"), 0)
+    downtime = 0.0
+
+    def include(row: dict[str, Any], *, ongoing: bool = False) -> None:
+        nonlocal sessions, timed, downtime
+        if (finished := _finite_number(row.get("timestamp"))) is None:
+            return
+        began = _finite_number(row.get("started_at"))
+        if began is None or began > finished:
+            # For old rows without a start, only the completion time proves membership.
+            if not start <= finished < end:
+                return
+        elif not (finished > start and began < end):
+            return
+        sessions += 1
+        totals = row.get("totals")
+        for key, previous in amounts.items():
+            amount = _finite_number(totals.get(key)) if isinstance(totals, dict) else None
+            amounts[key] = previous + amount if previous is not None and amount is not None else None
+        # The active session's unsettled run time is not downtime.
+        if not ongoing and (idle := session_timing(row).downtime_s) is not None:
+            downtime += idle
+            timed += 1
+
+    active_id = active.get("session_id") if active is not None else None
+    for row in rows:
+        if row.get("kind") == "session":
+            include(row)
+            if active_id is not None and row.get("session_id") == active_id:
+                active = None  # State may lag the committed terminal history row.
+    if active is not None:
+        include(active, ongoing=True)
+    return NightSummary(sessions, amounts["zeny"], amounts["wins"], amounts["runs"],
+                        downtime if timed else None, timed < sessions)
 
 
 _REWARDS = {"zeny": "zeny_gain", "xp": "xp_gain", "kills": "kills", "coins": "coins_gain", "ymir": "ymir_gain"}
