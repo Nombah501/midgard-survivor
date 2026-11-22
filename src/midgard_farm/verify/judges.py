@@ -11,6 +11,8 @@ from ..core.history import read_history
 from .drive import Driven, Run
 from .soak import judge_files, read_jsonl
 
+TOWER_CRASH_POINTS = ("tower_intent", "tower_started")
+
 
 class VerificationFailure(Exception):
     pass
@@ -483,6 +485,45 @@ def tower_one_run(run: Run, driven: Driven, status: dict) -> None:
     checkpoint = json.loads(run.artifact("checkpoint.json").read_bytes())
     need(checkpoint["tower_intent"] == {"run_id": row["run_id"], "snapshot_id": row["snapshot"]["id"]},
          "Tower intent was not retained through settlement")
+
+
+def tower_crash_recovery(run: Run, driven: Driven, status: dict) -> None:
+    failed(run, driven, status, "tower_intent_unresolved")
+    cases = json.loads(run.artifact("crash-cases.json").read_bytes())
+    for point in TOWER_CRASH_POINTS:
+        case = cases[point]
+        checkpoint = case["checkpoint"]
+        saved_status = case["restart_status"]
+        need(case["first_exit"] != 0 and case["crash_marker"] == point, f"did not crash at {point}")
+        _marker(run, f"TEST_CRASH {point}", suffix=f"{point}.crash.farmer.log")
+        need(case["restart_exit"] == 1 and saved_status["phase"] == "failed"
+             and saved_status["terminal"] and saved_status["failed"]
+             and saved_status["finish_reason"] == "tower_intent_unresolved",
+             f"{point}: restart did not fail closed")
+        intent = checkpoint["tower_intent"]
+        session = f"{run.session}-{point}"
+        need(checkpoint["session"] == saved_status["session"] == session
+             and checkpoint["run_id"] == intent["run_id"] == f"{session}-r1"
+             and checkpoint["phase"] == "tower_intent" and intent["snapshot_id"],
+             f"{point}: missing durable launch intent")
+        evidence = case["evidence"] or {}
+        before, at_crash = evidence.get("before_crash"), evidence.get("at_crash")
+        if not before or not at_crash or not before["snapshots"]:
+            raise VerificationFailure(f"{point}: missing native save evidence")
+        chosen = max((snap for snap in before["snapshots"] if not snap["locked"]), key=_tower_rank, default=None)
+        if not chosen or chosen["id"] != intent["snapshot_id"]:
+            raise VerificationFailure(f"{point}: intent names the wrong snapshot")
+        expected = before["snapshots"] if point == "tower_intent" else [
+            snap for snap in before["snapshots"] if snap["id"] != chosen["id"]
+        ]
+        need(at_crash["snapshots"] == expected, f"{point}: unexpected Tower snapshot spend")
+        need(before["preparation"] == at_crash["preparation"], f"{point}: character preparation changed")
+        need(before["other_sha256"] == at_crash["other_sha256"], f"{point}: non-Tower profile data changed")
+        need(evidence["board_requests"] == 0, f"{point}: online submission during Tower launch")
+        need(case["before_restart"] == case["after_restart"], f"{point}: restart changed the saved profile")
+        need(checkpoint == case["checkpoint_after_restart"] and saved_status["totals"]["runs"] == 0,
+             f"{point}: restart advanced the unprovable run")
+    need(not _journal(run.artifact("journal.jsonl")), "an unprovable Tower run was journaled")
 
 
 def invalid_rotation_difficulty(run: Run, driven: Driven, status: dict) -> None:

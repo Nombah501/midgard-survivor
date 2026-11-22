@@ -1,11 +1,12 @@
 """Scenario registry and artifact collection for one isolated verification worker."""
 
+import hashlib
 import json
 import math
 import shutil
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
@@ -41,6 +42,54 @@ _MVP_DRILL_TRIALS = 5
 _HELL_RUN: dict[str, object] = {
     "class": "thief", "job_paths": {"thief": 0}, "danger": 30, "max_runs": 1, "oaths": _HELL_OATHS,
 }
+_TOWER_RUN: dict[str, object] = {
+    "stage": {"mode": "tower", "kind": "normal", "floor": 1},
+    "max_runs": 0, "auto_achievements": False,
+}
+
+
+def _drive_tower_crashes(run: drive.Run, timeout: float) -> drive.Driven:
+    cases = {}
+    outputs: list[Path] = []
+    profile = run.profile / "profile.json"
+    checkpoint = run.profile / "farmer_session.json"
+    marker = run.profile / "farmer_test_crashed"
+    for point in judges.TOWER_CRASH_POINTS:
+        trial = replace(run, session=f"{run.session}-{point}")
+        marker.unlink(missing_ok=True)
+        first = drive.direct(trial, timeout / 4, output=f"{point}.crash.log",
+                             FARMER_TEST_CRASH_AT=point, FARMER_TEST_TOWER_CRASH="1")
+        outputs.extend(first.outputs)
+        if first.failure:
+            return replace(first, outputs=tuple(outputs))
+        initial_status = trial.status()
+        crash_marker = marker.read_text() if marker.exists() else ""
+        if first.code == 0 or crash_marker != point:
+            reason = initial_status.get("finish_reason")
+            detail = initial_status.get("last_error")
+            diagnostic = f": {reason}: {detail}" if reason and detail else ""
+            return replace(first, outputs=tuple(outputs), failure=f"did not crash at {point}{diagnostic}")
+        shutil.copyfile(run.profile / "farmer.log", run.artifact(f"{point}.crash.farmer.log"))
+        case = {
+            "first_exit": first.code, "crash_marker": crash_marker,
+            "checkpoint": json.loads(checkpoint.read_bytes()) if checkpoint.exists() else {},
+            "evidence": initial_status.get("tower_evidence"),
+            "before_restart": hashlib.sha256(profile.read_bytes()).hexdigest(),
+        }
+        output = f"{point}.restart.log" if point != judges.TOWER_CRASH_POINTS[-1] else "run.log"
+        second = drive.direct(trial, timeout / 4, output=output)
+        outputs.extend(second.outputs)
+        if second.failure:
+            return replace(second, outputs=tuple(outputs))
+        cases[point] = case | {
+            "restart_exit": second.code, "restart_status": trial.status(),
+            "checkpoint_after_restart": json.loads(checkpoint.read_bytes()) if checkpoint.exists() else {},
+            "after_restart": hashlib.sha256(profile.read_bytes()).hexdigest(),
+        }
+    run.artifact("crash-cases.json").write_text(json.dumps(cases, indent=2) + "\n", encoding="utf-8")
+    return replace(second, outputs=tuple(outputs))
+
+
 # Bounded scenarios inherit the shared one-run config, including speed 10,
 # hard exit and display false. All check exits, evidence and script errors.
 SCENARIOS = {
@@ -79,10 +128,8 @@ SCENARIOS = {
     "tower-snapshot-parity": Scenario(300, {
         "class": "thief", "danger": 30, "max_runs": 2, "auto_achievements": False,
     }, partial(drive.direct, FARMER_TEST_TOWER_PARITY="1"), judges.tower_snapshot_parity),
-    "tower-one-run": Scenario(300, {
-        "stage": {"mode": "tower", "kind": "normal", "floor": 1},
-        "max_runs": 0, "auto_achievements": False,
-    }, partial(drive.direct, FARMER_TEST_TOWER_RUN="1"), judges.tower_one_run),
+    "tower-one-run": Scenario(300, _TOWER_RUN, partial(drive.direct, FARMER_TEST_TOWER_RUN="1"), judges.tower_one_run),
+    "tower-crash-recovery": Scenario(400, _TOWER_RUN, _drive_tower_crashes, judges.tower_crash_recovery),
     "oaths": Scenario(180, _OATH_RUNS | {"danger": 30, "oaths": {"tough": 3, "elite": 1}},
                       partial(drive.supervised, FARMER_TEST_OATHS="1",
                               resume=_resume_settings("prontera", 30, {"hunt": 2})),

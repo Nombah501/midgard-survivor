@@ -479,6 +479,9 @@ func _launch_tower(snapshot: Dictionary, floor: int) -> bool:
 	run_state["tower_floor_best"] = 0
 	run_state["snapshot"] = {"id": id, "job": snapshot["job"], "level": snapshot["level"]}
 	_tower_intent = {"snapshot_id": id, "run_id": run_state["run_id"]}
+	if _test_env("TOWER_CRASH") == "1":
+		_test_tower_evidence["before_crash"] = _test_tower_profile_evidence()
+		world.board.child_entered_tree.connect(_test_observe_tower_request.bind(true))
 	if not _write_checkpoint("tower_intent"):
 		return false
 	_test_crash("tower_intent")
@@ -3812,6 +3815,10 @@ func _test_crash(point: String) -> void:
 	if f != null:
 		f.store_string(point)
 		f.close()
+	if point in ["tower_intent", "tower_started"] and _test_env("TOWER_CRASH") == "1":
+		_test_tower_evidence["at_crash"] = _test_tower_profile_evidence()
+		_test_tower_evidence["board_requests"] = _test_tower_board_requests
+		_write_status()
 	_log("TEST_CRASH " + point)
 	OS.kill(OS.get_process_id())
 
@@ -4346,8 +4353,19 @@ func _tower_save_evidence(profile: Dictionary) -> Array:
 	return out
 
 
-func _test_observe_tower_request(child: Node) -> void:
-	if child is HTTPRequest and not world.running:
+
+func _test_tower_profile_evidence() -> Dictionary:
+	var saved: Dictionary = Save._read(Save.PATH)
+	if saved.is_empty():
+		return {}
+	var snapshots := _tower_save_evidence(saved)
+	var preparation := _preparation_snapshot(saved)
+	(saved.get("tower", {}) as Dictionary).erase("builds")
+	return {"snapshots": snapshots, "preparation": preparation, "other_sha256": JSON.stringify(saved).sha256_text()}
+
+
+func _test_observe_tower_request(child: Node, during_run := false) -> void:
+	if child is HTTPRequest and (during_run or not world.running):
 		_test_tower_board_requests += 1
 
 

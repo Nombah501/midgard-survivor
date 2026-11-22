@@ -27,6 +27,7 @@ mvp_drill = os.environ.get("FARMER_TEST_MVP_MECHANICS") == "1"
 verify_progress = os.environ.get("FARMER_TEST_PROGRESS") == "1"
 verify_tower_parity = os.environ.get("FARMER_TEST_TOWER_PARITY") == "1"
 verify_tower_run = os.environ.get("FARMER_TEST_TOWER_RUN") == "1"
+verify_tower_crash = os.environ.get("FARMER_TEST_TOWER_CRASH") == "1"
 tower_evidence = {}
 tower_intent = {}
 if field_navigation:
@@ -144,7 +145,7 @@ def status(phase, reason="", code=0, detail=""):
         if fault == "replayed-native-progress":
             after["history"] = [after["history"][0], *after["history"][:49]]
         data["progress_saved"] = after
-    if phase == "done" and tower_evidence:
+    if tower_evidence and (phase == "done" or verify_tower_crash):
         data["tower_evidence"] = tower_evidence
     if fault == "no-transition":
         del data["last_transition"]
@@ -168,7 +169,7 @@ def checkpoint(phase, row=None):
 
 def crash(point):
     if hook == point and not crashed.exists():
-        crashed.touch()
+        crashed.write_text(point)
         log(f"TEST_CRASH {point}")
         sys.exit(99)
 
@@ -456,12 +457,22 @@ if checkpoint_path.exists():
         log("FAIL checkpoint_corrupt")
         status("failed", "checkpoint_corrupt", 1)
         sys.exit(1)
-    started, run_id = saved["totals"]["started"], saved["run_id"]
-    rotation_index = saved.get("rotation_index")
-    if saved["phase"] == "run":
+    if saved["session"] == session and saved["phase"] == "tower_intent":
+        run_id = saved["run_id"]
+        if fault == "tower-crash-restart-write":
+            save.write_text("1")
+        log("FAIL tower_intent_unresolved")
+        status("failed", "tower_intent_unresolved", 1)
+        sys.exit(1)
+    if saved["session"] == session:
+        started, run_id = saved["totals"]["started"], saved["run_id"]
+        rotation_index = saved.get("rotation_index")
+    else:
+        saved = {}
+    if saved.get("phase") == "run":
         lost = 1
         log("RUN_LOST before settlement")
-    elif saved["phase"] == "settled":
+    elif saved.get("phase") == "settled":
         row = saved["row"]
         if journal_path.exists():
             log("RECOVER journal=present")
@@ -477,7 +488,7 @@ if checkpoint_path.exists():
 started += 1
 advance_rotation()
 run_id = f"{session}-r{started}"
-if verify_tower_run:
+if verify_tower_run or verify_tower_crash:
     tower_evidence["before"] = [
         tower_fixture("locked", 99, locked=True),
         tower_fixture("same-level-lower-xp", 30, xp=0.1, saved_at=40.0),
@@ -486,6 +497,17 @@ if verify_tower_run:
     ]
     tower_intent = {"snapshot_id": "selected", "run_id": run_id}
     checkpoint("tower_intent")
+    if verify_tower_crash:
+        snapshots = tower_evidence["before"]
+        remaining = snapshots
+        if hook == "tower_started":
+            remaining = snapshots[: -2 if fault == "tower-crash-double-spend" else -1]
+            save.write_text(str(boot_zeny - (len(snapshots) - len(remaining))))
+        profile_evidence = {"preparation": {"pet": "poring"}, "other_sha256": "same"}
+        tower_evidence.update(before_crash=profile_evidence | {"snapshots": snapshots},
+                              at_crash=profile_evidence | {"snapshots": remaining}, board_requests=0)
+        status("idle")
+        crash(hook)
     log(f"TOWER_START run={run_id} kind=normal floor={cfg['stage']['floor']} snapshot=selected")
 checkpoint("run")
 crash("run")
