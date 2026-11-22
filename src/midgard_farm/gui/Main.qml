@@ -9,6 +9,7 @@ ApplicationWindow {
     readonly property var history: backend.history
     readonly property var updates: session.updates
     readonly property var quarantine: session.quarantine
+    readonly property var diagnostics: backend.diagnostics
     readonly property color ground: "#1c1e1d"
     readonly property color raised: "#2b2e2c"
     readonly property color hairline: "#3a3e3b"
@@ -511,7 +512,7 @@ ApplicationWindow {
                 StoneTab { id: afkTab; objectName: "afkTab"; text: qsTr("AFK session"); height: tabs.height }
                 StoneTab { objectName: "historyTab"; text: qsTr("History"); height: tabs.height }
                 StoneTab { objectName: "updatesTab"; text: qsTr("Updates"); height: tabs.height }
-                StoneTab { objectName: "quarantineTab"; text: qsTr("Quarantine"); height: tabs.height }
+                StoneTab { objectName: "quarantineTab"; text: qsTr("Health"); height: tabs.height }
             }
             Caption {
                 Layout.alignment: Qt.AlignRight
@@ -1590,6 +1591,113 @@ ApplicationWindow {
                                         wrapMode: TextEdit.WrapAnywhere
                                         readOnly: true
                                         selectByMouse: true
+                                    }
+                                }
+                            }
+                        }
+                        Rule { Layout.topMargin: 6 }
+                        SectionTitle { text: qsTr("Diagnostics") }
+                        RowLayout {
+                            spacing: 8
+                            ActionButton {
+                                objectName: "runChecksButton"
+                                text: qsTr("Run checks")
+                                enabled: !shell.backend.diagnosticsBusy
+                                onClicked: shell.backend.runDiagnostics()
+                            }
+                            ActionButton {
+                                objectName: "repairFarmerPackButton"
+                                text: qsTr("Repair farmer pack")
+                                enabled: !shell.backend.diagnosticsBusy && shell.diagnostics.can_repair
+                                onClicked: shell.backend.repairFarmerPack()
+                            }
+                        }
+                        Caption {
+                            Layout.fillWidth: true
+                            visible: shell.backend.diagnosticsBusy ||
+                                     (diagnosticRows.count === 0 && !shell.diagnostics.check_error)
+                            text: shell.backend.diagnosticsBusy ? qsTr("Working…")
+                                  : qsTr("Run checks to inspect the local game, farmer patch and service.")
+                            wrapMode: Text.Wrap
+                        }
+                        BodyText {
+                            text: shell.diagnostics.check_error
+                            visible: text.length > 0
+                            color: shell.danger
+                        }
+                        BodyText {
+                            objectName: "repairFeedback"
+                            text: shell.diagnostics.repair_feedback
+                            visible: text.length > 0
+                        }
+                        Caption {
+                            objectName: "repairBlocker"
+                            Layout.fillWidth: true
+                            text: shell.diagnostics.repair_blocker
+                            visible: text.length > 0
+                            wrapMode: Text.Wrap
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            visible: diagnosticRows.count > 0
+                            Repeater {
+                                id: diagnosticRows
+                                objectName: "diagnosticRows"
+                                model: shell.diagnostics.checks
+                                delegate: ColumnLayout {
+                                    id: checkRow
+                                    required property var modelData
+                                    readonly property bool ok: modelData.status === "ok"
+                                    readonly property bool failed: modelData.status === "fail"
+                                    readonly property color markColor: failed ? shell.danger : shell.ochre
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Rule {}
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 12
+                                        Rectangle {
+                                            Layout.alignment: Qt.AlignTop
+                                            Layout.topMargin: 4
+                                            implicitWidth: 18
+                                            implicitHeight: 12
+                                            radius: 2
+                                            color: checkRow.ok ? checkRow.markColor : "transparent"
+                                            border.color: checkRow.markColor
+                                            border.width: 1
+                                            Accessible.ignored: true
+                                            Rectangle {
+                                                visible: checkRow.failed
+                                                anchors.centerIn: parent
+                                                width: 16
+                                                height: 2
+                                                rotation: -31
+                                                color: checkRow.markColor
+                                            }
+                                        }
+                                        Caption {
+                                            objectName: "diagnosticStatus-" + checkRow.modelData.id
+                                            Layout.alignment: Qt.AlignTop
+                                            Layout.minimumWidth: 60
+                                            text: checkRow.ok ? qsTr("OK") : checkRow.failed ? qsTr("Failed") : qsTr("Warning")
+                                        }
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            Layout.minimumWidth: 0
+                                            spacing: 4
+                                            BodyText {
+                                                objectName: "diagnosticSummary-" + checkRow.modelData.id
+                                                text: checkRow.modelData.summary
+                                            }
+                                            Caption {
+                                                objectName: "diagnosticNextAction-" + checkRow.modelData.id
+                                                Layout.fillWidth: true
+                                                text: checkRow.modelData.next_action
+                                                visible: text.length > 0
+                                                wrapMode: Text.Wrap
+                                            }
+                                        }
                                     }
                                 }
                             }

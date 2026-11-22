@@ -24,7 +24,7 @@ from . import _resources  # noqa: F401  # Qt registers the embedded QML on impor
 from .model import SessionModel, SessionView
 
 _AFK_FIELDS = tuple(item.name for item in fields(SessionView)
-                    if item.name not in ("history", "updates", "quarantine"))
+                    if item.name not in ("history", "updates", "quarantine", "diagnostics"))
 
 
 def _snapshot(view: SessionView) -> dict[str, Any]:
@@ -36,17 +36,21 @@ def _snapshot(view: SessionView) -> dict[str, Any]:
 class _Backend(QObject):
     changed = Signal()
     historyChanged = Signal()
+    diagnosticsChanged = Signal()
+    diagnosticsBusyChanged = Signal()
 
     def __init__(self, model: SessionModel, parent: QObject):
         super().__init__(parent)
         self._model = model
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="farm-window")
         self._pending: deque[Future[SessionView]] = deque()
+        self._diagnostics_job: Future[SessionView] | None = None
         executor = self._executor
         parent.destroyed.connect(lambda: executor.shutdown(wait=False))
         self._view = SessionView()
         self._snapshot = _snapshot(self._view)
         self._history = asdict(self._view.history)
+        self._diagnostics = asdict(self._view.diagnostics)
         self._completion = QTimer(self)
         self._completion.setInterval(25)
         self._completion.timeout.connect(self._publish)
@@ -60,7 +64,7 @@ class _Backend(QObject):
         if not self._pending:
             self._enqueue()
 
-    def _enqueue(self, action: Callable[[], object] | None = None) -> None:
+    def _enqueue(self, action: Callable[[], object] | None = None) -> Future[SessionView]:
         model = self._model
 
         def sample() -> SessionView:
@@ -68,26 +72,36 @@ class _Backend(QObject):
                 action()
             return model.poll()
 
-        self._pending.append(self._executor.submit(sample))
+        future = self._executor.submit(sample)
+        self._pending.append(future)
         if not self._completion.isActive():
             self._completion.start()
+        return future
 
     def _publish(self) -> None:
         # Read only completed futures; all model I/O and actions are serialized on the worker.
         while self._pending and self._pending[0].done():
+            future = self._pending.popleft()
             try:
-                view = self._pending.popleft().result()
+                view = future.result()
             except Exception:
                 logging.getLogger(__name__).exception("AFK window refresh failed")
                 view = replace(self._view, action_error="Could not refresh the AFK session.")
             if view != self._view:
                 history_changed = view.history != self._view.history
+                diagnostics_changed = view.diagnostics != self._view.diagnostics
                 self._view = view
                 self._snapshot = _snapshot(view)
                 if history_changed:
                     self._history = asdict(view.history)
                     self.historyChanged.emit()
+                if diagnostics_changed:
+                    self._diagnostics = asdict(view.diagnostics)
+                    self.diagnosticsChanged.emit()
                 self.changed.emit()
+            if future is self._diagnostics_job:
+                self._diagnostics_job = None
+                self.diagnosticsBusyChanged.emit()
         if not self._pending:
             self._completion.stop()
 
@@ -98,6 +112,28 @@ class _Backend(QObject):
     @Property(dict, notify=historyChanged)
     def history(self) -> dict[str, Any]:
         return self._history
+
+    @Property(dict, notify=diagnosticsChanged)
+    def diagnostics(self) -> dict[str, Any]:
+        return self._diagnostics
+
+    @Property(bool, notify=diagnosticsBusyChanged)
+    def diagnosticsBusy(self) -> bool:
+        return self._diagnostics_job is not None
+
+    def _run_diagnostics_job(self, action: Callable[[], object]) -> None:
+        if self._diagnostics_job is None:
+            self._diagnostics_job = self._enqueue(action)
+            self.diagnosticsBusyChanged.emit()
+
+    @Slot()
+    def runDiagnostics(self) -> None:
+        self._run_diagnostics_job(self._model.run_diagnostics)
+
+    @Slot()
+    def repairFarmerPack(self) -> None:
+        if self._view.diagnostics.can_repair:
+            self._run_diagnostics_job(self._model.repair_farmer_pack)
 
     @Slot(int)
     def selectCharacter(self, index: int) -> None:

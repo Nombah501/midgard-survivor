@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import assets
-from ..core import _app_releases, app_update, catalog, commands, game_update
+from ..core import _app_releases, app_update, catalog, commands, doctor, game_update
 from ..core.history import night_summary, read_history, read_run_journal, session_timing
 from ..core.profile import ProfileNotFound, find_profile
 from ..core.state import ServiceState, StateKind, read_state
@@ -408,6 +408,15 @@ class QuarantineView:
     paths: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class DiagnosticsView:
+    checks: list[doctor.Check] = field(default_factory=list)
+    check_error: str = ""
+    repair_feedback: str = ""
+    repair_blocker: str = ""
+    can_repair: bool = False
+
+
 def _night_view(rows: list[dict[str, Any]], today: date, active: dict[str, Any] | None = None) -> NightView:
     summary = night_summary(rows, today, active)
     window = f"{today - timedelta(days=1):%d %b} 18:00 – {today:%d %b} 12:00 local"
@@ -570,6 +579,7 @@ class SessionView:
     history: HistoryView = field(default_factory=HistoryView)
     updates: UpdatesView = field(default_factory=UpdatesView)
     quarantine: QuarantineView = field(default_factory=QuarantineView)
+    diagnostics: DiagnosticsView = field(default_factory=DiagnosticsView)
 
 
 class SessionModel:
@@ -611,6 +621,11 @@ class SessionModel:
         self._journal_version: tuple[Path, int, int] | None = None
         self._last_journal_session = ""
         self._last_update: tuple[str, str] = ("No outcome yet", "")
+        self._checks: list[doctor.Check] = []
+        self._check_error = ""
+        self._repair_request: Path | None = None
+        self._repair_feedback = ""
+        self._repair_succeeded = False
 
     def poll(self) -> SessionView:
         state = read_state(self._os)
@@ -775,6 +790,7 @@ class SessionModel:
             resume_refusal=(choice_blocker or resume_refusal) if can_resume else resume_refusal,
             action_error=self._action_error, service_missing=missing,
             history=history, updates=updates, quarantine=quarantine,
+            diagnostics=self._diagnostics(state),
         )
 
     def _read_status(self, state: ServiceState, profile: Path | None) -> dict[str, Any]:
@@ -994,6 +1010,64 @@ class SessionModel:
             rollback_feedback=rollback_feedback,
         )
 
+    def _farmer_patch_failed(self) -> bool:
+        return any(row["id"] == "farmer_patch" and row["status"] == "fail" for row in self._checks)
+
+    def _repair_blocker(self, state: ServiceState) -> str:
+        if self._pending_start or state.session_id is not None or state.kind is StateKind.ACTIVE:
+            return "Finish the AFK session before repairing."
+        if state.kind is StateKind.STALE:
+            return "Start the service before repairing."
+        if state.kind in (StateKind.REBUILDING, StateKind.UPDATING):
+            return "Wait for the current update to finish."
+        try:
+            try:
+                (self._os.app_data_dir() / "session.json").stat()
+            except FileNotFoundError:
+                pass
+            else:
+                return "Finish the saved AFK session before repairing."
+            if self._os.game_pids():
+                return "Close the game before repairing."
+        except (OSError, RuntimeError) as exc:
+            return f"Could not check whether repair is safe: {exc}"
+        return ""
+
+    def _repair_status(self, state: ServiceState, request: Path) -> str:
+        if request.exists():
+            if state.kind is StateKind.STALE:
+                return "Repair is queued; start the service to continue."
+            if state.kind is StateKind.REBUILDING:
+                return f"Repair in progress: {state.reason}."
+            return "Repair queued; waiting for the service."
+
+        # The service publishes the result before removing the request.
+        state = read_state(self._os)
+        for row in state.command_refusals:
+            if row.get("request") == request.name and row.get("command") == "check_again":
+                self._repair_request = None
+                return f"Repair refused: {_text(row.get('reason')) or 'No reason reported.'}"
+        if state.kind in (StateKind.WAITING_FOR_GAME, StateKind.REBUILDING):
+            return f"Repair in progress: {state.reason}."
+        self._repair_request = None
+        if state.kind is StateKind.IDLE and state.game_update_classification == "current":
+            self._repair_succeeded = True
+            return "The farmer patch is ready. Run checks again to refresh these results."
+        if state.kind is StateKind.FARMER_UNAVAILABLE:
+            record = state.quarantine or {}
+            detail = _text(record.get("detail")) if record.get("reason") == state.reason else ""
+            reason = detail or _UPDATE_FAILURES.get(state.reason) or state.reason
+            return f"Repair failed: {reason or 'The farmer patch is unavailable.'}"
+        return "The service did not confirm repair. See Game update for the current state."
+
+    def _diagnostics(self, state: ServiceState) -> DiagnosticsView:
+        if self._repair_request is not None:
+            self._repair_feedback = self._repair_status(state, self._repair_request)
+        eligible = self._farmer_patch_failed() and not self._repair_succeeded and self._repair_request is None
+        blocker = self._repair_blocker(state) if eligible else ""
+        return DiagnosticsView(self._checks, self._check_error, self._repair_feedback, blocker,
+                               eligible and not blocker)
+
     def _start_refusal(self, state: ServiceState) -> str:
         if self._last_start is not None:
             name = self._last_start.name
@@ -1172,6 +1246,27 @@ class SessionModel:
         if request is not None:
             self._patch_request = command, request
         return request
+
+    def run_diagnostics(self) -> None:
+        try:
+            self._checks = doctor.run_checks(self._os)
+        except (OSError, RuntimeError) as exc:
+            self._checks = []
+            self._check_error = f"Could not run the diagnostic checks: {exc}"
+        else:
+            self._check_error = ""
+            self._repair_succeeded = False
+            if self._repair_request is None:
+                self._repair_feedback = ""
+
+    def repair_farmer_pack(self) -> None:
+        if (not self._farmer_patch_failed() or self._pending_start
+                or self._repair_succeeded or self._repair_request is not None):
+            return
+        try:
+            self._repair_request = doctor.repair_farmer_pack(self._os)
+        except (OSError, RuntimeError) as exc:
+            self._repair_feedback = f"Could not request repair: {exc}"
 
     def check_app_updates(self) -> None:
         if not self.poll().updates.can_check_app:

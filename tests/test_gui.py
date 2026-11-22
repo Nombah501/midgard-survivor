@@ -1579,3 +1579,115 @@ def test_quarantine_screen_renders_inactive_state(open_dashboard, farm, tmp_path
     window = open_dashboard("quarantineTab")
     assert qml_item(window, "noQuarantine").property("visible")
     capture(window, tmp_path, "quarantine-inactive")
+
+
+def test_health_checks_run_only_on_demand_without_blocking_the_window(open_dashboard, farm, monkeypatch):
+    from midgard_farm.core import doctor
+
+    entered, finish = Event(), Event()
+    calls = []
+
+    def checks(platform):
+        calls.append(platform)
+        entered.set()
+        assert finish.wait(timeout=5), "The UI did not respond while checks were running"
+        return [
+            {"id": "official_patch", "status": "ok", "summary": "Official patch found.", "next_action": ""},
+            {"id": "notifications", "status": "warn", "summary": "Notifications not configured.",
+             "next_action": "Set ntfy_url."},
+            {"id": "farmer_patch", "status": "fail", "summary": "Farmer patch digest mismatch.",
+             "next_action": "Repair the farmer pack."},
+        ]
+
+    farm.state()
+    monkeypatch.setattr(doctor, "run_checks", checks)
+    monkeypatch.setattr(type(farm.platform), "game_pids", lambda _: set())
+    window = open_dashboard("quarantineTab")
+    assert qml_item(window, "quarantineTab").property("text") == "Health"
+    rows = qml_item(window, "diagnosticRows")
+    check = qml_item(window, "runChecksButton")
+    repair = qml_item(window, "repairFarmerPackButton")
+    assert rows.property("count") == 0
+    assert not repair.property("enabled")
+    assert not calls
+    try:
+        click(window, "runChecksButton")
+        wait_until(entered.is_set)
+        assert not check.property("enabled")
+        assert not repair.property("enabled")
+        click(window, "afkTab")
+        assert qml_item(window, "screenTabs").property("currentIndex") == 0
+    finally:
+        finish.set()
+
+    click(window, "quarantineTab")
+    wait_until(lambda: rows.property("count") == 3)
+    assert qml_item(window, "diagnosticStatus-official_patch").property("text") == "OK"
+    assert qml_item(window, "diagnosticStatus-notifications").property("text") == "Warning"
+    assert qml_item(window, "diagnosticStatus-farmer_patch").property("text") == "Failed"
+    assert qml_item(window, "diagnosticSummary-farmer_patch").property("text") == "Farmer patch digest mismatch."
+    assert qml_item(window, "diagnosticNextAction-notifications").property("text") == "Set ntfy_url."
+    assert not qml_item(window, "diagnosticNextAction-official_patch").property("visible")
+    assert repair.property("enabled")
+    farm.state("active", session_id="afk-fixture", farmer_phase="paused")
+    wait_until(lambda: not repair.property("enabled"))
+    assert qml_item(window, "repairBlocker").property("text") == "Finish the AFK session before repairing."
+    assert calls == [farm.platform]
+
+
+@pytest.mark.parametrize("outcome", ["ready", "failed", "refused"])
+def test_health_repair_waits_for_the_service_result(open_dashboard, farm, monkeypatch, outcome):
+    from midgard_farm.core import doctor
+
+    game_open = Event()
+    game_open.set()
+    status = "fail"
+
+    def checks(_):
+        return [{"id": "farmer_patch", "status": status, "summary": "Farmer patch integrity",
+                 "next_action": ""}]
+
+    farm.state(game_update_classification="farmer_removed_or_stale")
+    monkeypatch.setattr(doctor, "run_checks", checks)
+    monkeypatch.setattr(type(farm.platform), "game_pids", lambda _: {123} if game_open.is_set() else set())
+    window = open_dashboard("quarantineTab")
+    repair = qml_item(window, "repairFarmerPackButton")
+    blocker = qml_item(window, "repairBlocker")
+    click(window, "runChecksButton")
+    wait_until(lambda: blocker.property("text") == "Close the game before repairing.")
+    assert not repair.property("enabled")
+    saved = farm.data / "session.json"
+    saved.write_text("{}", encoding="utf-8")
+    game_open.clear()
+    wait_until(lambda: blocker.property("text") == "Finish the saved AFK session before repairing.")
+    assert not repair.property("enabled")
+    assert not requested_commands(farm)
+
+    saved.unlink()
+    click(window, "repairFarmerPackButton")
+    wait_until(lambda: requested_commands(farm) == ["check_again"])
+    [request] = list(commands.directory(farm.platform).glob("*.json"))
+    feedback = qml_item(window, "repairFeedback")
+    wait_until(lambda: feedback.property("text") == "Repair queued; waiting for the service.")
+    assert not repair.property("enabled")
+
+    if outcome == "ready":
+        farm.state(game_update_classification="current")
+        expected = "The farmer patch is ready. Run checks again to refresh these results."
+    elif outcome == "failed":
+        farm.state("farmer_unavailable", reason="smoke_failed",
+                   quarantine={"reason": "smoke_failed", "detail": "Sandbox did not settle a run."})
+        expected = "Repair failed: Sandbox did not settle a run."
+    else:
+        farm.state(command_refusals=[{"request": request.name, "command": "check_again",
+                                      "reason": "Service is busy."}])
+        expected = "Repair refused: Service is busy."
+    request.unlink()
+    wait_until(lambda: feedback.property("text") == expected)
+    assert repair.property("enabled") == (outcome != "ready")
+    if outcome == "ready":
+        status = "ok"
+        click(window, "runChecksButton")
+        wait_until(lambda: feedback.property("text") == "")
+        assert qml_item(window, "diagnosticStatus-farmer_patch").property("text") == "OK"
+        assert not repair.property("enabled")
