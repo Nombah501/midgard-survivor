@@ -310,10 +310,15 @@ class Supervisor:
             start = replace(start, settings=command.settings)
             if live:
                 config_path = self.profile / "farmer.cfg"
-                config = json.loads(self.os.read_shared(config_path))
-                if not isinstance(config, dict):
-                    raise ValueError("farmer.cfg must be a JSON object")
-                self._write(config_path, config | command.settings.config())
+                try:
+                    config = json.loads(self.os.read_shared(config_path))
+                    if not isinstance(config, dict):
+                        raise ValueError("farmer.cfg must be a JSON object")
+                    self._write(config_path, config | command.settings.config())
+                except (OSError, ValueError, RecursionError) as exc:
+                    # Settings are not committed or delivered if the config could not be prepared.
+                    refuse_command(self.os, self.state, path, "resume", f"Cannot update farmer.cfg: {exc}")
+                    return
         updated = replace(session, start=start, paused=command == "pause", control_request=path.name)
         # Commit before acknowledgement or delivery: the next child can boot
         # with the same intent even if this child never sees its mailbox.
@@ -762,11 +767,7 @@ class Supervisor:
                     if isinstance(command, commands.Resume) or command in ("pause", "resume"):
                         if session is None:
                             continue
-                        try:
-                            self._apply_control(session, path, command, live=True)
-                        except (ValueError, RecursionError) as exc:
-                            refuse_command(self.os, self.state, path, "resume", f"Cannot update farmer.cfg: {exc}")
-                            continue
+                        self._apply_control(session, path, command, live=True)
                         break
                     self.os.write_atomic(self.mailbox, (command + "\n").encode())
                     closing = closing or command in ("finish", "abort")

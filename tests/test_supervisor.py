@@ -385,6 +385,51 @@ def test_paused_heartbeat_is_healthy_and_resume_keeps_the_child(farm, structured
     assert farm.notifications() == ["stop"]
 
 
+@pytest.mark.parametrize("fault", ["read", "write"])
+def test_live_resume_config_io_failure_leaves_the_child_and_saved_pause_alone(farm, monkeypatch, fault):
+    session_id = "afk-" + uuid.uuid4().hex
+    start = commands.Start(commands.Character("archer", 1), farm.preset)
+    session = supervisor._Session(session_id, start, "start.json", time.time(), paused=True)
+    config = farm.profile / "farmer.cfg"
+    config.write_bytes(b'{"stage":"payon","danger":12}')
+    read, write = farm.os_.read_shared, farm.os_.write_atomic
+    blocked = True
+
+    def read_shared(path, **kwargs):
+        if blocked and fault == "read" and path == config:
+            raise PermissionError("profile config is busy")
+        return read(path, **kwargs)
+
+    def write_atomic(path, data):
+        if blocked and fault == "write" and path == config:
+            raise PermissionError("profile config is busy")
+        write(path, data)
+
+    monkeypatch.setattr(farm.os_, "read_shared", read_shared)
+    monkeypatch.setattr(farm.os_, "write_atomic", write_atomic)
+    with StateReporter(farm.os_) as reporter:
+        service = supervisor.Supervisor(farm.os_, farm.profile, supervisor.Policy(),
+                                        lambda: None, lambda *_: None, state=reporter)
+        service._save_session(session)
+        watch = service._watcher(session)
+        resume = farm.send("resume", settings={"location": "prontera", "difficulty": 2})
+
+        assert watch({"phase": "paused", "heartbeat_seq": 1}) is None
+        rejection = json.loads(commands.rejection_path(farm.os_, resume).read_bytes())
+        assert rejection == {"command": "resume", "reason": "Cannot update farmer.cfg: profile config is busy"}
+        assert not resume.exists() and not service.mailbox.exists()
+        assert session.paused and session.start == start
+        assert json.loads(service.session_path.read_bytes())["paused"] is True
+        assert json.loads(config.read_bytes()) == {"stage": "payon", "danger": 12}
+
+        blocked = False
+        retry = farm.send("resume", settings={"location": "prontera", "difficulty": 2})
+        assert watch({"phase": "paused", "heartbeat_seq": 2}) is None
+        assert not retry.exists() and service.mailbox.read_bytes() == b"resume_settings\n"
+        assert not session.paused and json.loads(service.session_path.read_bytes())["paused"] is False
+        assert json.loads(config.read_bytes())["stage"] == "prontera"
+
+
 @pytest.mark.parametrize("crash", ["crash-on-pause", "crash-before-pause"])
 def test_pause_blocks_new_runs_after_child_restart_until_resume(farm, crash):
     plan_game(farm, f"commands:{crash}", "commands")
