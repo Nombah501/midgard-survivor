@@ -11,7 +11,7 @@ from typing import Any
 
 from .. import assets
 from ..core import app_update, catalog, commands, game_update
-from ..core.history import read_history
+from ..core.history import read_history, read_run_journal
 from ..core.profile import ProfileNotFound, find_profile
 from ..core.state import ServiceState, StateKind, read_state
 from ..core.supervisor import session_log_dir
@@ -78,6 +78,7 @@ _PHASES = {
     "done": "Session ending",
     "failed": "Farmer stopped",
 }
+_RUN_PHASES = ("run", "settle", "keep", "maint")
 _DASH = "—"
 _UPDATE_STATES = {
     "current": ("Current", "The official patch and farmer patch match."),
@@ -246,6 +247,60 @@ def _target_text(stage: object, danger: object, names: dict[str, str], oath_poin
     return " · ".join(parts)
 
 
+def _run_segment(stage: object, outcome: str, names: dict[str, str]) -> dict[str, str]:
+    key = _text(stage)
+    label = names.get(key, "").strip() or _label(key).strip() or "Unknown location"
+    words = label.split()
+    short = words[0] + (" " + "".join(word[0] + "." for word in words[1:]) if len(words) > 1 else "")
+    return {"label": label, "short": short, "outcome": outcome}
+
+
+def _settled_band(rows: list[dict[str, Any]], names: dict[str, str]) -> list[dict[str, str]]:
+    return [_run_segment(row.get("stage"), "win" if row.get("finale_won") is True
+                         else "aborted" if row.get("forced") is True else "loss", names)
+            for row in rows]
+
+
+def _session_measurements(rows: list[dict[str, Any]], band: list[dict[str, str]],
+                          totals: dict[str, Any]) -> tuple[dict[str, int | float], dict[str, int | float], float]:
+    numbers: dict[str, int | float] = {}
+    metrics: dict[str, int | float] = {}
+    materials: dict[str, int | float] = {}
+    duration = 0.0
+    for row in rows:
+        duration += _number(row.get("wall_s")) or 0
+        for key, target, label in (("zeny_gain", numbers, "zeny"), ("kills", metrics, "Kills"),
+                                   ("cards_gain", metrics, "Cards")):
+            if (value := _number(row.get(key))) is not None:
+                target[label] = target.get(label, 0) + value
+        for key, raw in _mapping(row.get("materials")).items():
+            if (value := _number(raw)) is not None:
+                materials[key] = materials.get(key, 0) + value
+    if (_number(totals.get("runs")) or 0) >= len(rows):
+        if (zeny := _number(totals.get("zeny"))) is not None:
+            numbers["zeny"] = zeny
+        if (kills := _number(totals.get("kills"))) is not None:
+            metrics["Kills"] = kills
+        materials.update({key: value for key, raw in _mapping(totals.get("materials")).items()
+                          if (value := _number(raw)) is not None})
+    runs = _number(totals.get("runs"))
+    if band and (runs is None or len(band) >= runs):
+        numbers.update(runs=len(band), wins=sum(mark["outcome"] == "win" for mark in band),
+                       losses=sum(mark["outcome"] == "loss" for mark in band))
+    elif runs is not None:
+        numbers["runs"] = runs
+        if (wins := _number(totals.get("wins"))) is not None:
+            numbers["wins"] = wins
+            losses = _number(totals.get("losses"))
+            numbers["losses"] = max(0, runs - wins) if losses is None else losses
+
+    cards = metrics.pop("Cards", None)
+    metrics.update({key.replace("_", " ").title(): materials[key] for key in sorted(materials) if materials[key]})
+    if cards is not None:
+        metrics["Cards"] = cards
+    return numbers, metrics, duration
+
+
 @dataclass(frozen=True)
 class HistoryRow:
     date: str
@@ -253,6 +308,7 @@ class HistoryRow:
     summary: str
     session_id: str = ""
     run_choices: list[str] = field(default_factory=list)
+    session_runs: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -299,7 +355,8 @@ class QuarantineView:
     paths: list[str] = field(default_factory=list)
 
 
-def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names: dict[str, str]) -> HistoryView:
+def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names: dict[str, str],
+                  journal: dict[str, list[dict[str, Any]]]) -> HistoryView:
     entries: list[HistoryRow] = []
     newest_session = ""
     totals: dict[str, Any] = {}
@@ -314,8 +371,9 @@ def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names:
                 quantities = _mapping(row.get("totals"))
                 if session and not newest_session:
                     newest_session, totals = session, quantities
-                summary = [f"{_format_number(quantities.get(key))} {label}"
-                           for key, label in (("runs", "runs"), ("wins", "wins"), ("zeny", "zeny"))]
+                summary = [f"{_format_number(quantities[key])} {label}"
+                           for key, label in (("runs", "runs"), ("wins", "wins"), ("zeny", "zeny"), ("losses", "losses"))
+                           if _number(quantities.get(key)) is not None]
                 if reason := _label(row.get("reason")):
                     summary.append(reason)
                 if isinstance(failures := row.get("attempt_failures"), list):
@@ -332,7 +390,8 @@ def _history_view(rows: list[dict[str, Any]], names: dict[str, str], item_names:
                             prefix = f"Run {number} · {target}" if number.isdecimal() else target
                             choices.append(" · ".join([prefix, *_keep_text(run, item_names)]))
                 entries.append(HistoryRow(date, f"AFK session · {_label(row.get('outcome')) or _DASH}",
-                                          " · ".join(summary), session, choices))
+                                          " · ".join(summary), session, choices,
+                                          _settled_band(journal.get(session, []), names)))
             case "game_update":
                 if row.get("action") == "restore_official":
                     title = "Official patch restored" if row.get("outcome") == "restored" else "Restore official patch"
@@ -373,6 +432,12 @@ class SessionView:
     current_run: str = _DASH
     run_detail: str = ""
     run_totals: str = _DASH
+    session_runs: list[dict[str, str]] = field(default_factory=list)
+    session_numbers: dict[str, int | float] = field(default_factory=dict)
+    session_metrics: dict[str, int | float] = field(default_factory=dict)
+    session_duration: int = 0
+    current_number: int = 0
+    last_event: str = ""
     session_id: str = ""
     active: bool = False
     paused: bool = False
@@ -442,6 +507,10 @@ class SessionModel:
         self._history = HistoryView()
         self._history_stage_names: dict[str, str] = {}
         self._history_item_names: dict[str, str] = {}
+        self._history_journal: dict[str, list[dict[str, Any]]] = {}
+        self._journal: dict[str, list[dict[str, Any]]] = {}
+        self._journal_version: tuple[Path, int, int] | None = None
+        self._last_journal_session = ""
         self._last_update: tuple[str, str] = ("No outcome yet", "")
 
     def poll(self) -> SessionView:
@@ -451,6 +520,11 @@ class SessionModel:
         locations = _locations(latest)
         names = self._stages | {row["id"]: row["label"] for row in locations if isinstance(row["id"], str)}
         item_names = _legendary_names(latest)
+        try:
+            profile = find_profile(self._os.godot_user_data_root())
+        except (OSError, ProfileNotFound):
+            profile = None
+        self._refresh_journal(profile)
         self._refresh_history(names, item_names)
         location = self._session_settings.location
         level = self._session_settings.difficulty
@@ -465,13 +539,13 @@ class SessionModel:
         oath_blocker = ""
         if unavailable_oaths:
             names_unavailable = ", ".join(oath["label"] for oath in unavailable_oaths)
-            oath_blocker = f"Saved oaths unavailable: {names_unavailable}. Choose Show oaths and set them to Off."
+            oath_blocker = f"Saved oaths unavailable: {names_unavailable}. Open Oaths and set them to Off."
         if unavailable_oaths and not oath_difficulty:
             # Outside fixed difficulty 30, allow only clearing unavailable ranks.
             oaths = [oath | {"ranks": oath["ranks"][:1]} for oath in unavailable_oaths]
         oath_points = sum(oath["ranks"][i]["points"] for oath in oaths
                           if (i := oath["selected_index"]) >= 0) if oath_difficulty else 0
-        status = self._read_status(state)
+        status = self._read_status(state, profile)
         preset = self._preset
         options = list(self._characters)
         characters = list(self._characters.values())
@@ -499,6 +573,25 @@ class SessionModel:
         materials = f"{_format_number(rates.get('ore_h'), 1)} / {_format_number(rates.get('crumbs_h'), 1)}"
         totals = _mapping(status.get("totals"))
         run, detail = self._run_text(status, totals, names)
+        journal = self._journal.get((state.session_id or "") if busy else self._last_journal_session, [])
+        band = _settled_band(journal, names)
+        numbers, metrics, duration = _session_measurements(journal, band, totals)
+        current_number = 0
+        run_id = _text(status.get("run_id"))
+        if status.get("phase") in _RUN_PHASES and not (run_id and any(row.get("run_id") == run_id for row in journal)):
+            stage = _mapping(status.get("target")).get("stage") or _mapping(status.get("game")).get("stage")
+            band.append(_run_segment(stage, "current", names))
+            current_number = int(_number(totals.get("started")) or len(band))
+        last_event = ""
+        if journal:
+            last = journal[-1]
+            notes = _keep_text(last, item_names)
+            if notes:
+                last_event = " · ".join(notes)
+            else:
+                mark = band[len(journal) - 1]
+                outcome = {"win": "won", "loss": "lost", "aborted": "aborted"}[mark["outcome"]]
+                last_event = f"{mark['label']} · Run {outcome}"
         can_control = (state.kind is StateKind.ACTIVE and bool(state.session_id)
                        and farmer_phase in ("", "idle", "run", "settle", "keep", "maint", "paused")
                        and status.get("terminal") is not True)
@@ -513,6 +606,9 @@ class SessionModel:
             run_totals=" · ".join(f"{_format_number(totals.get(key))} {label}"
                                   for key, label in (("runs", "settled"), ("wins", "wins"), ("lost", "lost")))
             if totals else _DASH,
+            session_runs=band, session_numbers=numbers, session_metrics=metrics,
+            session_duration=int(_number(status.get("uptime_s")) or duration),
+            current_number=current_number, last_event=last_event,
             session_id=state.session_id or "", active=busy, paused=paused,
             can_control=can_control, can_pause=can_control and bool(farmer_phase),
             can_resume=can_resume and not oath_blocker,
@@ -538,18 +634,14 @@ class SessionModel:
             history=self._history, updates=updates, quarantine=quarantine,
         )
 
-    def _read_status(self, state: ServiceState) -> dict[str, Any]:
-        if state.kind is not StateKind.ACTIVE or not state.session_id or not state.farmer_phase:
-            return {}
-        try:
-            profile = find_profile(self._os.godot_user_data_root())
-        except (OSError, ProfileNotFound):
+    def _read_status(self, state: ServiceState, profile: Path | None) -> dict[str, Any]:
+        if profile is None or state.kind is not StateKind.ACTIVE or not state.session_id or not state.farmer_phase:
             return {}
         status = _object(self._os, profile / "farmer_status.json")
         return status if status.get("session") == state.session_id else {}
 
     def _run_text(self, status: dict[str, Any], totals: dict[str, Any], names: dict[str, str]) -> tuple[str, str]:
-        if status.get("phase") not in ("run", "settle", "keep", "maint") or not status.get("run_id"):
+        if status.get("phase") not in _RUN_PHASES or not status.get("run_id"):
             return _DASH, ""
         game = _mapping(status.get("game"))
         target = _mapping(status.get("target"))
@@ -614,17 +706,49 @@ class SessionModel:
                               "Check again" if retry else "Start a new session", retry,
                               retry and can_check_again, attempts, paths)
 
+    def _refresh_journal(self, profile: Path | None) -> None:
+        path = profile / "farmer_runs.jsonl" if profile is not None else None
+        if path is not None:
+            try:
+                info = path.stat()
+                version = path, info.st_mtime_ns, info.st_size
+                if self._journal_version == version:
+                    return
+                rows: dict[str, list[dict[str, Any]]] = {}
+                seen: set[tuple[str, str]] = set()
+                latest = ""
+                for row in read_run_journal(self._os, path):
+                    session = _text(row.get("session"))
+                    if not session:
+                        continue
+                    if run_id := _text(row.get("run_id")):
+                        if (session, run_id) in seen:
+                            continue
+                        seen.add((session, run_id))
+                    rows.setdefault(session, []).append(row)
+                    latest = session
+                self._journal_version, self._journal, self._last_journal_session = version, rows, latest
+                return
+            except FileNotFoundError:
+                pass
+            except OSError:
+                if self._journal_version is not None and self._journal_version[0] == path:
+                    return  # A temporarily unavailable file does not erase the last readable bands.
+        if self._journal_version is not None:
+            self._journal_version, self._journal, self._last_journal_session = None, {}, ""
+
     def _refresh_history(self, names: dict[str, str], item_names: dict[str, str]) -> None:
         try:
             rows = read_history(self._os)
         except OSError:
             return  # Retain the last readable history until the file becomes available.
         if (rows != self._history_rows or names != self._history_stage_names
-                or item_names != self._history_item_names):
+                or item_names != self._history_item_names or self._journal is not self._history_journal):
             self._history_rows = rows
             self._history_stage_names = names
             self._history_item_names = item_names
-            self._history = _history_view(rows, names, item_names)
+            self._history_journal = self._journal
+            self._history = _history_view(rows, names, item_names, self._journal)
             latest = max((row for row in rows if row["kind"] == "game_update" and _update_outcome(row)),
                          key=lambda row: row["timestamp"], default=None)
             self._last_update = (_update_outcome(latest), _text(latest.get("detail"))) if latest else ("No outcome yet", "")

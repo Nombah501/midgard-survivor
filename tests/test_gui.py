@@ -116,6 +116,37 @@ def active_status(farm):
                       "time": 522, "hp": 780, "max_hp": 1000})
 
 
+def test_session_run_band_tracks_active_run_and_latest_settled_session(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    rows = [
+        {"session": "older-afk", "run_id": "old-r1", "stage": "prontera", "finale_won": True},
+        {"session": "afk-fixture", "run_id": "run-10", "stage": "payon", "finale_won": True, "forced": True},
+        {"session": "afk-fixture", "run_id": "run-11", "stage": "prontera", "died": True},
+        {"session": "afk-fixture", "run_id": "run-12", "stage": "payon", "forced": True},
+    ]
+    (farm.profile / "farmer_runs.jsonl").write_text(
+        "\n".join(map(json.dumps, [*rows, rows[-1]])) + '\n{"torn"', encoding="utf-8",
+    )
+    append_event(farm.platform, "session", session_id="older-afk", outcome="finished")
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    active_status(farm)
+    model = SessionModel(farm.platform)
+    view = model.poll()
+    assert view.session_runs == [
+        {"label": "Payon Forest", "short": "Payon F.", "outcome": "win"},
+        {"label": "Prontera Field", "short": "Prontera F.", "outcome": "loss"},
+        {"label": "Payon Forest", "short": "Payon F.", "outcome": "aborted"},
+        {"label": "Payon Forest", "short": "Payon F.", "outcome": "current"},
+    ]
+    assert [run["outcome"] for run in view.history.rows[0].session_runs] == ["win"]
+
+    farm.state()
+    idle = model.poll()
+    assert idle.session_runs == view.session_runs[:-1]
+    assert idle.session_numbers == {"runs": 3, "wins": 1, "losses": 1}
+
+
 def test_start_refusal_is_correlated_and_a_new_start_clears_it(farm):
     from midgard_farm.gui.model import SessionModel
 

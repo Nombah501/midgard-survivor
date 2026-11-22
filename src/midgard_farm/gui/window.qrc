@@ -2,5 +2,9 @@
 <RCC>
     <qresource prefix="/midgard-farm">
         <file>Main.qml</file>
+        <file>RunBand.qml</file>
+        <file>fonts/NotoSans-Regular.ttf</file>
+        <file>fonts/NotoSans-Bold.ttf</file>
+        <file>fonts/OFL.txt</file>
     </qresource>
 </RCC>

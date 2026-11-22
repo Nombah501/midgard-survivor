@@ -9,29 +9,71 @@ ApplicationWindow {
     readonly property var history: backend.history
     readonly property var updates: session.updates
     readonly property var quarantine: session.quarantine
-    readonly property bool linux: Qt.platform.os === "linux"
-    readonly property color muted: linux ? "#acc9bd" : palette.windowText
-    readonly property color warning: linux ? "#ffdbab" : palette.windowText
-    readonly property color danger: linux ? "#ffb5b5" : palette.windowText
+    readonly property color ground: "#1c1e1d"
+    readonly property color raised: "#2b2e2c"
+    readonly property color hairline: "#3a3e3b"
+    readonly property color ink: "#e8e2d3"
+    readonly property color muted: "#a9a597"
+    readonly property color redOchre: "#b6432a"
+    readonly property color ochre: "#c9943c"
+    readonly property color danger: "#e07a5f"
+    readonly property color edge: "#74766d"
+    readonly property color hoverStone: "#353934"
+    readonly property color warning: ochre
+    readonly property int gutter: width >= 1280 ? 48 : width >= 1000 ? 32 : width >= 760 ? 24 : 16
+    readonly property bool compact: width < 760
+    readonly property bool runLocked: session.active && !session.paused
+    readonly property int dropdownRowHeight: 36
+
+    function amount(value) {
+        return value === undefined ? "" : Number(value).toLocaleString(Qt.locale("en_US"), "f", 0)
+    }
+
+    function elapsed(seconds) {
+        const hours = Math.floor(seconds / 3600)
+        const minutes = Math.floor(seconds / 60) % 60
+        return hours > 0 ? qsTr("%1 h %2 min").arg(hours).arg(minutes) : qsTr("%1 min").arg(minutes)
+    }
 
     title: qsTr("Midgard Farm")
     visible: true
-    width: 860
-    height: 660
+    width: 1100
+    height: 820
     minimumWidth: 640
     minimumHeight: 520
 
-    SystemPalette { id: systemColors }
-    palette.window: linux ? "#13251f" : systemColors.window
-    palette.windowText: linux ? "#eef7f2" : systemColors.windowText
-    palette.base: linux ? "#1b3229" : systemColors.base
-    palette.alternateBase: linux ? "#183027" : systemColors.alternateBase
-    palette.text: linux ? "#eef7f2" : systemColors.text
-    palette.button: linux ? "#254338" : systemColors.button
-    palette.buttonText: linux ? "#eef7f2" : systemColors.buttonText
-    palette.mid: linux ? "#44675a" : systemColors.mid
-    palette.highlight: linux ? "#a4dec7" : systemColors.highlight
-    palette.highlightedText: linux ? "#13251f" : systemColors.highlightedText
+    FontLoader { id: regularFont; source: "fonts/NotoSans-Regular.ttf" }
+    FontLoader { id: boldFont; source: "fonts/NotoSans-Bold.ttf" }
+    font.family: regularFont.name
+    font.pixelSize: 14
+    color: ground
+    palette.window: ground
+    palette.windowText: ink
+    palette.base: ground
+    palette.alternateBase: raised
+    palette.text: ink
+    palette.button: raised
+    palette.buttonText: ink
+    palette.mid: hairline
+    palette.highlight: ochre
+    palette.highlightedText: ground
+    palette.placeholderText: muted
+
+    component Frame: Rectangle {
+        property bool focused: false
+        radius: 2
+        border.width: focused ? 2 : 1
+    }
+
+    component Chevron: Item {
+        property color stroke: shell.muted
+        property bool expanded: false
+        implicitWidth: 10
+        implicitHeight: 10
+        rotation: expanded ? 225 : 45
+        Rectangle { width: 6; height: 1; color: parent.stroke; anchors.right: parent.right; anchors.bottom: parent.bottom }
+        Rectangle { width: 1; height: 6; color: parent.stroke; anchors.right: parent.right; anchors.bottom: parent.bottom }
+    }
 
     component Caption: Label {
         color: shell.muted
@@ -40,24 +82,281 @@ ApplicationWindow {
     }
 
     component ActionButton: Button {
+        id: button
+        property bool destructive: false
+        property bool disclosure: false
+        horizontalPadding: 12
+        verticalPadding: 8
+        spacing: 12
+        font.bold: !disclosure
+        contentItem: Label {
+            text: button.text
+            color: !button.enabled ? shell.muted
+                   : button.highlighted ? "white"
+                   : button.destructive ? shell.danger : shell.ink
+            font: button.font
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            verticalAlignment: Text.AlignVCenter
+            horizontalAlignment: button.disclosure ? Text.AlignLeft : Text.AlignHCenter
+        }
+        background: Frame {
+            implicitHeight: button.disclosure ? 36 : 40
+            focused: button.visualFocus
+            color: !button.enabled ? (button.disclosure ? shell.raised : "transparent")
+                   : button.highlighted ? (button.down || button.hovered
+                       ? Qt.darker(shell.redOchre, button.down ? 1.18 : 1.10) : shell.redOchre)
+                   : button.down || button.hovered ? shell.hoverStone
+                   : button.disclosure ? shell.raised : "transparent"
+            border.color: button.visualFocus ? shell.ink
+                          : !button.enabled ? shell.hairline
+                          : button.destructive || button.highlighted ? shell.redOchre : shell.edge
+        }
+    }
+
+    component Disclosure: ActionButton {
+        id: disclosure
+        property alias detail: disclosureDetail.text
+        property alias detailObjectName: disclosureDetail.objectName
+        disclosure: true
+        checkable: true
+        contentItem: RowLayout {
+            spacing: 12
+            SingleLine {
+                text: disclosure.text
+                color: disclosure.enabled ? shell.ink : shell.muted
+            }
+            Caption {
+                id: disclosureDetail
+                visible: text.length > 0
+                elide: Text.ElideRight
+                Layout.maximumWidth: disclosure.availableWidth * 0.7
+                ToolTip.visible: disclosure.hovered && truncated
+                ToolTip.text: text
+                ToolTip.delay: 500
+            }
+            Chevron {
+                visible: disclosure.enabled
+                expanded: disclosure.checked
+                Layout.rightMargin: 2
+                Layout.bottomMargin: 4
+            }
+        }
+    }
+
+    component StoneTab: TabButton {
+        id: tab
+        width: implicitWidth
+        implicitHeight: shell.compact ? 48 : 64
+        horizontalPadding: shell.compact ? 8 : 16
+        verticalPadding: 0
+        font.bold: true
+        contentItem: Label {
+            text: tab.text
+            font: tab.font
+            color: tab.checked || tab.hovered ? shell.ink : shell.muted
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            color: tab.checked ? shell.ground : tab.hovered ? shell.hoverStone : "transparent"
+            border.color: shell.ink
+            border.width: tab.visualFocus ? 2 : 0
+            Rectangle {
+                anchors.bottom: parent.bottom
+                width: parent.width
+                height: 3
+                color: shell.redOchre
+                visible: tab.checked
+            }
+        }
+    }
+
+    component StoneScrollBar: ScrollBar {
+        id: bar
+        padding: 2
+        minimumSize: 0.05
+        contentItem: Rectangle {
+            implicitWidth: 5
+            implicitHeight: 5
+            radius: 2
+            color: bar.pressed ? shell.ink : bar.hovered ? shell.muted : shell.edge
+            visible: bar.size < 1
+        }
+        background: null
+    }
+
+    component PickOption: ItemDelegate {
+        id: option
+        horizontalPadding: 12
+        verticalPadding: 8
+        implicitHeight: shell.dropdownRowHeight
+        contentItem: Label {
+            text: option.text
+            color: option.enabled ? shell.ink : shell.muted
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            color: option.highlighted || option.hovered ? shell.hoverStone : shell.raised
+        }
+    }
+
+    component StoneCombo: ComboBox {
+        id: pick
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
         leftPadding: 12
-        rightPadding: 12
-        Layout.minimumHeight: 44
+        rightPadding: 32
+        verticalPadding: 8
+        contentItem: Label {
+            text: pick.displayText
+            color: pick.enabled ? shell.ink : shell.muted
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            verticalAlignment: Text.AlignVCenter
+        }
+        ToolTip.visible: pick.hovered && contentItem.truncated
+        ToolTip.text: displayText
+        ToolTip.delay: 500
+        indicator: Chevron {
+            x: pick.width - width - 14
+            y: (pick.height - height) / 2 - 2
+            expanded: pick.down
+        }
+        background: Frame {
+            implicitWidth: 120
+            implicitHeight: 36
+            focused: pick.visualFocus
+            color: pick.enabled && (pick.hovered || pick.down) ? shell.hoverStone : shell.raised
+            border.color: pick.visualFocus ? shell.ink : pick.enabled ? shell.edge : shell.hairline
+        }
+        delegate: PickOption {
+            required property int index
+            width: ListView.view.width
+            text: pick.textAt(index)
+            highlighted: pick.highlightedIndex === index
+        }
+        popup: Popup {
+            width: pick.width
+            topMargin: 8
+            bottomMargin: 8
+            padding: 1
+            height: Math.min(contentItem.implicitHeight + 2, shell.height - topMargin - bottomMargin)
+            onOpened: optionsList.forceLayout()
+            contentItem: ListView {
+                id: optionsList
+                clip: true
+                implicitHeight: pick.count * shell.dropdownRowHeight
+                model: pick.delegateModel
+                currentIndex: pick.highlightedIndex
+                highlightRangeMode: ListView.ApplyRange
+                highlightMoveDuration: 0
+                ScrollBar.vertical: StoneScrollBar {
+                    parent: optionsList
+                    anchors.top: optionsList.top
+                    anchors.right: optionsList.right
+                    anchors.bottom: optionsList.bottom
+                }
+            }
+            background: Frame { color: shell.raised; border.color: shell.edge }
+        }
+    }
+
+    component StoneSwitch: Switch {
+        id: toggle
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        padding: 0
+        spacing: 8
+        contentItem: Label {
+            text: toggle.text
+            color: toggle.enabled ? shell.ink : shell.muted
+            rightPadding: toggle.indicator.width + toggle.spacing
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            verticalAlignment: Text.AlignVCenter
+        }
+        indicator: Frame {
+            implicitWidth: 32
+            implicitHeight: 16
+            x: toggle.width - width
+            y: (toggle.height - height) / 2
+            focused: toggle.visualFocus
+            color: toggle.checked ? (toggle.enabled ? shell.ink : shell.muted)
+                   : toggle.hovered && toggle.enabled ? shell.hoverStone : shell.ground
+            border.color: toggle.visualFocus || (toggle.checked && toggle.enabled) ? shell.ink : shell.edge
+            Rectangle {
+                width: 10
+                height: 10
+                radius: 2
+                x: 3 + (parent.width - width - 6) * toggle.visualPosition
+                anchors.verticalCenter: parent.verticalCenter
+                color: toggle.checked ? shell.ground : shell.muted
+            }
+        }
+        background: Item { implicitHeight: 32 }
+    }
+
+    component StoneField: TextField {
+        id: field
+        padding: 8
+        selectByMouse: true
+        background: Frame {
+            implicitHeight: 36
+            focused: field.activeFocus
+            border.color: field.activeFocus ? shell.ink : shell.edge
+            color: shell.raised
+        }
+    }
+
+    component StoneCheck: CheckBox {
+        id: check
+        padding: 4
+        spacing: 8
+        contentItem: Label {
+            text: check.text
+            color: check.enabled ? shell.ink : shell.muted
+            leftPadding: check.indicator.width + check.spacing
+            verticalAlignment: Text.AlignVCenter
+        }
+        indicator: Frame {
+            implicitWidth: 16
+            implicitHeight: 16
+            x: check.leftPadding
+            y: (check.height - height) / 2
+            focused: check.visualFocus
+            color: check.checked ? shell.ink : check.hovered ? shell.hoverStone : shell.ground
+            border.color: check.visualFocus ? shell.ink : shell.edge
+            Item {
+                visible: check.checked
+                width: 9
+                height: 6
+                anchors.centerIn: parent
+                rotation: -45
+                Rectangle { width: 2; height: 5; color: shell.ground }
+                Rectangle { width: 9; height: 2; color: shell.ground; anchors.bottom: parent.bottom }
+            }
+        }
     }
 
     component ScreenPanel: Pane {
         Layout.fillWidth: true
-        padding: 20
-        background: Rectangle {
-            color: shell.palette.base
-            radius: 12
-            border.color: shell.palette.mid
-        }
+        padding: 0
+        background: null
     }
 
     component PageTitle: Label {
-        font.pixelSize: 22
-        font.weight: Font.DemiBold
+        font.pixelSize: 30
+        font.bold: true
+        textFormat: Text.PlainText
+    }
+
+    component SectionTitle: Label {
+        font.pixelSize: 16
+        font.bold: true
+        textFormat: Text.PlainText
     }
 
     component Rule: Rectangle {
@@ -98,7 +397,8 @@ ApplicationWindow {
             text: parent.value
             textFormat: Text.PlainText
             font.pixelSize: 17
-            font.weight: Font.DemiBold
+            font.bold: true
+            font.features: {"tnum": 1}
             wrapMode: Text.Wrap
         }
         Caption {
@@ -110,533 +410,674 @@ ApplicationWindow {
         }
     }
 
+    header: Pane {
+        horizontalPadding: shell.gutter
+        topPadding: 0
+        bottomPadding: 0
+        background: Rectangle {
+            color: shell.raised
+            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: shell.hairline }
+        }
+        contentItem: RowLayout {
+            spacing: shell.width >= 1280 ? 24 : shell.compact ? 12 : 16
+            SingleLine {
+                Layout.fillWidth: false
+                Layout.preferredWidth: shell.width >= 1280 ? 218 : implicitWidth
+                text: shell.title
+                font.pixelSize: shell.compact ? 20 : 23
+                font.bold: true
+            }
+            TabBar {
+                id: tabs
+                objectName: "screenTabs"
+                Accessible.name: qsTr("Screens")
+                Layout.fillWidth: true
+                Layout.preferredHeight: shell.compact ? 48 : 64
+                background: null
+                spacing: 4
+                onCurrentIndexChanged: if (scroll.contentItem) scroll.contentItem.contentY = 0
+                StoneTab { id: afkTab; objectName: "afkTab"; text: qsTr("AFK session"); height: tabs.height }
+                StoneTab { objectName: "historyTab"; text: qsTr("History"); height: tabs.height }
+                StoneTab { objectName: "updatesTab"; text: qsTr("Updates"); height: tabs.height }
+                StoneTab { objectName: "quarantineTab"; text: qsTr("Quarantine"); height: tabs.height }
+            }
+            Caption {
+                Layout.alignment: Qt.AlignRight
+                text: shell.compact ? qsTr("Local profile")
+                      : Qt.platform.os === "windows" ? qsTr("Windows · local profile") : qsTr("Linux · local profile")
+            }
+        }
+    }
+
     ScrollView {
         id: scroll
         anchors.fill: parent
         contentWidth: availableWidth
+        padding: 0
+        ScrollBar.vertical: StoneScrollBar {
+            parent: scroll
+            anchors.top: scroll.top
+            anchors.right: scroll.right
+            anchors.bottom: scroll.bottom
+        }
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         clip: true
 
         Item {
             implicitWidth: scroll.availableWidth
-            implicitHeight: page.implicitHeight + 48
+            implicitHeight: page.implicitHeight + 32
 
             ColumnLayout {
                 id: page
-                anchors.horizontalCenter: parent.horizontalCenter
-                y: 24
-                width: Math.min(parent.width - 48, 900)
+                anchors.top: parent.top
+                anchors.topMargin: 16
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.leftMargin: shell.gutter
+                anchors.rightMargin: shell.gutter
                 spacing: 16
 
-                RowLayout {
-                    Layout.fillWidth: true
-                    Label {
-                        Layout.fillWidth: true
-                        text: qsTr("Midgard Farm")
-                        font.pixelSize: 26
-                        font.weight: Font.DemiBold
-                    }
-                    Caption { text: qsTr("One device · Local profile") }
-                }
-
-                TabBar {
-                    id: tabs
-                    objectName: "screenTabs"
-                    Accessible.name: qsTr("Screens")
-                    Layout.fillWidth: true
-                    onCurrentIndexChanged: scroll.contentItem.contentY = 0
-                    TabButton { id: afkTab; objectName: "afkTab"; text: qsTr("AFK session"); height: 44 }
-                    TabButton { objectName: "historyTab"; text: qsTr("History"); height: 44 }
-                    TabButton { objectName: "updatesTab"; text: qsTr("Updates"); height: 44 }
-                    TabButton { objectName: "quarantineTab"; text: qsTr("Quarantine"); height: 44 }
-                }
-
-                ScreenPanel {
+                ColumnLayout {
+                    id: afk
                     visible: tabs.currentIndex === 0
+                    Layout.fillWidth: true
+                    spacing: 16
+                    readonly property var runParts: shell.session.current_run === "—"
+                        ? [] : shell.session.current_run.split(" · ")
+                    readonly property bool hasRun: runParts.length > 0
+                    readonly property bool hasZeny: shell.session.session_numbers.zeny !== undefined
+                    readonly property bool hasRate: shell.session.zeny !== "—"
+                    readonly property int rotationCount: shell.session.locations
+                        .filter(row => typeof row.id === "string" && row.enabled).length
 
-                    ColumnLayout {
-                        width: parent.width
-                        spacing: 14
-
-                        RowLayout {
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.minimumHeight: shell.compact ? 100 : 120
+                        spacing: shell.compact ? 12 : 24
+                        ColumnLayout {
                             Layout.fillWidth: true
-                            spacing: 24
-                            ColumnLayout {
+                            Layout.minimumWidth: 0
+                            spacing: 4
+                            RowLayout {
                                 Layout.fillWidth: true
-                                spacing: 4
-                                Caption { text: qsTr("Phase") }
+                                spacing: 8
+                                Rectangle {
+                                    Layout.preferredWidth: 8
+                                    Layout.preferredHeight: 8
+                                    radius: 2
+                                    color: shell.runLocked && shell.session.can_pause ? shell.redOchre
+                                           : shell.session.paused ? shell.ochre
+                                           : shell.session.service_missing || shell.quarantine.reason ? shell.danger
+                                           : shell.muted
+                                }
                                 Label {
                                     objectName: "phaseValue"
-                                    Layout.fillWidth: true
+                                    Layout.fillWidth: shell.compact
+                                    Layout.minimumWidth: 0
+                                    font.bold: true
                                     text: shell.session.phase
                                     textFormat: Text.PlainText
-                                    color: shell.session.service_missing ? shell.warning : shell.palette.windowText
-                                    font.pixelSize: 24
-                                    font.weight: Font.DemiBold
-                                    wrapMode: Text.Wrap
+                                    elide: Text.ElideRight
                                 }
-                            }
-                            Metric {
-                                Layout.fillWidth: false
-                                Layout.minimumWidth: 136
-                                title: qsTr("Last heartbeat")
-                                value: shell.session.heartbeat_age
-                            }
-                        }
-
-                        Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: shell.palette.mid }
-
-                        GridLayout {
-                            Layout.fillWidth: true
-                            columns: 2
-                            uniformCellWidths: true
-                            rowSpacing: 12
-                            columnSpacing: 24
-                            Metric {
-                                title: qsTr("Zeny per hour")
-                                value: shell.session.zeny
-                                valueObjectName: "zenyValue"
-                            }
-                            Metric {
-                                title: qsTr("Current run")
-                                value: shell.session.current_run
-                                detail: shell.session.run_detail
-                            }
-                            Metric { title: qsTr("Ore / Star Crumb per hour"); value: shell.session.materials }
-                            Metric { title: qsTr("Run totals"); value: shell.session.run_totals }
-                            Metric { title: qsTr("Kills per minute"); value: shell.session.kills }
-                            Metric {
-                                visible: value.length > 0
-                                title: qsTr("Session ID")
-                                value: shell.session.session_id
-                                valueObjectName: "sessionValue"
-                            }
-                        }
-
-                        Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: shell.palette.mid }
-
-                        Label {
-                            text: qsTr("Session setup")
-                            font.pixelSize: 16
-                            font.weight: Font.DemiBold
-                        }
-
-                        GridLayout {
-                            Layout.fillWidth: true
-                            columns: width >= 700 ? 4 : 2
-                            uniformCellWidths: true
-                            columnSpacing: 12
-                            rowSpacing: 10
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                Layout.preferredWidth: 1
-                                spacing: 4
-                                Caption { id: characterLabel; text: qsTr("Character") }
-                                ComboBox {
-                                    objectName: "characterPicker"
-                                    Accessible.name: characterLabel.text
+                                Rectangle {
+                                    visible: !shell.compact && shell.session.heartbeat_age !== "—"
+                                    Layout.preferredWidth: 1
+                                    Layout.preferredHeight: 16
+                                    Layout.leftMargin: 8
+                                    Layout.rightMargin: 4
+                                    color: shell.edge
+                                }
+                                Caption {
                                     Layout.fillWidth: true
-                                    Layout.minimumHeight: 44
-                                    model: shell.session.characters
-                                    currentIndex: shell.session.character_index
-                                    enabled: shell.session.can_pick_character
-                                    onActivated: index => shell.backend.selectCharacter(index)
+                                    visible: !shell.compact && shell.session.heartbeat_age !== "—"
+                                    elide: Text.ElideRight
+                                    text: qsTr("Last heartbeat · %1").arg(shell.session.heartbeat_age)
                                 }
-                            }
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                Layout.preferredWidth: 1
-                                spacing: 4
-                                Caption { id: presetLabel; text: qsTr("Preset") }
-                                ComboBox {
-                                    objectName: "presetPicker"
-                                    Accessible.name: presetLabel.text
-                                    Layout.fillWidth: true
-                                    Layout.minimumHeight: 44
-                                    model: shell.session.presets
-                                    currentIndex: shell.session.preset_index
-                                    enabled: shell.session.can_pick_preset
-                                    onActivated: index => shell.backend.selectPreset(index)
-                                }
-                            }
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                Layout.preferredWidth: 1
-                                spacing: 4
-                                Caption { id: locationLabel; text: qsTr("Location") }
-                                ComboBox {
-                                    id: locationPicker
-                                    objectName: "locationPicker"
-                                    Accessible.name: locationLabel.text
-                                    Layout.fillWidth: true
-                                    Layout.minimumHeight: 44
-                                    model: shell.session.locations
-                                    textRole: "label"
-                                    currentIndex: shell.session.location_index
-                                    displayText: currentIndex < 0 ? qsTr("Saved location unavailable") : currentText
-                                    enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
-
-                                    delegate: ItemDelegate {
-                                        required property int index
-                                        required property var modelData
-                                        objectName: "locationOption" + index
-                                        width: locationPicker.width
-                                        text: enabled ? modelData.label : qsTr("%1 (locked)").arg(modelData.label)
-                                        enabled: modelData.enabled
-                                        highlighted: locationPicker.highlightedIndex === index
-                                    }
-
-                                    function stepLocation(step) {
-                                        for (let i = currentIndex + step; i >= 0 && i < count; i += step) {
-                                            if (model[i].enabled) {
-                                                shell.backend.selectLocation(i)
-                                                break
-                                            }
-                                        }
-                                    }
-
-                                    Keys.onUpPressed: event => {
-                                        event.accepted = !popup.visible
-                                        if (event.accepted)
-                                            stepLocation(-1)
-                                    }
-                                    Keys.onDownPressed: event => {
-                                        event.accepted = !popup.visible
-                                        if (event.accepted)
-                                            stepLocation(1)
-                                    }
-                                    onActivated: index => {
-                                        if (model[index].enabled)
-                                            shell.backend.selectLocation(index)
-                                        else
-                                            currentIndex = Qt.binding(() => shell.session.location_index)
-                                    }
-                                }
-                            }
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                Layout.preferredWidth: 1
-                                spacing: 4
-                                Caption { id: difficultyLabel; text: qsTr("Difficulty") }
-                                ComboBox {
-                                    objectName: "difficultyPicker"
-                                    Accessible.name: difficultyLabel.text
-                                    Layout.fillWidth: true
-                                    Layout.minimumHeight: 44
-                                    model: shell.session.difficulties
-                                    currentIndex: shell.session.difficulty_index
-                                    displayText: currentIndex < 0 ? qsTr("Saved difficulty unavailable") : currentText
-                                    enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
-                                    onActivated: index => shell.backend.selectDifficulty(textAt(index))
-                                }
-                            }
-                        }
-
-                        Caption {
-                            Layout.fillWidth: true
-                            visible: text.length > 0
-                            text: shell.session.preset_description
-                            wrapMode: Text.Wrap
-                        }
-
-                        Caption {
-                            objectName: "catalogRefresh"
-                            Layout.fillWidth: true
-                            text: shell.session.catalog_refresh
-                                  ? qsTr("Catalog refreshed: %1").arg(shell.session.catalog_refresh)
-                                  : qsTr("No catalog yet")
-                            wrapMode: Text.Wrap
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            visible: !shell.session.active || shell.session.paused
-                            ActionButton {
-                                id: oathPanel
-                                objectName: "oathPanel"
-                                visible: shell.session.oaths.length > 0
-                                text: checked && enabled ? qsTr("Hide oaths") : qsTr("Show oaths")
-                                checkable: true
-                                enabled: shell.session.can_pick_oaths
                             }
                             Caption {
-                                objectName: "oathPoints"
                                 Layout.fillWidth: true
-                                visible: oathPanel.visible
-                                text: shell.session.difficulties[shell.session.difficulty_index] === "30"
-                                      ? qsTr("Oath points: %1").arg(shell.session.oath_points)
-                                      : qsTr("Oaths require fixed difficulty 30.")
-                                wrapMode: Text.Wrap
+                                visible: shell.compact && shell.session.heartbeat_age !== "—"
+                                text: qsTr("Last heartbeat · %1").arg(shell.session.heartbeat_age)
+                                elide: Text.ElideRight
                             }
-                            Item { Layout.fillWidth: true; visible: !oathPanel.visible }
-                            Switch {
-                                objectName: "keepUnownedLegendaries"
-                                Layout.minimumHeight: 44
-                                text: qsTr("Keep every legendary I don't own yet")
-                                checked: shell.session.keep_unowned_legendaries
-                                enabled: shell.session.can_pick_run_choice
-                                onToggled: shell.backend.setKeepUnownedLegendaries(checked)
+                            PageTitle {
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                                text: afk.hasRun ? afk.runParts.slice(0, 2).join(" · ")
+                                      : shell.session.paused ? qsTr("AFK session paused")
+                                      : shell.runLocked ? qsTr("AFK session active")
+                                      : shell.session.service_missing ? qsTr("Start the background service")
+                                      : shell.quarantine.reason ? qsTr("AFK session on hold")
+                                      : qsTr("Set up an AFK session")
                             }
-                            Switch {
-                                objectName: "showGameWindow"
-                                Layout.minimumHeight: 44
-                                text: qsTr("Show game window")
-                                readonly property string helpText: qsTr("Applies at the next game launch. Closing the game window is treated as a game exit; the supervisor may restart it.")
-                                Accessible.description: helpText
-                                ToolTip.text: helpText
-                                ToolTip.visible: hovered || activeFocus
-                                ToolTip.delay: 350
-                                checked: shell.session.show_game_window
-                                enabled: shell.session.can_change_show_game_window
-                                onToggled: shell.backend.setShowGameWindow(checked)
+                            SingleLine {
+                                visible: text.length > 0
+                                color: shell.muted
+                                font.pixelSize: 13
+                                text: [shell.session.run_detail, afk.runParts.slice(2).join(" · ")]
+                                    .filter(Boolean).join(" · ")
                             }
-                            ActionButton {
-                                id: wishlistPanel
-                                objectName: "wishlistPanel"
-                                enabled: shell.session.can_edit_wishlist
-                                checkable: true
-                                text: checked && enabled ? qsTr("Hide wishlist (%1)").arg(shell.session.wishlist_count)
-                                      : qsTr("Wishlist (%1)").arg(shell.session.wishlist_count)
-                            }
-                            ActionButton {
-                                id: maintenancePanel
-                                objectName: "maintenancePanel"
-                                enabled: shell.session.can_edit_maintenance
-                                checkable: true
-                                text: checked && enabled ? qsTr("Hide maintenance") : qsTr("Maintenance")
+                            Caption {
+                                objectName: "sessionValue"
+                                Layout.fillWidth: true
+                                visible: !afk.hasRun && text.length > 0
+                                text: shell.session.session_id
+                                elide: Text.ElideRight
                             }
                         }
+                        ColumnLayout {
+                            visible: afk.hasZeny || afk.hasRate
+                            Layout.preferredWidth: Math.min(implicitWidth, afk.width * (shell.compact ? 0.47 : 0.45))
+                            Layout.minimumWidth: 0
+                            spacing: 0
+                            Caption {
+                                Layout.alignment: Qt.AlignRight
+                                visible: afk.hasZeny
+                                text: shell.session.active ? qsTr("Zeny tonight") : qsTr("Zeny last session")
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                visible: afk.hasZeny
+                                horizontalAlignment: Text.AlignRight
+                                text: shell.amount(shell.session.session_numbers.zeny)
+                                color: shell.ochre
+                                font.family: boldFont.name
+                                font.bold: true
+                                font.pixelSize: shell.compact ? 44 : 56
+                                font.features: {"tnum": 1}
+                                fontSizeMode: Text.HorizontalFit
+                                minimumPixelSize: 28
+                                elide: Text.ElideLeft
+                            }
+                            RowLayout {
+                                Layout.alignment: Qt.AlignRight
+                                visible: afk.hasRate
+                                spacing: 4
+                                Caption { objectName: "zenyValue"; text: shell.session.zeny }
+                                Caption { text: qsTr("zeny/h") }
+                            }
+                        }
+                    }
 
-                        GridLayout {
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Rule {}
+                        RunBand {
+                            objectName: "sessionRunBand"
+                            theme: shell
+                            runs: shell.session.session_runs
+                            currentNumber: shell.session.current_number
+                            heading: shell.session.active || runs.length === 0 ? qsTr("Run rotation") : qsTr("Last session")
+                            subtitle: !shell.compact && shell.session.active && afk.rotationCount > 0
+                                ? qsTr("%1 locations").arg(afk.rotationCount) : ""
+                            emptyText: shell.session.active ? qsTr("Waiting for the first run to appear.")
+                                : qsTr("Completed runs will appear here in rotation order.")
+                        }
+                        Rule { Layout.topMargin: shell.width >= 1000 ? 12 : 4 }
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: shell.width < 1000 ? 1 : 2
+                        columnSpacing: shell.width >= 1280 ? 56 : 32
+                        rowSpacing: 24
+                        uniformCellWidths: true
+                        ColumnLayout {
                             Layout.fillWidth: true
-                            visible: oathPanel.checked && oathPanel.enabled
-                            columns: width >= 700 ? 3 : 2
-                            uniformCellWidths: true
-                            columnSpacing: 12
-                            rowSpacing: 10
-                            Repeater {
-                                model: shell.session.oaths.length
-                                delegate: ColumnLayout {
-                                    id: oathRow
-                                    required property int index
-                                    readonly property var oath: shell.session.oaths[index]
+                            Layout.alignment: Qt.AlignTop
+                            Layout.minimumWidth: 0
+                            spacing: 8
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.bottomMargin: 4
+                                spacing: 12
+                                SectionTitle { text: qsTr("Run choice") }
+                                Caption {
                                     Layout.fillWidth: true
-                                    Layout.alignment: Qt.AlignTop
-                                    Layout.preferredWidth: 1
+                                    visible: shell.runLocked
+                                    horizontalAlignment: Text.AlignRight
+                                    text: qsTr("Locked while running · editable when paused")
+                                    elide: Text.ElideRight
+                                }
+                            }
+                            GridLayout {
+                                Layout.fillWidth: true
+                                columns: 2
+                                uniformCellWidths: true
+                                columnSpacing: 16
+                                rowSpacing: 8
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
                                     spacing: 4
-                                    Caption {
-                                        id: oathName
-                                        objectName: "oathLabel" + oathRow.index
-                                        Layout.fillWidth: true
-                                        text: oathRow.oath.label
-                                        wrapMode: Text.Wrap
-                                    }
-                                    ComboBox {
-                                        id: rankPicker
-                                        objectName: "oathPicker" + oathRow.index
-                                        Accessible.name: oathName.text
-                                        Layout.fillWidth: true
-                                        Layout.minimumHeight: 44
-                                        model: oathRow.oath.ranks.length
-                                        currentIndex: oathRow.oath.selected_index
-                                        displayText: currentIndex < 0 ? qsTr("Saved rank unavailable") : rankText(currentIndex)
-                                        onActivated: index => shell.backend.selectOath(oathRow.oath.id, oathRow.oath.ranks[index].rank)
-                                        function rankText(index) {
-                                            const rank = oathRow.oath.ranks[index]
-                                            return rank.rank === 0 ? qsTr("Off") : qsTr("Rank %1 (%2 pts)").arg(rank.rank).arg(rank.points)
-                                        }
-                                        delegate: ItemDelegate {
-                                            required property int index
-                                            width: rankPicker.width
-                                            text: rankPicker.rankText(index)
-                                            highlighted: rankPicker.highlightedIndex === index
-                                        }
-                                    }
-                                    Caption {
-                                        objectName: "oathRankDetail" + oathRow.index
-                                        Layout.fillWidth: true
-                                        text: rankPicker.currentIndex < 0 ? qsTr("Choose another rank or turn this oath off.")
-                                              : oathRow.oath.ranks[rankPicker.currentIndex].description
-                                        visible: text.length > 0
-                                        wrapMode: Text.Wrap
+                                    Caption { id: characterLabel; text: qsTr("Character") }
+                                    StoneCombo {
+                                        objectName: "characterPicker"
+                                        Accessible.name: characterLabel.text
+                                        model: shell.session.characters
+                                        currentIndex: shell.session.character_index
+                                        enabled: shell.session.can_pick_character
+                                        onActivated: index => shell.backend.selectCharacter(index)
                                     }
                                 }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    spacing: 4
+                                    Caption { id: presetLabel; text: qsTr("Preset") }
+                                    StoneCombo {
+                                        objectName: "presetPicker"
+                                        Accessible.name: presetLabel.text
+                                        model: shell.session.presets
+                                        currentIndex: shell.session.preset_index
+                                        enabled: shell.session.can_pick_preset
+                                        onActivated: index => shell.backend.selectPreset(index)
+                                    }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    spacing: 4
+                                    Caption { id: locationLabel; text: qsTr("Location") }
+                                    StoneCombo {
+                                        id: locationPicker
+                                        objectName: "locationPicker"
+                                        Accessible.name: locationLabel.text
+                                        model: shell.session.locations
+                                        textRole: "label"
+                                        currentIndex: shell.session.location_index
+                                        displayText: currentIndex < 0 ? qsTr("Saved location unavailable") : currentText
+                                        enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
+
+                                        delegate: PickOption {
+                                            required property int index
+                                            required property var modelData
+                                            objectName: "locationOption" + index
+                                            width: ListView.view.width
+                                            text: enabled ? modelData.label : qsTr("%1 (locked)").arg(modelData.label)
+                                            enabled: modelData.enabled
+                                            highlighted: locationPicker.highlightedIndex === index
+                                        }
+
+                                        function stepLocation(step) {
+                                            for (let i = currentIndex + step; i >= 0 && i < count; i += step) {
+                                                if (model[i].enabled) {
+                                                    shell.backend.selectLocation(i)
+                                                    break
+                                                }
+                                            }
+                                        }
+
+                                        Keys.onUpPressed: event => {
+                                            event.accepted = !popup.visible
+                                            if (event.accepted)
+                                                stepLocation(-1)
+                                        }
+                                        Keys.onDownPressed: event => {
+                                            event.accepted = !popup.visible
+                                            if (event.accepted)
+                                                stepLocation(1)
+                                        }
+                                        onActivated: index => {
+                                            if (model[index].enabled)
+                                                shell.backend.selectLocation(index)
+                                            else
+                                                currentIndex = Qt.binding(() => shell.session.location_index)
+                                        }
+                                    }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    spacing: 4
+                                    Caption { id: difficultyLabel; text: qsTr("Difficulty") }
+                                    StoneCombo {
+                                        objectName: "difficultyPicker"
+                                        Accessible.name: difficultyLabel.text
+                                        model: shell.session.difficulties
+                                        currentIndex: shell.session.difficulty_index
+                                        displayText: currentIndex < 0 ? qsTr("Saved difficulty unavailable") : currentText
+                                        enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
+                                        onActivated: index => shell.backend.selectDifficulty(textAt(index))
+                                    }
+                                }
+                            }
+
+                            Disclosure {
+                                id: oathPanel
+                                objectName: "oathPanel"
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 0
+                                visible: shell.session.oaths.length > 0
+                                enabled: !shell.runLocked && shell.session.can_pick_oaths
+                                text: checked && enabled ? qsTr("Hide oaths") : qsTr("Oaths")
+                                Accessible.name: checked && enabled ? text : qsTr("Show oaths")
+                                Accessible.description: detail
+                                detailObjectName: "oathPoints"
+                                detail: shell.session.difficulties[shell.session.difficulty_index] === "30"
+                                    ? qsTr("Oath points: %1").arg(shell.session.oath_points)
+                                    : qsTr("Oaths require fixed difficulty 30.")
+                            }
+                            GridLayout {
+                                Layout.fillWidth: true
+                                visible: oathPanel.visible && oathPanel.checked && oathPanel.enabled
+                                columns: 2
+                                uniformCellWidths: true
+                                columnSpacing: 16
+                                rowSpacing: 8
+                                Repeater {
+                                    model: shell.session.oaths.length
+                                    delegate: ColumnLayout {
+                                        id: oathRow
+                                        required property int index
+                                        readonly property var oath: shell.session.oaths[index]
+                                        Layout.fillWidth: true
+                                        Layout.alignment: Qt.AlignTop
+                                        Layout.minimumWidth: 0
+                                        spacing: 4
+                                        Caption {
+                                            id: oathName
+                                            objectName: "oathLabel" + oathRow.index
+                                            Layout.fillWidth: true
+                                            text: oathRow.oath.label
+                                            wrapMode: Text.Wrap
+                                        }
+                                        StoneCombo {
+                                            id: rankPicker
+                                            objectName: "oathPicker" + oathRow.index
+                                            Accessible.name: oathName.text
+                                            model: oathRow.oath.ranks.length
+                                            currentIndex: oathRow.oath.selected_index
+                                            displayText: currentIndex < 0 ? qsTr("Saved rank unavailable") : rankText(currentIndex)
+                                            onActivated: index => shell.backend.selectOath(oathRow.oath.id, oathRow.oath.ranks[index].rank)
+                                            function rankText(index) {
+                                                const rank = oathRow.oath.ranks[index]
+                                                return rank.rank === 0 ? qsTr("Off") : qsTr("Rank %1 (%2 pts)").arg(rank.rank).arg(rank.points)
+                                            }
+                                            delegate: PickOption {
+                                                required property int index
+                                                width: ListView.view.width
+                                                text: rankPicker.rankText(index)
+                                                highlighted: rankPicker.highlightedIndex === index
+                                            }
+                                        }
+                                        Caption {
+                                            objectName: "oathRankDetail" + oathRow.index
+                                            Layout.fillWidth: true
+                                            text: rankPicker.currentIndex < 0 ? qsTr("Choose another rank or turn this oath off.")
+                                                : oathRow.oath.ranks[rankPicker.currentIndex].description
+                                            visible: text.length > 0
+                                            wrapMode: Text.Wrap
+                                        }
+                                    }
+                                }
+                            }
+
+                            GridLayout {
+                                Layout.fillWidth: true
+                                columns: 2
+                                uniformCellWidths: true
+                                columnSpacing: 16
+                                StoneSwitch {
+                                    objectName: "keepUnownedLegendaries"
+                                    text: qsTr("Keep every legendary I don't own yet")
+                                    checked: shell.session.keep_unowned_legendaries
+                                    enabled: shell.session.can_pick_run_choice
+                                    onToggled: shell.backend.setKeepUnownedLegendaries(checked)
+                                }
+                                StoneSwitch {
+                                    objectName: "showGameWindow"
+                                    text: qsTr("Show game window")
+                                    readonly property string helpText: qsTr("Applies at the next game launch. Closing the game window is treated as a game exit; the supervisor may restart it.")
+                                    Accessible.description: helpText
+                                    ToolTip.text: helpText
+                                    ToolTip.visible: hovered || activeFocus
+                                    ToolTip.delay: 350
+                                    checked: shell.session.show_game_window
+                                    enabled: !shell.runLocked && shell.session.can_change_show_game_window
+                                    onToggled: shell.backend.setShowGameWindow(checked)
+                                }
+                            }
+
+                            Rule {}
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 12
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    spacing: 0
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+                                        Label { text: qsTr("Wishlist"); font.bold: true }
+                                        Caption {
+                                            Layout.fillWidth: true
+                                            text: shell.session.wishlist_count === 1 ? qsTr("· 1 item")
+                                                : qsTr("· %1 items").arg(shell.session.wishlist_count)
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+                                    SingleLine {
+                                        visible: text.length > 0
+                                        color: shell.muted
+                                        font.pixelSize: 13
+                                        text: shell.session.wishlist_items.filter(row => row.selected)
+                                            .map(row => row.label).join(", ")
+                                    }
+                                }
+                                ActionButton {
+                                    id: wishlistPanel
+                                    objectName: "wishlistPanel"
+                                    enabled: shell.session.can_edit_wishlist
+                                    checkable: true
+                                    disclosure: true
+                                    text: checked && enabled ? qsTr("Hide wishlist") : qsTr("Search wishlist")
+                                }
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                visible: wishlistPanel.checked && wishlistPanel.enabled
+                                spacing: 4
+
+                                Caption { id: wishlistSearchLabel; text: qsTr("Search legendary items by name") }
+                                StoneField {
+                                    id: wishlistSearch
+                                    objectName: "wishlistSearch"
+                                    Accessible.name: wishlistSearchLabel.text
+                                    Layout.fillWidth: true
+                                }
+                                StoneCheck {
+                                    id: wishlistOnly
+                                    text: qsTr("Show wishlist only")
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    StoneCombo {
+                                        id: wishlistPicker
+                                        objectName: "wishlistPicker"
+                                        Accessible.name: qsTr("Matching legendary items")
+                                        property string itemId: ""
+                                        readonly property var option: model[currentIndex] ?? null
+                                        model: {
+                                            const query = wishlistSearch.text.trim().toLocaleLowerCase()
+                                            return shell.session.wishlist_items.filter(row =>
+                                                (!wishlistOnly.checked || row.selected) &&
+                                                row.label.toLocaleLowerCase().includes(query))
+                                        }
+                                        textRole: "label"
+                                        currentIndex: count ? Math.max(0, model.findIndex(row => row.id === itemId)) : -1
+                                        onActivated: index => itemId = model[index].id
+                                        displayText: option ? optionText(option) : qsTr("No matching items")
+                                        enabled: count > 0
+
+                                        function optionText(row) {
+                                            return row.owned ? qsTr("%1 (owned)").arg(row.label) : row.label
+                                        }
+                                        delegate: PickOption {
+                                            required property int index
+                                            required property var modelData
+                                            width: ListView.view.width
+                                            text: wishlistPicker.optionText(modelData)
+                                            highlighted: wishlistPicker.highlightedIndex === index
+                                        }
+                                    }
+                                    ActionButton {
+                                        objectName: "wishlistAction"
+                                        enabled: wishlistPicker.option !== null
+                                        text: wishlistPicker.option?.selected ? qsTr("Remove") : qsTr("Add")
+                                        onClicked: {
+                                            const item = wishlistPicker.option
+                                            wishlistPicker.itemId = item.id
+                                            shell.backend.setWishlisted(item.id, !item.selected)
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rule {}
+                            Label {
+                                visible: shell.runLocked
+                                text: qsTr("Maintenance")
+                                font.bold: true
+                            }
+                            Disclosure {
+                                id: maintenancePanel
+                                objectName: "maintenancePanel"
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 0
+                                visible: !shell.runLocked
+                                enabled: shell.session.can_edit_maintenance
+                                text: checked && enabled ? qsTr("Hide maintenance") : qsTr("Maintenance")
+                            }
+                            GridLayout {
+                                Layout.fillWidth: true
+                                visible: shell.runLocked || (maintenancePanel.checked && maintenancePanel.enabled)
+                                enabled: !shell.runLocked && shell.session.can_edit_maintenance
+                                columns: 2
+                                uniformCellWidths: true
+                                columnSpacing: 16
+                                rowSpacing: 0
+                                Repeater {
+                                    model: [
+                                        { key: "upgrades", label: qsTr("Kafra/Sage upgrades") },
+                                        { key: "card_fusion", label: qsTr("Card fusion") },
+                                        { key: "star_smith", label: qsTr("Star Smith") },
+                                        { key: "storage_cleanup", label: qsTr("Storage cleanup") }
+                                    ]
+                                    delegate: StoneSwitch {
+                                        required property var modelData
+                                        objectName: "maintenance-" + modelData.key
+                                        text: modelData.label
+                                        checked: shell.session.maintenance[modelData.key]
+                                        onToggled: shell.backend.setMaintenance(modelData.key, checked)
+                                    }
+                                }
+                            }
+                            Caption {
+                                Layout.fillWidth: true
+                                visible: text.length > 0
+                                text: shell.session.preset_description
+                                wrapMode: Text.Wrap
+                            }
+                            Caption {
+                                objectName: "catalogRefresh"
+                                Layout.fillWidth: true
+                                text: shell.session.catalog_refresh
+                                    ? qsTr("Catalog refreshed: %1").arg(shell.session.catalog_refresh) : qsTr("No catalog yet")
+                                wrapMode: Text.Wrap
                             }
                         }
 
                         ColumnLayout {
+                            id: tally
                             Layout.fillWidth: true
-                            visible: wishlistPanel.visible && wishlistPanel.checked && wishlistPanel.enabled
-                            spacing: 4
-
-                            Caption { id: wishlistSearchLabel; text: qsTr("Search legendary items by name") }
-                            TextField {
-                                id: wishlistSearch
-                                objectName: "wishlistSearch"
-                                Accessible.name: wishlistSearchLabel.text
-                                Layout.fillWidth: true
-                                Layout.minimumHeight: 44
+                            Layout.minimumWidth: 0
+                            Layout.alignment: Qt.AlignTop
+                            spacing: 8
+                            readonly property var numbers: shell.session.session_numbers
+                            readonly property var readings: shell.session.session_metrics
+                            readonly property var measurementNames: {
+                                const preferred = ["Kills", "Star Crumb", "Oridecon", "Elunium", "Legend Coin"]
+                                const keys = Object.keys(readings)
+                                return preferred.filter(key => keys.includes(key))
+                                    .concat(keys.filter(key => key !== "Cards" && !preferred.includes(key)))
+                                    .concat(keys.includes("Cards") ? ["Cards"] : [])
                             }
-                            CheckBox {
-                                id: wishlistOnly
-                                text: qsTr("Show wishlist only")
-                                Layout.minimumHeight: 44
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.bottomMargin: 4
+                                spacing: 12
+                                SectionTitle {
+                                    Layout.fillWidth: true
+                                    text: !shell.session.active && tally.numbers.runs !== undefined
+                                        ? qsTr("Last session totals") : qsTr("Session so far")
+                                }
+                                Caption {
+                                    visible: shell.session.session_duration >= 60
+                                    text: shell.elapsed(shell.session.session_duration)
+                                }
+                            }
+                            Caption {
+                                Layout.fillWidth: true
+                                visible: tally.numbers.runs === undefined
+                                wrapMode: Text.Wrap
+                                text: shell.session.active ? qsTr("Totals appear as the farmer reports its progress.")
+                                                          : qsTr("No recorded session yet.")
                             }
                             RowLayout {
                                 Layout.fillWidth: true
-                                ComboBox {
-                                    id: wishlistPicker
-                                    objectName: "wishlistPicker"
-                                    Accessible.name: qsTr("Matching legendary items")
-                                    Layout.fillWidth: true
-                                    Layout.minimumWidth: 0
-                                    Layout.minimumHeight: 44
-                                    property string itemId: ""
-                                    readonly property var option: model[currentIndex] ?? null
-                                    model: {
-                                        const query = wishlistSearch.text.trim().toLocaleLowerCase()
-                                        return shell.session.wishlist_items.filter(row =>
-                                            (!wishlistOnly.checked || row.selected) &&
-                                            row.label.toLocaleLowerCase().includes(query))
-                                    }
-                                    textRole: "label"
-                                    currentIndex: count ? Math.max(0, model.findIndex(row => row.id === itemId)) : -1
-                                    onActivated: index => itemId = model[index].id
-                                    displayText: option ? optionText(option) : qsTr("No matching items")
-                                    enabled: count > 0
-
-                                    function optionText(row) {
-                                        return row.owned ? qsTr("%1 (owned)").arg(row.label) : row.label
-                                    }
-                                    delegate: ItemDelegate {
-                                        required property int index
+                                visible: tally.numbers.runs !== undefined
+                                spacing: 12
+                                Repeater {
+                                    model: [
+                                        {key: "runs", label: qsTr("Runs")},
+                                        {key: "wins", label: qsTr("Wins")},
+                                        {key: "losses", label: qsTr("Losses")}
+                                    ]
+                                    delegate: ColumnLayout {
                                         required property var modelData
-                                        width: wishlistPicker.width
-                                        text: wishlistPicker.optionText(modelData)
-                                        highlighted: wishlistPicker.highlightedIndex === index
-                                    }
-                                }
-                                ActionButton {
-                                    objectName: "wishlistAction"
-                                    enabled: wishlistPicker.option !== null
-                                    text: wishlistPicker.option?.selected ? qsTr("Remove") : qsTr("Add")
-                                    onClicked: {
-                                        const item = wishlistPicker.option
-                                        wishlistPicker.itemId = item.id
-                                        shell.backend.setWishlisted(item.id, !item.selected)
+                                        Layout.fillWidth: true
+                                        Layout.preferredWidth: 1
+                                        visible: tally.numbers[modelData.key] !== undefined
+                                        spacing: 0
+                                        Caption { text: parent.modelData.label }
+                                        Label {
+                                            text: shell.amount(tally.numbers[parent.modelData.key])
+                                            Layout.fillWidth: true
+                                            elide: Text.ElideRight
+                                            font.pixelSize: 36
+                                            font.bold: true
+                                            font.features: {"tnum": 1}
+                                        }
                                     }
                                 }
                             }
-                        }
-
-                        GridLayout {
-                            Layout.fillWidth: true
-                            visible: maintenancePanel.visible && maintenancePanel.checked && maintenancePanel.enabled
-                            columns: width >= 880 ? 4 : 2
-                            uniformCellWidths: true
-                            columnSpacing: 12
-                            enabled: shell.session.can_edit_maintenance
+                            Rule { visible: tally.measurementNames.length > 0 }
                             Repeater {
-                                model: [
-                                    { key: "upgrades", label: qsTr("Kafra/Sage upgrades") },
-                                    { key: "card_fusion", label: qsTr("Card fusion") },
-                                    { key: "star_smith", label: qsTr("Star Smith") },
-                                    { key: "storage_cleanup", label: qsTr("Storage cleanup") }
-                                ]
-                                delegate: Switch {
-                                    required property var modelData
-                                    objectName: "maintenance-" + modelData.key
+                                model: tally.measurementNames
+                                delegate: RowLayout {
+                                    required property string modelData
                                     Layout.fillWidth: true
-                                    Layout.minimumHeight: 44
-                                    text: modelData.label
-                                    checked: shell.session.maintenance[modelData.key]
-                                    onToggled: shell.backend.setMaintenance(modelData.key, checked)
+                                    Layout.minimumHeight: 36
+                                    spacing: 12
+                                    SingleLine { text: parent.modelData }
+                                    Caption {
+                                        visible: parent.modelData === "Kills" && shell.session.kills !== "—"
+                                        text: qsTr("%1/min").arg(shell.session.kills)
+                                    }
+                                    Label {
+                                        text: modelData === "Cards" && tally.readings[modelData] > 0
+                                            ? "+" + shell.amount(tally.readings[modelData])
+                                            : shell.amount(tally.readings[modelData])
+                                        font.pixelSize: 24
+                                        font.bold: true
+                                        font.features: {"tnum": 1}
+                                    }
                                 }
                             }
-                        }
-
-                        Label {
-                            objectName: "startRefusal"
-                            Layout.fillWidth: true
-                            visible: shell.session.start_refusal.length > 0
-                            text: visible ? qsTr("Start refused: %1").arg(shell.session.start_refusal) : ""
-                            textFormat: Text.PlainText
-                            wrapMode: Text.Wrap
-                            color: shell.danger
-                        }
-                        Label {
-                            objectName: "resumeRefusal"
-                            Layout.fillWidth: true
-                            visible: shell.session.resume_refusal.length > 0
-                            text: visible ? qsTr("Resume refused: %1").arg(shell.session.resume_refusal) : ""
-                            textFormat: Text.PlainText
-                            wrapMode: Text.Wrap
-                            color: shell.danger
-                        }
-                        Caption {
-                            Layout.fillWidth: true
-                            visible: !shell.session.active && !shell.session.service_missing
-                                     && text.length > 0 && text !== shell.session.start_refusal
-                            text: shell.session.start_reason
-                            textFormat: Text.PlainText
-                            wrapMode: Text.Wrap
-                            color: shell.warning
-                        }
-                        Label {
-                            Layout.fillWidth: true
-                            visible: text.length > 0
-                            text: shell.session.action_error
-                            textFormat: Text.PlainText
-                            wrapMode: Text.Wrap
-                            color: shell.danger
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 8
-                            ActionButton {
-                                objectName: "startButton"
-                                text: qsTr("Start AFK session")
-                                visible: !shell.session.active && !shell.session.service_missing
-                                enabled: shell.session.can_start
-                                highlighted: true
-                                onClicked: shell.backend.start()
-                            }
-                            ActionButton {
-                                objectName: "startServiceButton"
-                                text: qsTr("Start service")
-                                visible: shell.session.service_missing
-                                highlighted: true
-                                onClicked: shell.backend.startService()
-                            }
-                            ActionButton {
-                                objectName: "pauseButton"
-                                text: shell.session.paused ? qsTr("Resume") : qsTr("Pause after run")
-                                visible: shell.session.active
-                                enabled: shell.session.paused ? shell.session.can_resume : shell.session.can_pause
-                                onClicked: shell.backend.control(shell.session.paused ? "resume" : "pause",
-                                                                 shell.session.session_id)
-                            }
-                            ActionButton {
-                                objectName: "finishButton"
-                                text: qsTr("Finish")
-                                visible: shell.session.active
-                                enabled: shell.session.can_control
-                                onClicked: shell.backend.control("finish", shell.session.session_id)
-                            }
-                            ActionButton {
-                                objectName: "abortButton"
-                                text: qsTr("Abort…")
-                                palette.buttonText: shell.danger
-                                visible: shell.session.active
-                                enabled: shell.session.can_control
-                                onClicked: {
-                                    abortDialog.sessionId = shell.session.session_id
-                                    abortDialog.betweenAttempts = !shell.session.can_pause
-                                    abortDialog.open()
-                                }
-                            }
-                            Item { Layout.fillWidth: true }
                         }
                     }
                 }
@@ -668,14 +1109,16 @@ ApplicationWindow {
                                 readonly property bool expanded: expandable
                                     && historyPanel.expandedSession === modelData.session_id
                                 Layout.fillWidth: true
-                                spacing: 10
+                                spacing: 8
+                                Layout.bottomMargin: 8
                                 Rule {}
                                 RowLayout {
                                     Layout.fillWidth: true
                                     spacing: 12
-                                    Caption { text: entry.modelData.date }
+                                    Caption { text: entry.modelData.date; font.features: {"tnum": 1} }
                                     SingleLine {
                                         objectName: "historyRow" + entry.index
+                                        font.bold: true
                                         text: entry.modelData.title + (entry.modelData.summary ? " · " + entry.modelData.summary : "")
                                     }
                                     ActionButton {
@@ -687,6 +1130,12 @@ ApplicationWindow {
                                                          ? qsTr("Show details for the last night") : text
                                         onClicked: historyPanel.expandedSession = entry.expanded ? "" : entry.modelData.session_id
                                     }
+                                }
+                                RunBand {
+                                    theme: shell
+                                    runs: entry.modelData.session_runs
+                                    visible: runs.length > 0
+                                    small: true
                                 }
                                 ColumnLayout {
                                     objectName: entry.lastNight ? "lastNightDetails" : ""
@@ -710,7 +1159,7 @@ ApplicationWindow {
                                     GridLayout {
                                         visible: entry.lastNight
                                         Layout.fillWidth: true
-                                        columns: 5
+                                        columns: shell.compact ? 3 : 5
                                         uniformCellWidths: true
                                         columnSpacing: 12
                                         rowSpacing: 12
@@ -748,10 +1197,12 @@ ApplicationWindow {
                         spacing: 14
                         PageTitle { text: qsTr("Updates") }
                         Rule {}
-                        Label { text: qsTr("Game update"); font.pixelSize: 16; font.weight: Font.DemiBold }
-                        RowLayout {
+                        SectionTitle { text: qsTr("Game update") }
+                        GridLayout {
                             Layout.fillWidth: true
-                            spacing: 24
+                            columns: 2
+                            uniformCellWidths: true
+                            columnSpacing: 24
                             Metric {
                                 title: qsTr("Patch state")
                                 value: shell.updates.game_state
@@ -811,7 +1262,7 @@ ApplicationWindow {
                             color: shell.danger
                         }
                         Rule {}
-                        Label { text: qsTr("App update"); font.pixelSize: 16; font.weight: Font.DemiBold }
+                        SectionTitle { text: qsTr("App update") }
                         Metric {
                             title: qsTr("Installed version")
                             value: shell.updates.app_version
@@ -843,6 +1294,7 @@ ApplicationWindow {
                         width: parent.width
                         spacing: 14
                         PageTitle { text: qsTr("Quarantine") }
+                        Rule {}
                         Caption {
                             objectName: "noQuarantine"
                             visible: !shell.quarantine.reason
@@ -856,10 +1308,10 @@ ApplicationWindow {
                                 objectName: "quarantineReason"
                                 text: shell.quarantine.reason
                                 font.pixelSize: 17
-                                font.weight: Font.DemiBold
+                                font.bold: true
                                 color: shell.danger
                             }
-                            SingleLine { objectName: "quarantineDetail"; text: shell.quarantine.detail }
+                            BodyText { objectName: "quarantineDetail"; text: shell.quarantine.detail }
                             ActionButton {
                                 objectName: "quarantineNextAction"
                                 text: shell.quarantine.action
@@ -902,13 +1354,13 @@ ApplicationWindow {
                                 visible: diagnosticsDisclosure.checked
                                 Layout.fillWidth: true
                                 spacing: 8
-                                Caption { text: qsTr("Attempts") }
+                                SectionTitle { text: qsTr("Attempts") }
                                 Caption { visible: shell.quarantine.attempts.length === 0; text: qsTr("No attempts recorded.") }
                                 Repeater {
                                     model: shell.quarantine.attempts
                                     delegate: BodyText { required property string modelData; text: modelData }
                                 }
-                                Caption { text: qsTr("Log paths") }
+                                SectionTitle { text: qsTr("Log paths") }
                                 Caption { visible: shell.quarantine.paths.length === 0; text: qsTr("No log paths recorded.") }
                                 Repeater {
                                     model: shell.quarantine.paths
@@ -917,7 +1369,10 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         text: modelData
                                         textFormat: TextEdit.PlainText
-                                        color: shell.palette.text
+                                        color: shell.ink
+                                        font: shell.font
+                                        selectionColor: shell.ochre
+                                        selectedTextColor: shell.ground
                                         wrapMode: TextEdit.WrapAnywhere
                                         readOnly: true
                                         selectByMouse: true
@@ -927,12 +1382,133 @@ ApplicationWindow {
                         }
                     }
                 }
+            }
+        }
+    }
 
+    component FeedbackLine: Label {
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        maximumLineCount: 2
+        elide: Text.ElideRight
+        visible: text.length > 0
+        HoverHandler { id: feedbackHover }
+        ToolTip.visible: feedbackHover.hovered && truncated
+        ToolTip.delay: 500
+        ToolTip.text: text
+    }
+
+    footer: Pane {
+        id: actionBar
+        readonly property bool stacked: shell.width < 840
+        visible: tabs.currentIndex === 0
+        horizontalPadding: shell.gutter
+        verticalPadding: stacked ? 8 : 16
+        implicitHeight: Math.max(stacked ? 0 : 84, implicitContentHeight + topPadding + bottomPadding)
+        background: Rectangle {
+            color: shell.raised
+            Rectangle { width: parent.width; height: 1; color: shell.hairline }
+        }
+        contentItem: GridLayout {
+            columns: 2
+            columnSpacing: 24
+            rowSpacing: 8
+            ColumnLayout {
+                Layout.row: 0
+                Layout.column: 0
+                Layout.columnSpan: actionBar.stacked ? 2 : 1
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                spacing: 4
+                FeedbackLine {
+                    id: startRefusal
+                    objectName: "startRefusal"
+                    text: shell.session.start_refusal ? qsTr("Start refused: %1").arg(shell.session.start_refusal) : ""
+                    color: shell.danger
+                }
+                FeedbackLine {
+                    id: resumeRefusal
+                    objectName: "resumeRefusal"
+                    text: shell.session.resume_refusal ? qsTr("Resume refused: %1").arg(shell.session.resume_refusal) : ""
+                    color: shell.danger
+                }
+                FeedbackLine {
+                    id: startReason
+                    text: !shell.session.active && !shell.session.service_missing
+                        && shell.session.start_reason !== shell.session.start_refusal ? shell.session.start_reason : ""
+                    color: shell.warning
+                }
+                FeedbackLine {
+                    id: actionError
+                    text: shell.session.action_error
+                    color: shell.danger
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: !startRefusal.visible && !resumeRefusal.visible && !startReason.visible && !actionError.visible
+                    spacing: 8
+                    Label { text: qsTr("Last event ·"); font.bold: true }
+                    SingleLine { text: shell.session.last_event || qsTr("No events yet.") }
+                }
                 Caption {
-                    visible: tabs.currentIndex === 0
                     Layout.fillWidth: true
                     text: qsTr("Closing this window leaves the AFK session running in the background service.")
                     wrapMode: Text.Wrap
+                }
+            }
+            RowLayout {
+                Layout.row: actionBar.stacked ? 1 : 0
+                Layout.column: actionBar.stacked ? 0 : 1
+                Layout.columnSpan: actionBar.stacked ? 2 : 1
+                Layout.alignment: Qt.AlignRight
+                spacing: 8
+                ActionButton {
+                    objectName: "startButton"
+                    text: qsTr("Start AFK session")
+                    visible: !shell.session.active && !shell.session.service_missing
+                    enabled: shell.session.can_start
+                    highlighted: true
+                    onClicked: shell.backend.start()
+                }
+                ActionButton {
+                    objectName: "startServiceButton"
+                    text: qsTr("Start service")
+                    visible: shell.session.service_missing
+                    highlighted: true
+                    onClicked: shell.backend.startService()
+                }
+                ActionButton {
+                    objectName: "pauseButton"
+                    text: shell.session.paused ? qsTr("Resume") : qsTr("Pause")
+                    Accessible.description: shell.session.paused ? "" : qsTr("Pause after the current run")
+                    ToolTip.text: Accessible.description
+                    ToolTip.visible: hovered && ToolTip.text.length > 0
+                    ToolTip.delay: 500
+                    visible: shell.session.active
+                    enabled: shell.session.paused ? shell.session.can_resume : shell.session.can_pause
+                    highlighted: true
+                    onClicked: shell.backend.control(shell.session.paused ? "resume" : "pause", shell.session.session_id)
+                }
+                ActionButton {
+                    objectName: "finishButton"
+                    text: qsTr("Finish after this run")
+                    visible: shell.session.active
+                    enabled: shell.session.can_control
+                    onClicked: shell.backend.control("finish", shell.session.session_id)
+                }
+                ActionButton {
+                    objectName: "abortButton"
+                    text: qsTr("Abort")
+                    destructive: true
+                    visible: shell.session.active
+                    enabled: shell.session.can_control
+                    onClicked: {
+                        abortDialog.sessionId = shell.session.session_id
+                        abortDialog.betweenAttempts = !shell.session.can_pause
+                        abortDialog.open()
+                    }
                 }
             }
         }
@@ -948,6 +1524,16 @@ ApplicationWindow {
         modal: true
         closePolicy: Popup.CloseOnEscape
         title: qsTr("Abort AFK session?")
+        padding: 24
+        spacing: 16
+        background: Frame { color: shell.raised; border.color: shell.edge }
+        Overlay.modal: Rectangle { color: "#a6171817" }
+        header: SectionTitle {
+            text: abortDialog.title
+            leftPadding: 24
+            rightPadding: 24
+            topPadding: 24
+        }
         onOpened: cancelAbort.forceActiveFocus()
         onAccepted: shell.backend.control("abort", sessionId)
 
@@ -960,6 +1546,12 @@ ApplicationWindow {
             wrapMode: Text.Wrap
         }
         footer: DialogButtonBox {
+            alignment: Qt.AlignRight
+            spacing: 8
+            leftPadding: 24
+            rightPadding: 24
+            bottomPadding: 24
+            background: null
             ActionButton {
                 id: cancelAbort
                 objectName: "cancelAbort"
@@ -969,7 +1561,7 @@ ApplicationWindow {
             ActionButton {
                 objectName: "confirmAbort"
                 text: qsTr("Abort session")
-                palette.buttonText: shell.danger
+                destructive: true
                 DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
             }
         }

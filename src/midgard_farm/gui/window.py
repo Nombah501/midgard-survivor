@@ -1,6 +1,6 @@
 """Qt adapter for the file-backed session view model.
 
-After editing Main.qml, run from the repository root:
+After editing the QML or the assets in window.qrc, run from the repository root:
     pyside6-rcc --format-version 1 --compress-algo zlib -o src/midgard_farm/gui/_resources.py src/midgard_farm/gui/window.qrc
 """
 

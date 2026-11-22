@@ -54,6 +54,14 @@ def read_history(os_: Platform) -> list[dict[str, Any]]:
             and type(row.get("timestamp")) in (int, float)]
 
 
+def read_run_journal(os_: Platform, path: Path) -> Iterator[dict[str, Any]]:
+    """Read farmer run rows in append order using a Windows-compatible shared read."""
+    try:
+        return _rows(os_.read_shared(path))
+    except FileNotFoundError:
+        return iter(())
+
+
 def _number(value: object) -> int | float:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
@@ -67,9 +75,7 @@ def session_summary(os_: Platform, profile: Path, session_id: str,
                     status_totals: dict[str, Any]) -> dict[str, Any]:
     """Collect cumulative totals and the actual run choices from the journal."""
     try:
-        rows = _rows(os_.read_shared(profile / "farmer_runs.jsonl"))
-    except FileNotFoundError:
-        rows = iter(())
+        rows = read_run_journal(os_, profile / "farmer_runs.jsonl")
     except OSError as exc:
         print(f"supervisor: could not read totals from farmer journal: {exc}", flush=True)
         rows = iter(())
