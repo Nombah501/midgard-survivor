@@ -118,6 +118,8 @@ class FakeReleases:
     def open(self, request, *, timeout):
         assert request.full_url.startswith("https://updates.test/")
         assert request.get_header("Authorization") is None
+        # The real host sits behind Cloudflare, which rejects urllib's default User-Agent (error 1010).
+        assert request.get_header("User-agent") == "MidgardFarm-Updater"
         key = request.full_url.removeprefix("https://updates.test/")
         self.hits.append(key.split("/", 1)[0])
         if self.status:

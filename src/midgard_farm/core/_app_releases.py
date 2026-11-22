@@ -26,6 +26,7 @@ from ..platform import Platform
 # Signed update channel (ADR 0010): R2 bucket midgard-farm-release behind the Operator's domain.
 UPDATE_BASE_URL = "https://updates.vibeauction.shop"
 MINISIGN_PUBLIC_KEY = "RWQs+4Pjv3LjCQyZNEjrnUPsMD6V03qW2NsY8kWAfUmYf3YP3V52dJmz"
+USER_AGENT = "MidgardFarm-Updater"
 CHANNEL = "stable"
 MANIFEST_KEY = f"{CHANNEL}/manifest.json"
 MAX_MANIFEST_SIZE = 1 << 20
@@ -78,7 +79,9 @@ def update_base_url() -> str:
 
 @contextmanager
 def _open(key: str):
-    request = Request(f"{update_base_url()}/{key}", headers={"Accept-Encoding": "identity"})
+    # Cloudflare's Browser Integrity Check answers urllib's default User-Agent with 403 (error 1010).
+    request = Request(f"{update_base_url()}/{key}",
+                      headers={"Accept-Encoding": "identity", "User-Agent": USER_AGENT})
     try:
         with _HTTPS.open(request, timeout=15) as response:
             yield response
