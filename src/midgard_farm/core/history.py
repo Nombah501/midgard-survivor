@@ -108,8 +108,12 @@ class NightSummary:
 def night_summary(rows: Iterable[dict[str, Any]], today: date,
                   active: dict[str, Any] | None = None) -> NightSummary:
     """Sum whole overlapping sessions; the journal cannot cut rewards at clock boundaries."""
-    start = datetime.combine(today - timedelta(days=1), local_time(18)).timestamp()
-    end = datetime.combine(today, local_time(12)).timestamp()
+    try:
+        start = datetime.combine(today - timedelta(days=1), local_time(18)).timestamp()
+        end = datetime.combine(today, local_time(12)).timestamp()
+    except (OSError, OverflowError, ValueError):
+        # Windows cannot convert local times before the epoch; no session can lie there.
+        return NightSummary(0, 0, 0, 0, None, False)
     sessions = timed = 0
     amounts: dict[str, int | float | None] = dict.fromkeys(("zeny", "wins", "runs"), 0)
     downtime = 0.0
