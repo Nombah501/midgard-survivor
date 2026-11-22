@@ -1363,9 +1363,12 @@ def test_compact_afk_headline_keeps_full_location_readable(open_dashboard, farm)
                 totals={"started": 38, "runs": 37, "wins": 35, "zeny": 2086359338},
                 target={"stage": "prontera"}, rates={"zeny_h": 212172135})
     window = open_dashboard("afkTab")
-    window.resize(640, 900)
     headline = qml_item(window, "currentRunHeadline")
     wait_until(lambda: headline.property("text") == "Run 38 · Prontera Field")
+    window.resize(640, 900)
+    # A native resize can return before QML delivers it and lays out the compact row.
+    wait_until(lambda: window.property("compact")
+               and headline.width() == window.width() - 2 * window.property("gutter"))
     assert not window.grabWindow().isNull()
     assert not headline.property("truncated")
 

@@ -97,8 +97,11 @@ def verification(tmp_path, monkeypatch):
 
 def execute(verification, name, **kwargs):
     os_, source, candidate, work, out, _ = verification
-    return scenarios.run_scenario(os_, source, candidate, work, out, name,
-                                  policy=supervisor.Policy(backoff_base=0.05), **kwargs)
+    with pytest.MonkeyPatch.context() as env:
+        if name == "location-rotation-resume":
+            env.setenv("FAKE_VERIFY_PAUSE_AFTER_RUNS", "1")
+        return scenarios.run_scenario(os_, source, candidate, work, out, name,
+                                      policy=supervisor.Policy(backoff_base=0.05), **kwargs)
 
 
 def test_registry_contains_every_legacy_scenario():
@@ -151,6 +154,21 @@ def test_rotation_judges_accept_different_seeded_starts(verification, monkeypatc
     starts = [line.split(" ROTATION_START stage=")[1] for log in logs if log.is_file()
               for line in log.read_text().splitlines() if " ROTATION_START stage=" in line]
     assert starts == [first]
+
+
+def test_rotation_resume_waits_for_pause_after_recovery(verification, monkeypatch):
+    from midgard_farm.verify import drive
+
+    submit = drive.submit
+
+    def delayed_submit(os_, command):
+        if command == "pause":
+            time.sleep(1)  # Deliver Pause after the fake game's normal short run would end.
+        return submit(os_, command)
+
+    monkeypatch.setattr(drive, "submit", delayed_submit)
+    row = execute(verification, "location-rotation-resume")
+    assert row["verdict"] == "PASS", row
 
 
 def test_windowed_scenario_finishes_one_supervised_attempt(verification, monkeypatch):

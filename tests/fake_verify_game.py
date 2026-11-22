@@ -519,8 +519,10 @@ if verify_tower_run:
     settle("finish")
     finish("tower_finished")
 deadline = time.monotonic() + 0.65 if cfg.get("run_minutes") == 0.2 else 0
-if started == 1 or (started == 2 and rotating()):
-    while time.monotonic() < deadline:
+# A scripted Pause must be delivered before this run settles; the verifier owns the timeout.
+wait_for_pause = os.environ.get("FAKE_VERIFY_PAUSE_AFTER_RUNS") == str(runs)
+if started == 1 or wait_for_pause:
+    while wait_for_pause or time.monotonic() < deadline:
         control = command()
         if control == "abort":
             lost = 1
