@@ -76,6 +76,13 @@ SCENARIOS = {
         "auto_achievements": False,
     }, partial(drive.supervised, crash_at="settled", FARMER_TEST_PROGRESS="1"),
        judges.native_progress_parity, preset="hell-rotation.json"),
+    "tower-snapshot-parity": Scenario(300, {
+        "class": "thief", "danger": 30, "max_runs": 2, "auto_achievements": False,
+    }, partial(drive.direct, FARMER_TEST_TOWER_PARITY="1"), judges.tower_snapshot_parity),
+    "tower-one-run": Scenario(300, {
+        "stage": {"mode": "tower", "kind": "normal", "floor": 1},
+        "max_runs": 0, "auto_achievements": False,
+    }, partial(drive.direct, FARMER_TEST_TOWER_RUN="1"), judges.tower_one_run),
     "oaths": Scenario(180, _OATH_RUNS | {"danger": 30, "oaths": {"tough": 3, "elite": 1}},
                       partial(drive.supervised, FARMER_TEST_OATHS="1",
                               resume=_resume_settings("prontera", 30, {"hunt": 2})),

@@ -16,15 +16,31 @@ class LocationRotation(TypedDict):
     mode: Literal["rotation"]
 
 
-type LocationChoice = str | LocationRotation | None
+TowerKind = Literal["normal", "hel"]
+
+
+class LocationTower(TypedDict):
+    mode: Literal["tower"]
+    kind: TowerKind
+    floor: int
+
+
+type LocationChoice = str | LocationRotation | LocationTower | None
 
 
 def _decode_location(value: object) -> LocationChoice:
     if isinstance(value, dict) and value == {"mode": "rotation"}:
         return {"mode": "rotation"}
+    if isinstance(value, dict) and value.get("mode") == "tower":
+        kind, floor = value.get("kind"), value.get("floor")
+        if kind not in ("normal", "hel"):
+            raise ValueError('settings.location.kind must be "normal" or "hel" for Tower')
+        if value.keys() != {"mode", "kind", "floor"} or type(floor) is not int:
+            raise ValueError("settings.location for Tower needs mode, kind and an integer floor")
+        return {"mode": "tower", "kind": kind, "floor": 1 if kind == "hel" else floor}
     if value is None or (isinstance(value, str) and value.strip() and "\0" not in value):
         return value
-    raise ValueError('settings.location must be a location id, null for Automatic, or {"mode":"rotation"}')
+    raise ValueError("settings.location must be a location id, null for Automatic, or a rotation or Tower choice")
 
 MAINTENANCE_CONFIG_KEYS = {
     "upgrades": ("auto_upgrades", "auto_sage"),
@@ -84,13 +100,19 @@ class SessionSettings:
             switches[name] = enabled
         return cls(location, difficulty, oaths, wishlist, **switches)
 
+    @property
+    def tower(self) -> LocationTower | None:
+        location = self.location
+        return location if isinstance(location, dict) and location["mode"] == "tower" else None
+
     def maintenance(self) -> dict[str, bool]:
         return {name: getattr(self, name) for name in MAINTENANCE_CONFIG_KEYS}
 
     def config(self) -> dict:
         switches = {key: enabled for name, enabled in self.maintenance().items() for key in MAINTENANCE_CONFIG_KEYS[name]}
-        return {"stage": self.location or "", "danger": "auto" if self.difficulty is None else self.difficulty,
-                "oaths": self.oaths, "wishlist": self.wishlist,
+        tower = self.tower
+        return {"stage": self.location or "", "danger": "auto" if tower or self.difficulty is None else self.difficulty,
+                "oaths": {} if tower else self.oaths, "wishlist": self.wishlist,
                 "keep_unowned_legendaries": self.keep_unowned_legendaries, **switches}
 
 

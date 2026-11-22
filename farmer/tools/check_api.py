@@ -5,8 +5,8 @@ Usage: check_api.py [farmer.gd] [decompiled_src_dir]
 
 This is a maintenance aid, not a proof: it only checks that identifiers used as
 `Save.x`, `world.x`, `GameData.x`, `Equipment.x`, `Player.x`, `Menus.x`,
-`menus.x`, `raid.x`, `altars.x`, `Bot.x` exist as a func/var/const in the
-decompiled 0.2.3 tree. Engine/inherited members are whitelisted.
+`menus.x`, `raid.x`, `tower.x`, `RunSave.x`, `altars.x`, `Bot.x` exist as a func/var/const in
+the supplied decompiled game scripts. Engine/inherited members are whitelisted.
 """
 import re
 import sys
@@ -25,6 +25,8 @@ TARGETS = {
     "Menus": "menus.gd",
     "menus": "menus.gd",
     "raid": "mvp_raid.gd",
+    "tower": "tower_run.gd",
+    "RunSave": "run_save.gd",
     "altars": "altars.gd",
     "Bot": "bot.gd",
     "Potential": "potential.gd",
@@ -45,6 +47,8 @@ WHITELIST = {
     "Menus": set(ENGINE),
     "menus": set(ENGINE),
     "raid": set(ENGINE) | {"position", "name"},
+    "tower": set(ENGINE),
+    "RunSave": set(ENGINE),
     "altars": set(ENGINE) | {"position", "name"},
     "Bot": set(ENGINE),
     "Potential": set(ENGINE),

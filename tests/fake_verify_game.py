@@ -25,6 +25,10 @@ field_navigation = os.environ.get("FARMER_TEST_FIELD_NAVIGATION") == "1"
 field_charge = os.environ.get("FARMER_TEST_FIELD_CHARGE") == "1"
 mvp_drill = os.environ.get("FARMER_TEST_MVP_MECHANICS") == "1"
 verify_progress = os.environ.get("FARMER_TEST_PROGRESS") == "1"
+verify_tower_parity = os.environ.get("FARMER_TEST_TOWER_PARITY") == "1"
+verify_tower_run = os.environ.get("FARMER_TEST_TOWER_RUN") == "1"
+tower_evidence = {}
+tower_intent = {}
 if field_navigation:
     assert cfg["altar_policy"] == "map-wide"
 elif cfg.get("run_minutes") != 50 and not verify_progress:
@@ -93,7 +97,8 @@ def oath_points():
 
 
 def totals():
-    return {"started": started, "runs": runs, "lost": lost, "zeny": zeny, "wins": runs, "coins": 0, "ymir": 0}
+    return {"started": started, "runs": runs, "lost": lost, "zeny": zeny,
+            "wins": 0 if verify_tower_run else runs, "coins": 0, "ymir": 0}
 
 
 def status(phase, reason="", code=0, detail=""):
@@ -139,6 +144,8 @@ def status(phase, reason="", code=0, detail=""):
         if fault == "replayed-native-progress":
             after["history"] = [after["history"][0], *after["history"][:49]]
         data["progress_saved"] = after
+    if phase == "done" and tower_evidence:
+        data["tower_evidence"] = tower_evidence
     if fault == "no-transition":
         del data["last_transition"]
     if fault == "pause-starts-run" and phase == "paused" and seq > 2:
@@ -154,6 +161,8 @@ def log(message):
 def checkpoint(phase, row=None):
     payload = {"phase": phase, "session": session, "run_id": run_id, "totals": totals(), "row": row,
                "rotation_index": rotation_index}
+    if tower_intent:
+        payload["tower_intent"] = tower_intent
     os_.write_atomic(checkpoint_path, json.dumps(payload).encode())
 
 
@@ -273,6 +282,52 @@ def settle_progress(row):
     }
 
 
+
+def tower_fixture(id_, level, *, farmer=False, locked=False, xp=0.0, saved_at=1.0):
+    return {"id": id_, "class": "thief", "job": "Assassin", "level": level, "farmer": farmer, "locked": locked,
+            "xp_progress": xp, "saved_at": saved_at, "digest": f"{id_}-content"}
+
+
+def publish_tower_catalog(snapshots):
+    data = CATALOG | {"tower": {"open": True, "hel_unlocked": False, "hel_reason": "Clear floor 100 first.",
+                               "checkpoints": [1], "snapshots": [
+                                   {k: v for k, v in snap.items() if k != "digest"} | {"index": i}
+                                   for i, snap in enumerate(snapshots)
+                               ]}}
+    os_.write_atomic(profile / "farmer_catalog.json", json.dumps(data).encode())
+
+
+def settle_tower_parity(row):
+    assert cfg["danger"] == 30
+    manual = tower_evidence.setdefault("before", [
+        tower_fixture(f"manual-{i}", 20 + i, locked=i == 0) for i in range(10)
+    ])
+    row["player_level"] = 20 if started == 1 else 25
+    saved = tower_fixture(f"farmer-{started}", row["player_level"], farmer=True)
+    if fault == "kept-old-farmer-snapshot" and started == 2:
+        saved = tower_evidence["1"][-1]
+    if fault == "evicted-manual-snapshot":
+        manual = manual[1:]
+    builds = [*manual, saved]
+    tower_evidence[str(started)] = builds
+    publish_tower_catalog(builds)
+
+
+def settle_tower_run(row):
+    floor = cfg["stage"]["floor"]
+    assert cfg["stage"]["kind"] == "normal" and cfg["max_runs"] == 0
+    snapshot = tower_evidence["before"][-1]
+    row.update(stage="tower", danger=25, victory=False, finale_won=False, died=False, forced=True,
+               tower_floor_start=floor + (fault == "tower-wrong-floor"), tower_floor_best=floor + 1,
+               end_cause="finish", snapshot={key: snapshot[key] for key in ("id", "level", "job")})
+    before = {"loadouts": {"thief": {"weapon": "worn"}}, "potentials": {"worn": {"tier": 1}}, "pet": "poring"}
+    after = before | {"pet": "pupa"} if fault == "tower-preparation-changed" else before
+    tower_evidence.update(after=tower_evidence["before"][: -2 if fault == "tower-spent-two" else -1],
+                          preparation_before=before, preparation_after=after, autopilot_at_end=True,
+                          board_requests=int(fault == "tower-online"))
+    publish_tower_catalog(tower_evidence["after"])
+
+
 def settle(force, *, wait_at_keep=False):
     row = {"session": session, "run_id": run_id, "zeny_gain": 20, "kills": 15, "game_s": 7, "victory": True,
            "endless": cfg.get("endless"), "endless_mvps": 3, "kept": [], "force_reason": force,
@@ -323,6 +378,10 @@ def settle(force, *, wait_at_keep=False):
         settle_wishlist(row)
     if verify_progress:
         settle_progress(row)
+    if verify_tower_parity:
+        settle_tower_parity(row)
+    if verify_tower_run:
+        settle_tower_run(row)
     if hell_rotation:
         keep = "free=false slots=1" if fault == "paid-finale-keep" else "free=true slots=3"
         log(f"KEEP_DONE kept=0 offer=0 victory={str(row['victory']).lower()} {keep}")
@@ -418,9 +477,25 @@ if checkpoint_path.exists():
 started += 1
 advance_rotation()
 run_id = f"{session}-r{started}"
+if verify_tower_run:
+    tower_evidence["before"] = [
+        tower_fixture("locked", 99, locked=True),
+        tower_fixture("same-level-lower-xp", 30, xp=0.1, saved_at=40.0),
+        tower_fixture("same-level-same-xp-older", 30, xp=0.2, saved_at=10.0),
+        tower_fixture("selected", 30, xp=0.2, saved_at=20.0),
+    ]
+    tower_intent = {"snapshot_id": "selected", "run_id": run_id}
+    checkpoint("tower_intent")
+    log(f"TOWER_START run={run_id} kind=normal floor={cfg['stage']['floor']} snapshot=selected")
 checkpoint("run")
 crash("run")
 status("run")
+if verify_tower_run:
+    log(f"TOWER_FLOOR cleared={cfg['stage']['floor'] + 1}")
+    os_.write_atomic(profile / "farmer_command", b"finish\n")
+    assert command() == "finish"
+    settle("finish")
+    finish("tower_finished")
 deadline = time.monotonic() + 0.65 if cfg.get("run_minutes") == 0.2 else 0
 if started == 1 or (started == 2 and rotating()):
     while time.monotonic() < deadline:
@@ -505,7 +580,7 @@ if mvp_drill:
         settle("")
     finish("max_runs")
 settle("" if hell_rotation else "run_timeout")
-while (rotating() or verify_wishlist) and runs < cfg["max_runs"]:
+while (rotating() or verify_wishlist or verify_tower_parity) and runs < cfg["max_runs"]:
     started += 1
     advance_rotation()
     run_id = f"{session}-r{started}"

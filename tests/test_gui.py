@@ -245,7 +245,8 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     assert "Endless until the final boss" in description
     assert "50 min per run" in description
     model.select_preset(view.preset_index)
-    assert [row["label"] for row in view.locations] == ["Automatic"]
+    assert [row["label"] for row in view.locations] == ["Automatic", "Endless Tower", "Torre de Hel"]
+    assert [row["enabled"] for row in view.locations] == [True, False, False]
     assert view.difficulties == ["Automatic"]
 
     locations = [
@@ -255,7 +256,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     ]
     farm.platform.write_atomic(farm.profile / "farmer_catalog.json", json.dumps(CATALOG | {"locations": locations}).encode())
     view = model.poll()
-    assert [row["enabled"] for row in view.locations] == [True, True, False, True, True]
+    assert [row["enabled"] for row in view.locations] == [True, True, False, True, True, False, False]
     model.select_location("payon")
     assert model.poll().location_index == 0
     model.select_location("prontera")
@@ -721,7 +722,7 @@ def test_afk_location_picker_skips_locked_locations_on_keyboard(open_dashboard, 
     window = open_dashboard("afkTab")
     location = qml_item(window, "locationPicker")
     difficulty = qml_item(window, "difficultyPicker")
-    wait_until(lambda: location.property("count") == 5)
+    wait_until(lambda: location.property("count") == 7)
     assert location.property("currentText") == "Automatic"
     assert not difficulty.property("enabled")
     click(window, "locationPicker")
@@ -757,7 +758,7 @@ def test_window_remembers_and_sends_location_rotation_with_shared_difficulties(o
     window = open_dashboard("afkTab")
     location = qml_item(window, "locationPicker")
     difficulty = qml_item(window, "difficultyPicker")
-    wait_until(lambda: location.property("count") == 5)
+    wait_until(lambda: location.property("count") == 7)
     click(window, "locationPicker")
     click(window, "locationOption4")
     wait_until(lambda: location.property("currentText") == "All locations in turn" and difficulty.property("count") == 4)
@@ -780,6 +781,117 @@ def test_window_remembers_and_sends_location_rotation_with_shared_difficulties(o
     wait_until(lambda: len(requested_commands(farm)) == 2)
     _, resume = requested_commands(farm)
     assert resume == commands.Resume(start.settings)
+
+
+def tower_catalog_fixture(*, hel_unlocked=False):
+    snapshots = [
+        {"index": index, "id": job, "class": class_id, "job": job, "level": level, "xp_progress": xp,
+         "saved_at": 1767225600 + index * 86400, "locked": locked, "farmer": farmer}
+        for index, (class_id, job, level, xp, locked, farmer) in enumerate((
+            ("archer", "Locked Sniper", 90, 0.9, True, False),
+            ("swordman", "Lord Knight", 60, 0.8, False, False),
+            ("mage", "High Wizard", 59, 0.99, False, False),
+            ("acolyte", "High Priest", 60, 0.8, False, True),
+            ("merchant", "Whitesmith", 60, 0.7, False, False),
+        ))
+    ]
+    return CATALOG | {"tower": {"open": True, "hel_unlocked": hel_unlocked,
+                               "hel_reason": "" if hel_unlocked else "Clear floor 100 to unlock Torre de Hel.",
+                               "checkpoints": [1, 11, 51], "snapshots": snapshots}}
+
+
+def test_afk_tower_picker_shows_snapshot_replaces_rules_and_sends_floor(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+
+    latest = tower_catalog_fixture()
+    (farm.profile / "farmer_catalog.json").write_text(json.dumps(latest), encoding="utf-8")
+    farm.state()
+    window = open_dashboard("afkTab")
+    location = qml_item(window, "locationPicker")
+    wait_until(lambda: location.property("count") == 6)
+    click(window, "locationPicker")
+    hel = qml_item(window, "locationOption5")
+    assert not hel.property("enabled") and "Clear floor 100" in hel.property("text")
+    click(window, "locationOption4")
+    wait_until(lambda: qml_item(window, "towerRules").isVisible())
+    floor = qml_item(window, "towerFloorPicker")
+    assert location.property("currentText") == "Endless Tower"
+    assert floor.isVisible() and floor.property("count") == 3 and floor.property("currentText") == "1"
+    assert not qml_item(window, "difficultyPicker").isVisible()
+    assert not qml_item(window, "oathPanel").isVisible()
+    assert qml_item(window, "towerRules").property("text") == "The Tower sets Difficulty and Oaths."
+    assert qml_item(window, "towerSnapshotCaption").property("text") == "Starting spends this snapshot"
+    preview = qml_item(window, "towerSnapshot").property("text")
+    expected_day = datetime.fromtimestamp(latest["tower"]["snapshots"][3]["saved_at"]).strftime("%Y-%m-%d")
+    assert "High Priest" in preview and "Level 60" in preview and expected_day in preview
+    key_click(window, "towerFloorPicker", Qt.Key.Key_Down)
+    wait_until(lambda: floor.property("currentText") == "11")
+    click(window, "startButton")
+    wait_until(lambda: bool(requested_commands(farm)))
+    [start] = requested_commands(farm)
+    assert isinstance(start, commands.Start)
+    assert start.settings == commands.SessionSettings({"mode": "tower", "kind": "normal", "floor": 11})
+
+
+def test_afk_hel_picker_starts_on_floor_one(open_dashboard, farm):
+    (farm.profile / "farmer_catalog.json").write_text(json.dumps(tower_catalog_fixture(hel_unlocked=True)),
+                                                     encoding="utf-8")
+    farm.state()
+    window = open_dashboard("afkTab")
+    location = qml_item(window, "locationPicker")
+    wait_until(lambda: location.property("count") == 6)
+    click(window, "locationPicker")
+    click(window, "locationOption5")
+    wait_until(lambda: qml_item(window, "towerRules").isVisible())
+    assert location.property("currentText") == "Torre de Hel"
+    assert not qml_item(window, "towerFloorPicker").isVisible()
+    click(window, "startButton")
+    wait_until(lambda: bool(requested_commands(farm)))
+    [start] = requested_commands(farm)
+    assert isinstance(start, commands.Start)
+    assert start.settings.location == {"mode": "tower", "kind": "hel", "floor": 1}
+
+
+def test_remembered_tower_checkpoint_must_still_be_available(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    latest = tower_catalog_fixture()
+    catalog_file = farm.profile / "farmer_catalog.json"
+    catalog_file.write_text(json.dumps(latest), encoding="utf-8")
+    farm.state()
+    model = SessionModel(farm.platform)
+    model.select_location({"mode": "tower", "kind": "normal", "floor": 1})
+    model.select_tower_floor(11)
+
+    latest["tower"]["checkpoints"] = [1]
+    catalog_file.write_text(json.dumps(latest), encoding="utf-8")
+    model = SessionModel(farm.platform)
+    view = model.poll()
+    assert view.tower_selected and view.tower_floor_index == -1
+    assert "not an available Endless Tower checkpoint" in view.start_reason
+    assert model.start() is None
+    model.select_tower_floor(1)
+    assert model.poll().can_start
+
+
+def test_tower_runs_are_labelled_and_styled_from_the_journal(farm):
+    from midgard_farm.gui.model import SessionModel
+
+    farm.state()
+    append_event(farm.platform, "session", session_id="afk-tower", outcome="finished", reason="tower_finished")
+    rows = [
+        {"session": "afk-tower", "run_id": "run-1", "stage": "tower", "tower_floor_best": 25,
+         "tower_floor_start": 11, "end_cause": "death", "died": True, "forced": True, "finale_won": False},
+        {"session": "afk-tower", "run_id": "run-2", "stage": "hel", "tower_floor_best": 7,
+         "tower_floor_start": 1, "end_cause": "finish", "died": False, "finale_won": False},
+    ]
+    (farm.profile / "farmer_runs.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    view = SessionModel(farm.platform).poll()
+    assert view.history.rows[0].session_runs == view.session_runs == [
+        {"label": "Tower F25", "short": "Tower F25", "outcome": "loss"},
+        {"label": "Hel F7", "short": "Hel F7", "outcome": "aborted"},
+    ]
+    assert view.last_event == "Hel F7 · Run finished"
 
 
 def oath_catalog(farm):

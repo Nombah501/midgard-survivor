@@ -411,6 +411,80 @@ def native_progress_parity(run: Run, driven: Driven, status: dict) -> None:
     need(status.get("progress_saved") == after, "recovery changed the native progression a second time")
 
 
+def _tower_rank(snapshot: dict) -> tuple[int, float, float]:
+    return snapshot["level"], snapshot["xp_progress"], snapshot["saved_at"]
+
+
+def _tower_done(driven: Driven, status: dict) -> None:
+    if status.get("phase") == "failed":
+        raise VerificationFailure(f"{status.get('finish_reason')}: {status.get('last_error')}")
+    _exit(driven)
+    _done(status)
+
+
+def tower_snapshot_parity(run: Run, driven: Driven, status: dict) -> None:
+    _tower_done(driven, status)
+    rows = _journal(run.artifact("journal.jsonl"))
+    need(len(rows) == status["totals"]["runs"] == 2, "expected two settled D30 runs")
+    need(all(row["stage"] == "prontera" and row["danger"] == 30 for row in rows), "wrong D30 run choice")
+    evidence = status["tower_evidence"]
+    manual = evidence["before"]
+    need(len(manual) == 10 and sum(not snap["locked"] for snap in manual) == 9
+         and not any(snap["farmer"] for snap in manual), "wrong manual Tower fixture")
+    saved = []
+    for i, row in enumerate(rows, 1):
+        builds = evidence[str(i)]
+        need([snap for snap in builds if not snap["farmer"]] == manual, "manual Tower snapshots changed")
+        candidates = [snap for snap in builds if snap["farmer"]]
+        need(len(candidates) == 1, "expected exactly one farmer Tower snapshot after each run")
+        saved.append(candidates[0])
+        need(row["player_level"] >= 20, "ordinary D30 hero did not reach the native eligibility threshold")
+    need(saved[0]["level"] == rows[0]["player_level"], "the first run's snapshot has the wrong level")
+    need(saved[1]["id"] != saved[0]["id"] and saved[1]["level"] == rows[1]["player_level"]
+         and _tower_rank(saved[1]) > _tower_rank(saved[0]), "better run did not replace the farmer snapshot")
+    catalog = json.loads(run.artifact("catalog.json").read_bytes())["tower"]
+    need(catalog["open"] is True, "Tower catalog did not reflect unlock")
+    need([snap["id"] for snap in catalog["snapshots"] if snap["farmer"]] == [saved[1]["id"]],
+         "Tower catalog did not publish the replacement snapshot")
+
+
+def tower_one_run(run: Run, driven: Driven, status: dict) -> None:
+    _tower_done(driven, status)
+    need(status["finish_reason"] == "tower_finished", "wrong Tower session outcome")
+    totals = status["totals"]
+    rows = _journal(run.artifact("journal.jsonl"))
+    need(len(rows) == totals["started"] == totals["runs"] == 1 and totals["lost"] == totals["wins"] == 0,
+         "expected exactly one settled Tower run and no win")
+    row = rows[0]
+    chosen_floor = json.loads(run.artifact("json").read_bytes())["stage"]["floor"]
+    need(row["stage"] == "tower" and row["tower_floor_start"] == chosen_floor
+         and row["tower_floor_best"] >= chosen_floor + 1, "wrong Tower journal floors")
+    need(row["victory"] is row["finale_won"] is False and row["end_cause"] in {"death", "finish"}
+         and row["died"] is (row["end_cause"] == "death"), "Tower death/Finish was treated as a win")
+    if row["end_cause"] == "finish":
+        need(row["force_reason"] == "finish" and not (run.profile / "farmer_command").exists(),
+             "Tower did not consume the Finish command")
+    evidence = status["tower_evidence"]
+    before = evidence["before"]
+    chosen = max((snap for snap in before if not snap["locked"]), key=_tower_rank, default=None)
+    need(chosen and row["snapshot"] == {key: chosen[key] for key in ("id", "level", "job")},
+         "wrong Tower snapshot selected")
+    need(evidence["after"] == [snap for snap in before if snap["id"] != row["snapshot"]["id"]],
+         "did not consume exactly the selected snapshot")
+    prep_before, prep_after = evidence["preparation_before"], evidence["preparation_after"]
+    need(prep_before and prep_after, "missing Tower preparation evidence")
+    for field in prep_before.keys() | prep_after.keys():
+        if field != "free_points" and (field != "pet" or prep_before["pet"]):
+            need(prep_before.get(field) == prep_after.get(field), f"character preparation changed: {field}")
+    need(evidence["autopilot_at_end"] is True and evidence["board_requests"] == 0,
+         "online submission during Tower settlement")
+    _marker(run, f"TOWER_START run={row['run_id']} kind=normal floor={chosen_floor}")
+    _marker(run, f"TOWER_FLOOR cleared={row['tower_floor_best']}")
+    checkpoint = json.loads(run.artifact("checkpoint.json").read_bytes())
+    need(checkpoint["tower_intent"] == {"run_id": row["run_id"], "snapshot_id": row["snapshot"]["id"]},
+         "Tower intent was not retained through settlement")
+
+
 def invalid_rotation_difficulty(run: Run, driven: Driven, status: dict) -> None:
     locations = _unlocked_locations(run)
     need(locations[0]["min_difficulty"] == 1, "difficulty 1 is not valid for the first location")

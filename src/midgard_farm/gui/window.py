@@ -113,6 +113,10 @@ class _Backend(QObject):
             location = self._view.locations[index]["id"]
             self._enqueue(partial(self._model.select_location, location))
 
+    @Slot(int)
+    def selectTowerFloor(self, floor: int) -> None:
+        self._enqueue(partial(self._model.select_tower_floor, floor))
+
     @Slot(str)
     def selectDifficulty(self, level: str) -> None:
         self._enqueue(partial(self._model.select_difficulty, level))

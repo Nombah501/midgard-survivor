@@ -80,6 +80,8 @@ var active_oath_points := 0
 var next_arm_hint := ""
 var _rotating := false
 var _last_rotated_stage := ""
+var _tower_kind := ""
+var _tower_intent: Dictionary = {}
 
 var run_state: Dictionary = {}
 var last_run: Dictionary = {}
@@ -133,6 +135,11 @@ var _test_charge_enemy: Enemy
 var _test_mvp_mechanics := false
 var _test_mvp_enemy: Enemy
 var _test_mvp_waves: Array[Dictionary] = []
+var _test_tower_parity := false
+var _test_tower_run := false
+var _test_tower_board_requests := 0
+var _test_tower_finish_sent := false
+var _test_tower_evidence: Dictionary = {}
 
 var _potential_script = null
 var _vanilla_input_seen := false
@@ -190,6 +197,8 @@ func _ready() -> void:
 	_test_charge = _test_env("FIELD_CHARGE") == "1"
 	_test_mvp_mechanics = _test_env("MVP_MECHANICS") == "1"
 	_test_verify_wishlist = _test_env("WISHLIST") == "1"
+	_test_tower_parity = _test_env("TOWER_PARITY") == "1"
+	_test_tower_run = _test_env("TOWER_RUN") == "1"
 	_potential_script = load("res://scripts/core/potential.gd")
 	_load_arms()
 	_mark_transition("boot")
@@ -268,10 +277,15 @@ func _discover_world() -> void:
 
 func _on_world_ready() -> void:
 	if not _catalog_written:
+		if _test_tower_parity and not _test_seed_manual_tower_snapshots():
+			return
 		if not _write_catalog():
 			_fail_session("catalog_write_failed")
 			return
 		_catalog_written = true
+		if phase == "tower_recovered":
+			_finish("tower_finished")
+			return
 		if _test_env("CATALOG") == "1":
 			_test_catalog = _catalog_evidence()
 		if not _validate_run_choice():
@@ -294,12 +308,14 @@ func _apply_autopilot() -> void:
 	if world == null or not is_instance_valid(world):
 		return
 	world.autopilot = true
+	if world.menus != null and is_instance_valid(world.menus):
+		world.menus.auto_pick = true
+	if not _tower_kind.is_empty():
+		return # The native Tower controller gates speed per floor and forbids fast Hel.
 	# Own the engine clock: _frenzy_time_scale() returns early, so the game
 	# stops rewriting Engine.time_scale every frame.
 	world._mvp_slow = true
 	world.fast_now = true
-	if world.menus != null and is_instance_valid(world.menus):
-		world.menus.auto_pick = true
 	var want := maxf(1.0, float(cfg.get("speed", 4.0)))
 	if not is_equal_approx(Engine.time_scale, want):
 		Engine.time_scale = want
@@ -327,10 +343,18 @@ func _prepare_run() -> void:
 	if world == null or not is_instance_valid(world) or world.map == null:
 		next_action_ms = _now() + 500
 		return
-	if _goal_done() and bool(cfg.get("goal_stop", false)):
+	if _tower_kind.is_empty() and _goal_done() and bool(cfg.get("goal_stop", false)):
 		_finish("goal")
 		return
-	var target := _choose_target()
+	var choice: Dictionary = cfg["stage"] if not _tower_kind.is_empty() else {}
+	var tower_snapshot := _pick_tower_snapshot() if not choice.is_empty() else {}
+	if not choice.is_empty() and tower_snapshot.is_empty():
+		_fail_session("tower_no_snapshot", true, "No eligible unlocked Tower snapshot.")
+		return
+	var target := _choose_target() if choice.is_empty() else {
+		"stage": "hel" if _tower_kind == "hel" else "tower",
+		"danger": GameData.DANGER_HELL10, "class": tower_snapshot["class"],
+	}
 	if target.is_empty():
 		if not failed:
 			_finish("no_target")
@@ -348,7 +372,8 @@ func _prepare_run() -> void:
 		Save.set_setting("endless_auto_pick", true)
 		AutoPick.log_picks = true
 		_test_preparation["before"] = _preparation_snapshot(Save.data)
-	_apply_build_settings(active_class)
+	if choice.is_empty():
+		_apply_build_settings(active_class)
 	var run_id := "%s-r%d" % [session_id, runs_started + 1]
 	run_state = _snapshot_run_state()
 	run_state["run_id"] = run_id
@@ -378,7 +403,7 @@ func _prepare_run() -> void:
 	run_state["route_entered"] = false
 	_altar_seen.clear()
 	_altar_channel = {}
-	if cfg["karma_route"] == "valhalla":
+	if choice.is_empty() and cfg["karma_route"] == "valhalla":
 		run_state["reginleif_cards"] = int(Save.data.get("cards", {}).get("reginleif_card", 0))
 	_time_last = -1.0
 	_time_change_ms = _now()
@@ -391,30 +416,39 @@ func _prepare_run() -> void:
 	_direct_grid = null
 	_field_map_id = 0
 	_set_autopilot_flags(true)
-	world.set_stage(active_stage)
-	world.danger = active_danger
-	world.speed = clampi(int(cfg.get("game_speed", 3)), 1, 3)
-	Save.set_setting("onboarded", true)
-	# The game consumes even an empty override; never inherit the saved set.
-	world.oaths_next = cfg["oaths"] if active_danger == GameData.DANGER_MAX else {}
-	# 0.2.5 suppresses the finale on autopilot unless this meta is set.
-	if _want_endless() and not GameData.has_meta("finale_at"):
-		GameData.set_meta("finale_at", GameData.MORROC_FINALE.at)
-	if _test_blocked_portal:
-		GameData.set_meta("mvp_at", 2.0)
+	if choice.is_empty():
+		world.set_stage(active_stage)
+		world.danger = active_danger
+		world.speed = clampi(int(cfg.get("game_speed", 3)), 1, 3)
+		Save.set_setting("onboarded", true)
+		# The game consumes even an empty override; never inherit the saved set.
+		world.oaths_next = cfg["oaths"] if active_danger == GameData.DANGER_MAX else {}
+		# 0.2.5 suppresses the finale on autopilot unless this meta is set.
+		if _want_endless() and not GameData.has_meta("finale_at"):
+			GameData.set_meta("finale_at", GameData.MORROC_FINALE.at)
+		if _test_blocked_portal:
+			GameData.set_meta("mvp_at", 2.0)
 	# The native start resets this manual-run toggle; don't persist its reset.
 	var settings: Dictionary = Save.data.settings
 	var had_auto_pick := settings.has("endless_auto_pick")
 	var auto_pick = settings.get("endless_auto_pick")
-	world.start_run(active_class)
-	world.player.farmer_fell.connect(_on_player_fell)
-	if run_state.has("progress"):
+	var started := true
+	if choice.is_empty():
+		world.start_run(active_class)
+	else:
+		started = _launch_tower(tower_snapshot, 1 if _tower_kind == "hel" else int(choice["floor"]))
+	if started and run_state.has("progress"):
 		world.board.child_entered_tree.connect(_test_progress_board_request)
 	if had_auto_pick:
 		settings["endless_auto_pick"] = auto_pick
 	else:
 		settings.erase("endless_auto_pick")
-	if cfg["karma_route"] == "valhalla" and is_instance_valid(world.karma):
+	if not started:
+		return
+	if not choice.is_empty() and not _flush_profile_verified("tower_launch"):
+		return
+	world.player.farmer_fell.connect(_on_player_fell)
+	if choice.is_empty() and cfg["karma_route"] == "valhalla" and is_instance_valid(world.karma):
 		world.karma.path = "light"
 	active_oath_points = int(world.oath_points())
 	_test_raid_ability = {}
@@ -422,7 +456,8 @@ func _prepare_run() -> void:
 	_test_mvp_waves.clear()
 	_replace_player_input()
 	_apply_autopilot()
-	Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
+	if choice.is_empty():
+		Engine.time_scale = maxf(1.0, float(cfg.get("speed", 4.0)))
 	runs_started += 1
 	if _rotating:
 		_last_rotated_stage = active_stage
@@ -434,6 +469,52 @@ func _prepare_run() -> void:
 		return
 	_test_crash("run")
 	_write_status()
+	if not choice.is_empty():
+		_refresh_tower_catalog()
+
+
+func _launch_tower(snapshot: Dictionary, floor: int) -> bool:
+	var id: String = snapshot["id"]
+	run_state["tower_floor_start"] = floor
+	run_state["tower_floor_best"] = 0
+	run_state["snapshot"] = {"id": id, "job": snapshot["job"], "level": snapshot["level"]}
+	_tower_intent = {"snapshot_id": id, "run_id": run_state["run_id"]}
+	if not _write_checkpoint("tower_intent"):
+		return false
+	_test_crash("tower_intent")
+	# The native writer consumes by array index and flushes before creating the run.
+	var index := -1
+	var builds: Array = Save.tower_builds()
+	for i in builds.size():
+		var build: Dictionary = builds[i]
+		if _tower_snapshot_id(build) != id:
+			continue
+		if index != -1 or Save.build_locked(build) or not GameData.CLASSES.has(build.get("class")):
+			return _fail_tower_intent()
+		index = i
+	if index == -1:
+		return _fail_tower_intent()
+	if _test_tower_run:
+		var saved: Dictionary = Save._read(Save.PATH)
+		_test_tower_evidence["before"] = _tower_save_evidence(saved)
+		_test_tower_evidence["preparation_before"] = _preparation_snapshot(saved)
+		world.board.child_entered_tree.connect(_test_observe_tower_request)
+	world.oaths_next = null # Use the native Tower rules, including Hel's saved-oath exclusions.
+	world._mvp_slow = false
+	world._speed_applied = -1.0
+	world.start_tower(index, floor, _tower_kind == "hel")
+	if not world.running or world.tower == null or not is_instance_valid(world.player) \
+			or world.player.class_id != active_class or world.tower.floor != floor \
+			or (world.tower.hel != null) != (_tower_kind == "hel"):
+		return _fail_tower_intent()
+	_test_crash("tower_started")
+	_log("TOWER_START run=%s kind=%s floor=%d snapshot=%s" % [run_state["run_id"], _tower_kind, floor, id])
+	return true
+
+
+func _fail_tower_intent() -> bool:
+	_fail_session("tower_intent_unresolved", true, "The saved Tower launch cannot be reconciled. No second snapshot will be spent.")
+	return false
 
 
 func _set_autopilot_flags(on: bool) -> void:
@@ -450,6 +531,9 @@ func _set_autopilot_flags(on: bool) -> void:
 
 func _tick_run(now: int) -> void:
 	_observe_arena_timing(now)
+	if not _tower_intent.is_empty():
+		_tick_tower(now)
+		return
 	if _test_blocked_portal and _test_tick_blocked_portal():
 		return
 	_apply_autopilot()
@@ -488,10 +572,46 @@ func _tick_run(now: int) -> void:
 		run_state["run_mvps"] = int(world.run_mvps)
 		if bool(world.player.fell):
 			run_state["died"] = true
+		if _test_tower_parity and world.player.level >= GameData.TOWER_BUILD_MIN_LEVEL + (runs_started - 1) * 5:
+			_results_forced("tower_parity_fixture", now)
 		_check_watchdog(now)
 		_check_timeout(now)
 	if phase == "run" and not world.running:
 		_begin_settle(now)
+
+
+func _tick_tower(now: int) -> void:
+	var tower: TowerRun = world.tower
+	if tower == null:
+		_fail_tower_intent()
+		return
+	_apply_autopilot()
+	_replace_player_input()
+	if tower.best > int(run_state["tower_floor_best"]):
+		run_state["tower_floor_best"] = tower.best
+		_log("TOWER_FLOOR cleared=%d" % tower.best)
+	if not world.running:
+		_begin_settle(now)
+		return
+	run_state["kills"] = int(world.kills)
+	run_state["run_zeny"] = int(world.run_zeny)
+	run_state["run_mvps"] = int(world.run_mvps)
+	if world.raid.state == "won" and world.raid.in_arena():
+		world._pull_prizes()
+	var collecting := _tower_collecting_prizes()
+	if _finish_after_run == "finish" and not collecting:
+		_end_run_safe(false)
+	elif _test_tower_run and not _test_tower_finish_sent \
+			and tower.best >= int(run_state["tower_floor_start"]) + 1:
+		_test_tower_finish_sent = _atomic_write(COMMAND_PATH, "finish\n")
+
+
+func _tower_collecting_prizes() -> bool:
+	if world.raid.state != "won" or not world.raid.in_arena():
+		return false
+	# Naght holds chest pickup for longer than the return portal takes to open.
+	return _now() < world._chests_held or world._loot != null or not world.loot_queue.is_empty() \
+		or world.pickups.any(func(p): return p.kind in ["chest", "card"])
 
 
 func _observe_arena_timing(now: int) -> void:
@@ -708,7 +828,8 @@ func _end_run_safe(victory: bool) -> void:
 	if _test_verify_wishlist:
 		_test_seed_wishlist_offer()
 	world._end_run(victory)
-	_set_autopilot_flags(false)
+	if _tower_intent.is_empty():
+		_set_autopilot_flags(false)
 
 
 func _record_local_progress() -> void:
@@ -717,7 +838,7 @@ func _record_local_progress() -> void:
 		return
 	# Recovery only journals the settled result, never re-enters keep.
 	run_state["native_progress"] = run_id
-	var victory := bool(run_state.get("native_victory",
+	var victory := _tower_intent.is_empty() and bool(run_state.get("native_victory",
 		bool(world.endless) if run_state["died"] else run_state["victory"]))
 	var p = world.player
 	if p != null and not world.training and not p.tampered and not p.stats_plausible():
@@ -728,7 +849,7 @@ func _record_local_progress() -> void:
 	if altars_taken > 0:
 		Save.bump("altars", altars_taken)
 		Save.stat_max("altars_run", altars_taken)
-	if not world.training:
+	if not world.training and _tower_intent.is_empty():
 		var autopilot: bool = world.autopilot
 		var channel = world.channel
 		var chat = channel.world_chat if is_instance_valid(channel) else null
@@ -768,9 +889,14 @@ func _begin_settle(now: int) -> void:
 		if p != null and is_instance_valid(p):
 			died = bool(p.fell)
 		run_state["died"] = run_state.get("died", false) or died
+		if not _tower_intent.is_empty():
+			run_state["tower_floor_best"] = world.tower.best
+			run_state["end_cause"] = "death" if died else ("finish" if _finish_after_run == "finish" else "native_end")
+			if _test_tower_run:
+				_test_tower_evidence["autopilot_at_end"] = world.autopilot
 		# The native end resets Morroc's event; the finale kill increments this
 		# stat before settlement, independently of the regular MVP counter.
-		var finale_won := Save.stat("morroc_finale") > float(run_state["morroc_finale_before"])
+		var finale_won := _tower_intent.is_empty() and Save.stat("morroc_finale") > float(run_state["morroc_finale_before"])
 		if _test_valkyrie and not _test_raid_ability.is_empty():
 			_test_log_valkyrie(died)
 		if _test_mvp_mechanics and not _test_raid_ability.is_empty():
@@ -805,10 +931,11 @@ func _check_settle() -> void:
 	if world.menus != null and is_instance_valid(world.menus):
 		var mode := str(world.menus._mode)
 		if mode == "end":
+			_save_tower_snapshot()
 			phase = "keep"
 			_write_status()
 			return
-		if mode == "victory" and not bool(run_state["died"]):
+		if mode == "victory" and not bool(run_state["died"]) and _tower_intent.is_empty():
 			# We expected to settle but a victory choice is still open.
 			if _want_endless() and not _endless_exhausted():
 				run_state["endless_mvps"] = int(run_state.get("endless_mvps", 0)) + 1
@@ -972,7 +1099,7 @@ func _check_command(now: int) -> void:
 
 
 func _check_limits(now: int) -> void:
-	if _finish_after_run != "":
+	if _finish_after_run != "" or not _tower_kind.is_empty():
 		return
 	var max_minutes := float(cfg.get("max_minutes", 0.0))
 	if max_minutes > 0.0 and now - boot_ms >= int(max_minutes * 60000.0):
@@ -991,7 +1118,8 @@ func _request_finish(reason: String) -> void:
 	if phase == "run" and world.running:
 		run_state["forced"] = true
 		run_state["force_reason"] = reason
-		_end_run_safe(false)
+		if _tower_intent.is_empty():
+			_end_run_safe(false)
 	elif phase == "idle" or phase == "paused":
 		_finish(reason)
 
@@ -1059,6 +1187,8 @@ func steer(hero) -> Vector2:
 	if get_tree().paused:
 		return Vector2.ZERO
 	var raid: MvpRaid = world.raid
+	if world.tower != null:
+		return _steer_tower(hero, raid)
 	var move := _steer_movement(hero)
 	if raid.state == "fight" and is_instance_valid(raid.boss):
 		return _avoid_raid_hazards(hero, move, raid)
@@ -1070,7 +1200,68 @@ func steer(hero) -> Vector2:
 	return move
 
 
-func _avoid_field_hazards(hero: Player, preferred: Vector2) -> Vector2:
+func _steer_tower(hero: Player, raid: MvpRaid) -> Vector2:
+	if raid.state == "won" and raid.in_arena():
+		if _tower_collecting_prizes():
+			return Vector2.ZERO
+		var exit := raid.autopilot_goal(hero)
+		if exit != Vector3.INF:
+			var direct := (exit - hero.position) * Vector3(1.0, 0.0, 1.0)
+			if direct.length_squared() > 0.09:
+				return _steer_direct(hero.position, exit, direct)
+			return Vector2.ZERO
+	var preferred: Vector2 = world.autopilot_input()
+	if raid.state == "fight" and is_instance_valid(raid.boss):
+		if raid.epic != null and raid.epic.hel != null and raid.autopilot_goal(hero) == Vector3.INF:
+			var soul := _tower_soul_goal(hero, raid)
+			if soul != Vector3.INF:
+				preferred = _field_input(hero, soul)
+		return _avoid_raid_hazards(hero, preferred, raid)
+	if raid.in_arena():
+		return preferred
+	var tower: TowerRun = world.tower
+	if tower.hel != null and tower.state == "fight":
+		var fog = world.hell_late
+		var center: Vector3 = fog.fog_center if fog.fog_on else Vector3.INF
+		var safe_radius: float = fog.fog_radius - HAZARD_MARGIN if fog.fog_on else 0.0
+		var at := hero.position
+		var goal := Vector3.INF
+		var nearest := INF
+		for portal: Dictionary in tower.hel.portals:
+			if center != Vector3.INF and _flat_distance(portal.at, center) >= safe_radius:
+				continue
+			# Finish a channel already underway before choosing another portal.
+			var distance := _flat_distance(at, portal.at)
+			var rank := distance - float(portal.fill) * GameData.HEL_PORTAL_REACH
+			if rank < nearest:
+				nearest = rank
+				goal = portal.at
+		if goal != Vector3.INF:
+			preferred = Vector2.ZERO if _flat_distance(at, goal) < GameData.HEL_PORTAL_REACH - HAZARD_MARGIN \
+				else _steer_field(hero, world.map, goal)
+		return _avoid_field_hazards(hero, preferred, center, Vector3(0.0, safe_radius, 0.0))
+	return _avoid_field_hazards(hero, preferred)
+
+
+func _tower_soul_goal(hero: Player, raid: MvpRaid) -> Vector3:
+	var hel = raid.epic.hel
+	var best := Vector3.INF
+	var nearest := INF
+	for soul: Dictionary in hel._souls.values():
+		var along: Vector3 = (raid.boss.position - soul.at) * Vector3(1.0, 0.0, 1.0)
+		var distance := _flat_distance(hero.position, soul.at)
+		var travel := distance / maxf(1.0, hero.move_speed)
+		var intercept := minf(along.length(), travel * float(hel.cfg.soul_speed))
+		if intercept + raid.boss.radius + 0.8 >= along.length():
+			continue # Already too close to Naght to intercept.
+		if distance < nearest:
+			nearest = distance
+			best = soul.at + along.normalized() * intercept
+	return best
+
+
+func _avoid_field_hazards(hero: Player, preferred: Vector2, safe_center := Vector3.INF,
+		safe_bound := Vector3.ZERO) -> Vector2:
 	var at := hero.position
 	var look := clampf(hero.move_speed * 0.35, 2.5, 4.0)
 	var threats := PackedVector3Array()
@@ -1090,7 +1281,7 @@ func _avoid_field_hazards(hero: Player, preferred: Vector2) -> Vector2:
 					continue
 				var duration := FIELD_CHARGE_DURATION if brain._state == "windup" else brain._state_time
 				_add_dash_hazard(threats, at, foe, foe.position, brain._dash_dir, duration, look)
-	return _avoid_hazards(hero, preferred, threats, look)
+	return _avoid_hazards(hero, preferred, threats, look, null, safe_center, safe_bound)
 
 
 func _avoid_raid_hazards(hero: Player, preferred: Vector2, raid: MvpRaid) -> Vector2:
@@ -1127,6 +1318,11 @@ func _avoid_raid_hazards(hero: Player, preferred: Vector2, raid: MvpRaid) -> Vec
 					_add_spoke_hazards(threats, attack.at, attack.base, attack.ab.rifts, attack.ab.width, raid.radius)
 			"starfall":
 				preferred = _kite_starfall(hero, raid)
+	if raid.epic != null and raid.epic.hel != null:
+		var judge: Dictionary = raid.epic.hel._judge
+		if not judge.is_empty() and judge.marks.has(hero):
+			var safe_normal: Vector3 = -judge.n if judge.marks[hero].kind == "fire" else judge.n
+			return _avoid_hazards(hero, preferred, threats, look, raid, raid.center, safe_normal)
 	return _avoid_hazards(hero, preferred, threats, look, raid)
 
 
@@ -1164,17 +1360,17 @@ func _add_hazard(threats: PackedVector3Array, from: Vector3, to: Vector3, radius
 
 
 func _avoid_hazards(hero: Player, preferred: Vector2, threats: PackedVector3Array, look: float,
-		raid: MvpRaid = null) -> Vector2:
-	if threats.is_empty():
+		raid: MvpRaid = null, safe_center := Vector3.INF, safe_bound := Vector3.ZERO) -> Vector2:
+	if threats.is_empty() and safe_center == Vector3.INF:
 		return preferred
 	var at := hero.position
 	var map: RoMap = world.map
 	var intended := Vector3(preferred.x, 0.0, preferred.y) * look
-	var standing := _hazard_path_clearance(at, Vector3.ZERO, threats)
+	var standing := _hazard_path_clearance(at, Vector3.ZERO, threats, safe_center, safe_bound)
 	var escaping := standing < 0.0
-	if _hazard_path_clearance(at, intended, threats) >= 0.0 \
+	if _hazard_path_clearance(at, intended, threats, safe_center, safe_bound) >= 0.0 \
 			and (not escaping or (
-				_hazard_path_clearance(at, intended.limit_length(0.75), threats) > standing + 0.25
+				_hazard_path_clearance(at, intended.limit_length(0.75), threats, safe_center, safe_bound) > standing + 0.25
 				and not _hazard_step_blocked(map, at, at + intended, raid))):
 		return preferred
 	var best := Vector2.ZERO
@@ -1183,13 +1379,13 @@ func _avoid_hazards(hero: Player, preferred: Vector2, threats: PackedVector3Arra
 		var dir := Vector2.RIGHT.rotated(float(i) * TAU / 24.0)
 		var progress := 0.0
 		if escaping:
-			progress = _hazard_path_clearance(at, Vector3(dir.x, 0.0, dir.y) * 0.75, threats) - standing
+			progress = _hazard_path_clearance(at, Vector3(dir.x, 0.0, dir.y) * 0.75, threats, safe_center, safe_bound) - standing
 		for sample in 3:
 			var length := look * (1.0 - 0.35 * sample)
 			var step := Vector3(dir.x, 0.0, dir.y) * length
 			if _hazard_step_blocked(map, at, at + step, raid):
 				continue
-			var gap := _hazard_path_clearance(at, step, threats)
+			var gap := _hazard_path_clearance(at, step, threats, safe_center, safe_bound)
 			if standing >= 0.0 and gap < 0.0:
 				continue
 			# Safe endpoints alone can cause alternating moves without getting clear.
@@ -1213,10 +1409,17 @@ func _hazard_step_blocked(map: RoMap, at: Vector3, to: Vector3, raid: MvpRaid) -
 	return _field_line_blocked(map, at, to, Vector3.INF)
 
 
-func _hazard_path_clearance(at: Vector3, step: Vector3, threats: PackedVector3Array) -> float:
+func _hazard_path_clearance(at: Vector3, step: Vector3, threats: PackedVector3Array,
+		safe_center := Vector3.INF, safe_bound := Vector3.ZERO) -> float:
 	at.y = 0.0
 	var to := at + step
 	var gap := INF
+	if safe_center != Vector3.INF:
+		# Convex safe zone: a horizontal normal for Judgement, or a radius in y for fog.
+		var initial := _safe_zone_clearance(at, safe_center, safe_bound)
+		gap = _safe_zone_clearance(to, safe_center, safe_bound)
+		if initial >= 0.0:
+			gap = minf(initial, gap)
 	for i in range(0, threats.size(), 3):
 		var start := threats[i]
 		var end := threats[i + 1]
@@ -1236,6 +1439,12 @@ func _hazard_path_clearance(at: Vector3, step: Vector3, threats: PackedVector3Ar
 					finish = -radius
 		gap = minf(gap, finish)
 	return gap
+
+
+func _safe_zone_clearance(at: Vector3, center: Vector3, bound: Vector3) -> float:
+	if bound.y > 0.0:
+		return bound.y - _flat_distance(at, center)
+	return (at - center).dot(bound) - HAZARD_MARGIN
 
 
 func _hazard_clearance(point: Vector3, start: Vector3, end: Vector3, radius: float) -> float:
@@ -2111,6 +2320,10 @@ func _do_keep() -> void:
 	_record_local_progress()
 	if not _flush_profile_verified("keep"):
 		return
+	if _test_tower_parity:
+		_test_tower_evidence[str(runs_started)] = _tower_save_evidence(Save._read(Save.PATH))
+	if run_state.has("tower_snapshot_saved") and not _refresh_tower_catalog():
+		return
 	if run_state.has("progress"):
 		world.board.child_entered_tree.disconnect(_test_progress_board_request)
 		run_state["progress"]["after"] = _progress_snapshot(Save._read(Save.PATH))
@@ -2464,6 +2677,10 @@ func _auto_prune() -> void:
 
 func _validate_run_choice() -> bool:
 	var location = cfg.get("stage")
+	_tower_kind = ""
+	if location is Dictionary and location.get("mode") == "tower":
+		_rotating = false
+		return _validate_tower_choice(location)
 	_rotating = (location is Dictionary and location.size() == 1
 		and location.get("mode") is String and location["mode"] == "rotation")
 	if not _rotating:
@@ -2503,6 +2720,27 @@ func _validate_run_choice() -> bool:
 		if not (rank is int or rank is float) or rank < 1 or rank > oath.pts.size() or rank != floorf(float(rank)):
 			_fail_session("invalid_oath", true, "Oath '%s' has no rank %s." % [id, str(rank)])
 			return false
+	return true
+
+
+func _validate_tower_choice(choice: Dictionary) -> bool:
+	var kind = choice.get("kind")
+	if kind not in ["normal", "hel"] or choice.size() != 3 or not choice.has("floor"):
+		_fail_session("invalid_location", true, "Tower requires a kind and a start floor.")
+		return false
+	if not Save.tower_open():
+		_fail_session("tower_closed", true, "Endless Tower is not open in this profile.")
+		return false
+	if kind == "hel":
+		if not Save.hel_open():
+			_fail_session("tower_hel_locked", true, _tower_hel_reason())
+			return false
+	else:
+		var f = choice["floor"]
+		if not (f is int or f is float) or not Save.tower_checkpoints().has(int(f)) or float(f) != floorf(float(f)):
+			_fail_session("tower_invalid_floor", true, "Tower start floor %s is not an unlocked checkpoint." % str(f))
+			return false
+	_tower_kind = kind
 	return true
 
 
@@ -2939,6 +3177,9 @@ func _complete_run(now: int) -> void:
 	# Refresh the pending result after maintenance before it goes to the journal.
 	if not _record_run():
 		return
+	if not _tower_intent.is_empty():
+		_finish("tower_finished")
+		return
 	if _finish_after_run == "finish":
 		_finish("finish")
 		return
@@ -2971,7 +3212,7 @@ func _account_run(r: Dictionary, append_log: bool) -> bool:
 	runs_done += 1
 	if bool(r.get("victory", false)):
 		wins += 1
-	else:
+	elif bool(r.get("died", true)) or not r.has("tower_floor_start"):
 		losses += 1
 	total_zeny += int(r.get("zeny_gain", 0))
 	total_kills += int(r.get("kills", 0))
@@ -2981,7 +3222,7 @@ func _account_run(r: Dictionary, append_log: bool) -> bool:
 		total_materials[str(k)] = int(total_materials.get(str(k), 0)) + int(mats[k])
 	total_coins += int(r.get("coins_gain", 0))
 	total_ymir += int(r.get("ymir_gain", 0))
-	if append_log:
+	if append_log and not r.has("tower_floor_start"):
 		_update_arm(r)
 	return true
 
@@ -3004,6 +3245,7 @@ func _write_checkpoint(stage: String, pending: Dictionary = {}) -> bool:
 		"started_unix": session_started_unix,
 		"phase": stage,
 		"run_id": str(run_state.get("run_id", "")),
+		"tower_intent": _tower_intent,
 		"target": {"stage": active_stage, "danger": active_danger, "class": active_class, "oath_points": active_oath_points},
 		"last_rotated_stage": _last_rotated_stage,
 		"totals": _totals(),
@@ -3058,7 +3300,29 @@ func _restore_checkpoint() -> bool:
 	active_oath_points = int(target.get("oath_points", 0))
 	active_class = str(target.get("class", ""))
 	var run_id := str(cp.get("run_id", ""))
-	match str(cp.get("phase", "")):
+	var boundary := str(cp.get("phase", ""))
+	var intent = cp.get("tower_intent", {})
+	if intent is Dictionary and not intent.is_empty():
+		_tower_intent = intent
+		run_state = cp.get("pre_run", {}) if cp.get("pre_run") is Dictionary else {}
+		if run_id.is_empty() or intent.get("run_id") != run_id or str(intent.get("snapshot_id", "")).is_empty():
+			return _fail_tower_intent()
+		if boundary == "settled":
+			var result: Dictionary = cp["result"]
+			if result.get("run_id") != run_id or not result.has("tower_floor_start") \
+					or result.get("snapshot", {}).get("id") != intent["snapshot_id"]:
+				return _fail_tower_intent()
+			if not _account_run(result, not _journal_has(run_id)):
+				return false
+		elif boundary != "idle" or not _journal_has(run_id):
+			# Native RunSave does not serialize Tower. Only a settled result proves
+			# the run is recoverable; a missing snapshot doesn't prove settlement.
+			return _fail_tower_intent()
+		phase = "tower_recovered"
+		return _write_checkpoint("idle")
+	if boundary == "tower_intent" or active_stage in ["tower", "hel"]:
+		return _fail_tower_intent()
+	match boundary:
 		"run":
 			# ADR 0001: a run that crashed before settlement is lost, not resumed.
 			runs_lost += 1
@@ -3617,7 +3881,10 @@ func _build_result() -> Dictionary:
 	}
 	if run_state.has("progress"):
 		result["progress"] = run_state["progress"]
-	if cfg["karma_route"] == "valhalla":
+	if run_state.has("tower_floor_start"):
+		for key in ["tower_floor_start", "tower_floor_best", "end_cause", "snapshot"]:
+			result[key] = run_state.get(key)
+	elif cfg["karma_route"] == "valhalla":
 		result["valkyrie_kills"] = int(run_state.get("valkyrie_kills", 0))
 		result["reginleif_cards_gain"] = int(Save.data.get("cards", {}).get("reginleif_card", 0)) \
 				- int(run_state.get("reginleif_cards", 0))
@@ -3874,6 +4141,8 @@ func _write_status() -> void:
 		data["wishlist_evidence"] = _test_wishlist_runs
 	if phase == "done" and _test_env("PROGRESS") == "1":
 		data["progress_saved"] = _progress_snapshot(Save._read(Save.PATH))
+	if not _test_tower_evidence.is_empty():
+		data["tower_evidence"] = _test_tower_evidence
 	_atomic_write(STATUS_PATH, JSON.stringify(data))
 
 
@@ -3928,7 +4197,158 @@ func _write_catalog() -> bool:
 		"schema": 1, "written_at": Time.get_unix_time_from_system(),
 		"max_difficulty": GameData.DANGER_MAX, "unlocked_max_difficulty": unlocked_max,
 		"locations": locations, "oaths": oaths, "legendaries": legendaries, "owned_item_ids": owned.keys(),
+		"tower": _tower_catalog(),
 	}))
+
+
+func _refresh_tower_catalog() -> bool:
+	if _write_catalog():
+		return true
+	_fail_session("catalog_write_failed")
+	return false
+
+
+func _tower_hel_reason() -> String:
+	if Save.hel_open():
+		return ""
+	if not Save.hel_earned():
+		return "Clear Endless Tower floor %d to unlock Torre de Hel." % GameData.TOWER_FLOORS
+	return "Torre de Hel is not yet released."
+
+
+func _tower_catalog() -> Dictionary:
+	var snapshots: Array = []
+	var builds: Array = Save.tower_builds()
+	for i in builds.size():
+		if _valid_tower_build(builds[i]):
+			snapshots.append(_tower_snapshot_entry(builds[i], i))
+	return {
+		"open": Save.tower_open(), "hel_unlocked": Save.hel_open(), "hel_reason": _tower_hel_reason(),
+		"checkpoints": Save.tower_checkpoints(), "snapshots": snapshots,
+	}
+
+
+func _valid_tower_build(build: Variant) -> bool:
+	return build is Dictionary and GameData.CLASSES.has(build.get("class")) and int(build.get("level", 0)) > 0
+
+
+func _tower_snapshot_id(build: Dictionary) -> String:
+	return JSON.stringify([
+		str(build.get("class", "")), bool(build.get("job2", false)), int(build.get("job_path", 0)),
+		str(build.get("name", "")), int(build.get("level", 0)), float(build.get("xp", 0.0)),
+		str(build.get("saved", "")),
+	]).sha256_text()
+
+
+func _tower_snapshot_entry(build: Dictionary, index: int) -> Dictionary:
+	# Native snapshots store local ISO datetime without an offset.
+	var saved := str(build.get("saved", ""))
+	var saved_at := 0.0
+	if not saved.is_empty():
+		saved_at = float(Time.get_unix_time_from_datetime_string(saved)) - float(Time.get_time_zone_from_system().bias) * 60.0
+	var cid: String = build["class"]
+	return {
+		"index": index, "id": _tower_snapshot_id(build), "class": cid,
+		"job": str(build.get("name", GameData.CLASSES[cid].get("name", cid))),
+		"level": int(build["level"]), "xp_progress": _tower_xp_progress(build), "saved_at": maxf(0.0, saved_at),
+		"locked": Save.build_locked(build), "farmer": build.has("farmer_run_id"),
+	}
+
+
+func _tower_xp_progress(build: Dictionary) -> float:
+	return clampf(float(build.get("xp", 0.0)) / maxf(1.0, float(build.get("xp_need", 1.0))), 0.0, 1.0)
+
+
+func _tower_build_better(a: Dictionary, b: Dictionary) -> bool:
+	if int(a["level"]) != int(b["level"]):
+		return int(a["level"]) > int(b["level"])
+	var xp_a := _tower_xp_progress(a)
+	var xp_b := _tower_xp_progress(b)
+	if xp_a != xp_b:
+		return xp_a > xp_b
+	return str(a.get("saved", "")) > str(b.get("saved", ""))
+
+
+func _pick_tower_snapshot() -> Dictionary:
+	var best: Dictionary = {}
+	var index := -1
+	var builds: Array = Save.tower_builds()
+	for i in builds.size():
+		var build = builds[i]
+		if _valid_tower_build(build) and not Save.build_locked(build) \
+				and (best.is_empty() or _tower_build_better(build, best)):
+			best = build
+			index = i
+	return {} if index == -1 else _tower_snapshot_entry(best, index)
+
+
+func _save_tower_snapshot() -> void:
+	var hero: Player = world.player
+	if not is_instance_valid(hero) or world.tower != null or world.training or hero.has_meta("tower_snap") \
+			or hero.level < GameData.TOWER_BUILD_MIN_LEVEL or not (Save.tower_open() or Save.tower_ready()):
+		return
+	var builds: Array = Save.tower_builds()
+	var farmer_index := -1
+	var farmer_locked := false
+	var manual_unlocked := 0
+	for i in builds.size():
+		var build: Dictionary = builds[i]
+		if build.has("farmer_run_id"):
+			if build["farmer_run_id"] == run_state["run_id"]:
+				return
+			farmer_locked = farmer_locked or Save.build_locked(build)
+			farmer_index = i
+		elif not Save.build_locked(build):
+			manual_unlocked += 1
+	if manual_unlocked >= Save.TOWER_BUILDS_MAX:
+		_log("TOWER_SNAPSHOT_SKIPPED full")
+		return
+	# Do not replace a snapshot the Operator explicitly protected.
+	if farmer_locked:
+		return
+	var snap := RunSave.hero_snapshot(world)
+	if farmer_index != -1:
+		if not _tower_build_better(snap, builds[farmer_index]):
+			return
+		builds.remove_at(farmer_index)
+	snap["farmer_run_id"] = run_state["run_id"]
+	hero.set_meta("tower_snap", snap)
+	hero.set_meta("tower_saved", [true])
+	Save.add_tower_build(snap)
+	run_state["tower_snapshot_saved"] = true
+	_log("TOWER_SNAPSHOT_SAVED run=%s level=%d replaced=%s" % [
+		run_state["run_id"], hero.level, str(farmer_index != -1)])
+
+
+func _test_seed_manual_tower_snapshots() -> bool:
+	# Fill all but one unlocked slot in this disposable sandbox, plus a locked entry.
+	var builds: Array = Save.tower_builds()
+	builds.clear()
+	for i in Save.TOWER_BUILDS_MAX:
+		Save.add_tower_build({
+			"class": "swordsman", "name": "Manual fixture", "level": 20 + i,
+			"saved": "2026-01-01T00:00:00", "locked": i == 0, "label": "manual-%d" % i,
+		})
+	if not _flush_profile_verified("tower_fixture"):
+		return false
+	_test_tower_evidence["before"] = _tower_save_evidence(Save._read(Save.PATH))
+	return true
+
+
+func _tower_save_evidence(profile: Dictionary) -> Array:
+	var builds: Array = profile.get("tower", {}).get("builds", [])
+	var out: Array = []
+	for i in builds.size():
+		var entry := _tower_snapshot_entry(builds[i], i)
+		entry.erase("index")
+		entry["digest"] = JSON.stringify(builds[i]).sha256_text()
+		out.append(entry)
+	return out
+
+
+func _test_observe_tower_request(child: Node) -> void:
+	if child is HTTPRequest and not world.running:
+		_test_tower_board_requests += 1
 
 
 func _catalog_evidence() -> Dictionary:
@@ -4052,6 +4472,13 @@ func _finish(reason: String) -> void:
 	exit_code = 0
 	if not _flush_profile_verified("finish"):
 		return
+	if not _tower_intent.is_empty() and not _refresh_tower_catalog():
+		return
+	if _test_tower_run and not _tower_intent.is_empty():
+		var saved: Dictionary = Save._read(Save.PATH)
+		_test_tower_evidence["after"] = _tower_save_evidence(saved)
+		_test_tower_evidence["preparation_after"] = _preparation_snapshot(saved)
+		_test_tower_evidence["board_requests"] = _test_tower_board_requests
 	if _test_preparation.has("before"):
 		_test_preparation["after"] = _preparation_snapshot(Save._read(Save.PATH))
 	if _test_oaths.has("before"):

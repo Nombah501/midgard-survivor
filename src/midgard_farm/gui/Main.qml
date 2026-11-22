@@ -205,6 +205,7 @@ ApplicationWindow {
 
     component StoneCombo: ComboBox {
         id: pick
+        property int minimumPopupWidth: 0
         Layout.fillWidth: true
         Layout.minimumWidth: 0
         leftPadding: 12
@@ -239,7 +240,7 @@ ApplicationWindow {
             highlighted: pick.highlightedIndex === index
         }
         popup: Popup {
-            width: pick.width
+            width: Math.max(pick.width, pick.minimumPopupWidth)
             topMargin: 8
             bottomMargin: 8
             padding: 1
@@ -731,6 +732,7 @@ ApplicationWindow {
                                         Accessible.name: characterLabel.text
                                         model: shell.session.characters
                                         currentIndex: shell.session.character_index
+                                        displayText: shell.session.tower_selected ? qsTr("From Tower snapshot") : currentText
                                         enabled: shell.session.can_pick_character
                                         onActivated: index => shell.backend.selectCharacter(index)
                                     }
@@ -762,14 +764,18 @@ ApplicationWindow {
                                         textRole: "label"
                                         currentIndex: shell.session.location_index
                                         displayText: currentIndex < 0 ? qsTr("Saved location unavailable") : currentText
-                                        enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
+                                        enabled: shell.session.can_pick_location && (count > 1 || currentIndex < 0)
+                                        minimumPopupWidth: 420
 
                                         delegate: PickOption {
                                             required property int index
                                             required property var modelData
                                             objectName: "locationOption" + index
                                             width: ListView.view.width
-                                            text: enabled ? modelData.label : qsTr("%1 (locked)").arg(modelData.label)
+                                            text: enabled ? modelData.label : modelData.reason
+                                                ? qsTr("%1 — %2").arg(modelData.label).arg(modelData.reason)
+                                                : qsTr("%1 (locked)").arg(modelData.label)
+                                            Accessible.description: modelData.reason || ""
                                             enabled: modelData.enabled
                                             highlighted: locationPicker.highlightedIndex === index
                                         }
@@ -804,6 +810,7 @@ ApplicationWindow {
                                 ColumnLayout {
                                     Layout.fillWidth: true
                                     Layout.minimumWidth: 0
+                                    visible: !shell.session.tower_selected
                                     spacing: 4
                                     Caption { id: difficultyLabel; text: qsTr("Difficulty") }
                                     StoneCombo {
@@ -815,6 +822,47 @@ ApplicationWindow {
                                         enabled: shell.session.can_pick_run_choice && (count > 1 || currentIndex < 0)
                                         onActivated: index => shell.backend.selectDifficulty(textAt(index))
                                     }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    visible: shell.session.tower_normal
+                                    spacing: 4
+                                    Caption { id: towerFloorLabel; text: qsTr("Start floor") }
+                                    StoneCombo {
+                                        objectName: "towerFloorPicker"
+                                        Accessible.name: towerFloorLabel.text
+                                        model: shell.session.tower_floors
+                                        currentIndex: shell.session.tower_floor_index
+                                        displayText: currentIndex < 0 ? qsTr("Saved floor unavailable") : currentText
+                                        enabled: shell.session.can_pick_location && count > 0 && (count > 1 || currentIndex < 0)
+                                        onActivated: index => shell.backend.selectTowerFloor(Number(textAt(index)))
+                                    }
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 0
+                                visible: shell.session.tower_selected
+                                spacing: 4
+                                Caption {
+                                    objectName: "towerRules"
+                                    Layout.fillWidth: true
+                                    text: qsTr("The Tower sets Difficulty and Oaths.")
+                                    wrapMode: Text.Wrap
+                                }
+                                Caption {
+                                    objectName: "towerSnapshotCaption"
+                                    Layout.fillWidth: true
+                                    visible: shell.session.tower_snapshot.length > 0
+                                    text: qsTr("Starting spends this snapshot")
+                                    wrapMode: Text.Wrap
+                                }
+                                BodyText {
+                                    objectName: "towerSnapshot"
+                                    visible: text.length > 0
+                                    text: shell.session.tower_snapshot
                                 }
                             }
 

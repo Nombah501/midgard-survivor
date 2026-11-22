@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from ..platform import NetworkIsolationError, Platform
-from . import commands, farmer_patch, game_update
+from . import catalog, commands, farmer_patch, game_update
 from .commands import Start
 from .history import append_event, read_history, session_summary
 from .launch import SHUTDOWN_GRACE_SECONDS, GameBusy, request_finish, run_attempt
@@ -28,7 +28,10 @@ from .run_progress import (
 )
 from .state import StateKind, StateReporter, read_state
 
-_INVALID_RUN_CHOICES = {"invalid_location", "invalid_difficulty", "invalid_oath"}
+_INVALID_RUN_CHOICES = {
+    "invalid_location", "invalid_difficulty", "invalid_oath",
+    "tower_closed", "tower_hel_locked", "tower_invalid_floor", "tower_no_snapshot", "tower_intent_unresolved",
+}
 FATAL_REASONS = {"cfg_invalid", "checkpoint_corrupt", "flush_failed"} | _INVALID_RUN_CHOICES
 POLL = 0.2
 UPDATE_POLL = 1.0
@@ -269,6 +272,11 @@ class Supervisor:
                 if isinstance(gate, game_update.Wait) and self._update_quarantine is not None:
                     refuse_command(self.os, self.state, path, "start", self._update_quarantine["reason"])
                     continue
+                if tower := command.settings.tower:
+                    latest = catalog.tower_catalog(catalog.read_latest(self.os))
+                    if reason := catalog.tower_blocker(latest, tower["kind"], tower["floor"]):
+                        refuse_command(self.os, self.state, path, "start", reason)
+                        continue
                 if self._before_start():
                     return
                 session = _Session(f"{self.session_prefix}-{uuid.uuid4().hex}", command, path.name, time.time())
@@ -296,6 +304,9 @@ class Supervisor:
                        *, live: bool) -> None:
         start = session.start
         if isinstance(command, commands.Resume):
+            if start.settings.tower != command.settings.tower:
+                refuse_command(self.os, self.state, path, "resume", "Finish this session and Start to change a Tower choice.")
+                return
             start = replace(start, settings=command.settings)
             if live:
                 config_path = self.profile / "farmer.cfg"

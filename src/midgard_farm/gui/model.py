@@ -162,7 +162,8 @@ def _catalog_refresh(latest: dict[str, Any] | None) -> str:
     return ""
 
 
-def _locations(latest: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _locations(latest: dict[str, Any] | None, tower: catalog.TowerCatalog | None,
+               choice: commands.LocationTower | None, *, paused: bool) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = [{"id": None, "label": "Automatic", "enabled": True}]
     for item in latest["locations"] if latest is not None else ():
         row = _mapping(item)
@@ -176,6 +177,14 @@ def _locations(latest: dict[str, Any] | None) -> list[dict[str, Any]]:
         options.append({"id": {"mode": "rotation"}, "label": "All locations in turn", "enabled": True,
                         "min_difficulty": max((row["min_difficulty"] for row in unlocked), default=1),
                         "max_difficulty": min((row["max_difficulty"] for row in unlocked), default=0)})
+    variants: tuple[tuple[commands.TowerKind, str], ...] = (("normal", "Endless Tower"), ("hel", "Torre de Hel"))
+    for kind, label in variants:
+        floor = choice["floor"] if choice and choice["kind"] == kind else (
+            tower.checkpoints[0] if kind == "normal" and tower and tower.checkpoints else 1
+        )
+        reason = "Finish this session and Start to change a Tower choice." if paused else catalog.tower_blocker(tower, kind)
+        options.append({"id": {"mode": "tower", "kind": kind, "floor": floor}, "label": label,
+                        "enabled": not reason, "reason": reason})
     return options
 
 
@@ -257,6 +266,13 @@ def _target_text(stage: object, danger: object, names: dict[str, str], oath_poin
     return " · ".join(parts)
 
 
+def _tower_run_label(stage: object, floor: object) -> str:
+    if stage not in ("tower", "hel"):
+        return ""
+    label = "Tower" if stage == "tower" else "Hel"
+    return f"{label} F{floor}" if type(floor) is int and floor >= 0 else label
+
+
 def _run_segment(stage: object, outcome: str, names: dict[str, str]) -> dict[str, str]:
     key = _text(stage)
     label = names.get(key, "").strip() or _label(key).strip() or "Unknown location"
@@ -266,9 +282,18 @@ def _run_segment(stage: object, outcome: str, names: dict[str, str]) -> dict[str
 
 
 def _settled_band(rows: list[dict[str, Any]], names: dict[str, str]) -> list[dict[str, str]]:
-    return [_run_segment(row.get("stage"), "win" if row.get("finale_won") is True
-                         else "aborted" if row.get("forced") is True else "loss", names)
-            for row in rows]
+    band = []
+    for row in rows:
+        stage = row.get("stage")
+        if label := _tower_run_label(stage, row.get("tower_floor_best")):
+            cause = row.get("end_cause")
+            died = cause == "death" or (cause != "finish" and row.get("died") is True)
+            outcome = "loss" if died else "aborted"
+            band.append({"label": label, "short": label, "outcome": outcome})
+        else:
+            band.append(_run_segment(stage, "win" if row.get("finale_won") is True
+                                     else "aborted" if row.get("forced") is True else "loss", names))
+    return band
 
 
 def _session_measurements(rows: list[dict[str, Any]], band: list[dict[str, str]],
@@ -512,6 +537,12 @@ class SessionView:
     preset_index: int = -1
     locations: list[dict[str, Any]] = field(default_factory=list)
     location_index: int = 0
+    can_pick_location: bool = False
+    tower_selected: bool = False
+    tower_normal: bool = False
+    tower_floors: list[str] = field(default_factory=list)
+    tower_floor_index: int = -1
+    tower_snapshot: str = ""
     difficulties: list[str] = field(default_factory=list)
     difficulty_index: int = 0
     can_pick_run_choice: bool = False
@@ -584,8 +615,19 @@ class SessionModel:
     def poll(self) -> SessionView:
         state = read_state(self._os)
         paused = state.farmer_phase == "paused"
+        missing = state.kind is StateKind.STALE
+        busy = not missing and (state.session_id is not None or state.kind is StateKind.ACTIVE)
+        saved = _object(self._os, self._os.app_data_dir() / "session.json") if busy and state.session_id else {}
+        active_tower = None
+        if state.session_id and saved.get("id") == state.session_id:
+            try:
+                active_tower = commands.SessionSettings.decode(_mapping(saved.get("start")).get("settings")).tower
+            except ValueError:
+                pass
         latest = catalog.read_latest(self._os)
-        locations = _locations(latest)
+        tower = catalog.tower_catalog(latest)
+        tower_choice = active_tower or self._session_settings.tower
+        locations = _locations(latest, tower, tower_choice, paused=paused)
         names = self._stages | {row["id"]: row["label"] for row in locations if isinstance(row["id"], str)}
         item_names = _legendary_names(latest)
         try:
@@ -596,15 +638,31 @@ class SessionModel:
         now = time.time()
         today = datetime.fromtimestamp(now).date()
         self._refresh_history(names, item_names, today)
-        location = self._session_settings.location
+        location = tower_choice or self._session_settings.location
         level = self._session_settings.difficulty
-        location_index = next((i for i, row in enumerate(locations) if row["enabled"] and row["id"] == location),
+        location_index = next((i for i, row in enumerate(locations)
+                               if row["id"] == location and (row["enabled"] or tower_choice)),
                               -1 if paused else 0)
-        difficulties = _difficulties(locations[max(0, location_index)])
+        difficulties = [] if tower_choice else _difficulties(locations[max(0, location_index)])
         difficulty_index = (difficulties.index(str(level)) if str(level) in difficulties
                             else (-1 if paused and level is not None else 0))
         oath_difficulty = level == 30 and difficulty_index > 0
-        oaths = _oath_rows(latest, self._session_settings.oaths)
+        oaths = [] if tower_choice else _oath_rows(latest, self._session_settings.oaths)
+        tower_blocker = ""
+        tower_floors: list[str] = []
+        tower_floor_index = -1
+        snapshot_text = ""
+        if tower_choice is not None:
+            kind, floor = tower_choice["kind"], tower_choice["floor"]
+            if kind == "normal" and tower is not None:
+                tower_floors = [str(checkpoint) for checkpoint in tower.checkpoints]
+                if str(floor) in tower_floors:
+                    tower_floor_index = tower_floors.index(str(floor))
+            if not active_tower:
+                tower_blocker = locations[location_index]["reason"] or catalog.tower_blocker(tower, kind, floor)
+            if not busy and tower and not locations[location_index]["reason"] and (snapshot := tower.best_snapshot):
+                saved_on = datetime.fromtimestamp(snapshot.saved_at).strftime("%Y-%m-%d")
+                snapshot_text = f"{snapshot.job} ({_label(snapshot.class_id)}) · Level {snapshot.level} · {saved_on}"
         unavailable_oaths = [oath for oath in oaths if oath["selected_index"] < 0]
         oath_blocker = ""
         if unavailable_oaths:
@@ -620,8 +678,6 @@ class SessionModel:
         options = list(self._characters)
         characters = list(self._characters.values())
         presets = [p.path.name for p in self._presets]
-        missing = state.kind is StateKind.STALE
-        busy = not missing and (state.session_id is not None or state.kind is StateKind.ACTIVE)
         updates = self._updates(state, busy)
         quarantine = self._quarantine(state, not updates.action_blocker)
         farmer_phase = state.farmer_phase or ""
@@ -648,16 +704,14 @@ class SessionModel:
         journal = self._journal.get(journal_id, [])
         band = _settled_band(journal, names)
         numbers, metrics, duration = _session_measurements(journal, band, totals)
-        if busy and state.session_id:
-            saved = _object(self._os, self._os.app_data_dir() / "session.json")
-            started_at = _number(saved.get("started_at"))
-            if saved.get("id") == state.session_id and started_at is not None and started_at <= now:
-                settled = {key: numbers.get(key, 0) for key in ("zeny", "wins", "runs")}
-                if (_number(totals.get("runs")) or 0) >= len(journal):
-                    settled.update({key: value for key in settled if (value := _number(totals.get(key))) is not None})
-                active = {"session_id": state.session_id, "started_at": started_at,
-                          "timestamp": now, "totals": settled}
-                history = replace(history, night=_night_view(self._history_rows, today, active))
+        started_at = _number(saved.get("started_at"))
+        if busy and state.session_id and saved.get("id") == state.session_id and started_at is not None and started_at <= now:
+            settled = {key: numbers.get(key, 0) for key in ("zeny", "wins", "runs")}
+            if (_number(totals.get("runs")) or 0) >= len(journal):
+                settled.update({key: value for key in settled if (value := _number(totals.get(key))) is not None})
+            active = {"session_id": state.session_id, "started_at": started_at,
+                      "timestamp": now, "totals": settled}
+            history = replace(history, night=_night_view(self._history_rows, today, active))
         current_number = 0
         run_id = _text(status.get("run_id"))
         if status.get("phase") in _RUN_PHASES and not (run_id and any(row.get("run_id") == run_id for row in journal)):
@@ -673,6 +727,8 @@ class SessionModel:
             else:
                 mark = band[len(journal) - 1]
                 outcome = {"win": "won", "loss": "lost", "aborted": "aborted"}[mark["outcome"]]
+                if last.get("stage") in ("tower", "hel") and last.get("end_cause") == "finish":
+                    outcome = "finished"
                 last_event = f"{mark['label']} · Run {outcome}"
         can_control = (state.kind is StateKind.ACTIVE and bool(state.session_id)
                        and farmer_phase in ("", "idle", "run", "settle", "keep", "maint", "paused")
@@ -680,6 +736,7 @@ class SessionModel:
         resume_refusal, resume_pending = self._resume_feedback(state, paused)
         can_resume = paused and can_control and not resume_pending
         can_pick_run_choice = (not busy and not self._pending_start) or can_resume
+        choice_blocker = tower_blocker or oath_blocker
         wishlist = self._session_settings.wishlist
         return SessionView(
             phase=phase, heartbeat_age=_heartbeat_age(state.last_heartbeat),
@@ -693,14 +750,18 @@ class SessionModel:
             current_number=current_number, last_event=last_event,
             session_id=state.session_id or "", active=busy, paused=paused,
             can_control=can_control, can_pause=can_control and bool(farmer_phase),
-            can_resume=can_resume and not oath_blocker,
+            can_resume=can_resume and not choice_blocker,
             characters=characters, presets=presets,
             character_index=options.index(self._character) if self._character in self._characters else -1,
             preset_index=self._presets.index(preset) if preset else -1,
-            can_start=not (reason or oath_blocker), can_pick_character=not busy and bool(characters),
+            can_start=not (reason or choice_blocker),
+            can_pick_character=not busy and not tower_choice and bool(characters),
             can_pick_preset=not busy and bool(presets), preset_description=preset.description if preset else "",
             locations=locations, location_index=location_index, difficulties=difficulties,
             difficulty_index=difficulty_index, can_pick_run_choice=can_pick_run_choice,
+            can_pick_location=can_pick_run_choice and not active_tower,
+            tower_selected=tower_choice is not None, tower_normal=bool(tower_choice and tower_choice["kind"] == "normal"),
+            tower_floors=tower_floors, tower_floor_index=tower_floor_index, tower_snapshot=snapshot_text,
             oaths=oaths, oath_points=oath_points,
             can_pick_oaths=bool(oaths and (oath_difficulty or oath_blocker) and (not reason or can_resume)),
             wishlist_items=_wishlist_rows(item_names, latest["owned_item_ids"], wishlist) if latest is not None else [],
@@ -710,8 +771,8 @@ class SessionModel:
             show_game_window=self._session_settings.show_game_window,
             can_change_show_game_window=not oath_blocker and (not reason or can_resume),
             catalog_refresh=_catalog_refresh(latest),
-            start_reason=reason or oath_blocker, start_refusal=refusal,
-            resume_refusal=(oath_blocker or resume_refusal) if can_resume else resume_refusal,
+            start_reason=reason or choice_blocker, start_refusal=refusal,
+            resume_refusal=(choice_blocker or resume_refusal) if can_resume else resume_refusal,
             action_error=self._action_error, service_missing=missing,
             history=history, updates=updates, quarantine=quarantine,
         )
@@ -984,10 +1045,18 @@ class SessionModel:
     def select_location(self, location: commands.LocationChoice) -> None:
         view = self.poll()
         selected = next((row for row in view.locations if row["id"] == location and row["enabled"]), None)
-        if view.can_pick_run_choice and selected is not None:
-            previous = str(self._session_settings.difficulty)
-            difficulty = int(previous) if previous in _difficulties(selected) else None
-            self._session_settings = replace(self._session_settings, location=location, difficulty=difficulty)
+        if view.can_pick_location and selected is not None:
+            settings = replace(self._session_settings, location=location)
+            if settings.tower is None and str(settings.difficulty) not in _difficulties(selected):
+                settings = replace(settings, difficulty=None)
+            self._session_settings = settings
+            self._save_picks()
+
+    def select_tower_floor(self, floor: int) -> None:
+        view = self.poll()
+        choice = self._session_settings.tower
+        if view.can_pick_location and choice and choice["kind"] == "normal" and str(floor) in view.tower_floors:
+            self._session_settings = replace(self._session_settings, location={**choice, "floor": floor})
             self._save_picks()
 
     def select_difficulty(self, level: str) -> None:
@@ -1042,6 +1111,8 @@ class SessionModel:
 
     def _selected_settings(self, view: SessionView, *, resuming: bool = False) -> commands.SessionSettings:
         settings = self._session_settings
+        if view.tower_selected:
+            return replace(settings, location=view.locations[view.location_index]["id"], difficulty=None, oaths={})
         if not resuming:
             level = int(view.difficulties[view.difficulty_index]) if view.difficulty_index else None
             settings = replace(settings, location=view.locations[view.location_index]["id"], difficulty=level)

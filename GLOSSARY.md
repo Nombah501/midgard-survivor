@@ -19,6 +19,15 @@ _Avoid_: game, match, attempt
 The game world a run is played in, chosen before the run; each has its own difficulty range.
 _Avoid_: stage, map, level
 
+**Endless Tower**:
+A run choice that spends a Tower snapshot to climb from an unlocked start floor until death or Finish. Floor 100 is a milestone, not a win.
+
+**Torre de Hel**:
+A harder Tower run choice unlocked through Endless Tower progression. It always starts at floor 1.
+
+**Tower snapshot**:
+A consumable record of a hero from a previous run, used as the starting hero in either Tower. It is not a reusable Loadout.
+
 **Difficulty**:
 The danger level of a run, from 1 to 30, limited by the location and the profile's progress.
 _Avoid_: danger, hardness, tier
@@ -36,7 +45,7 @@ Everything the operator sets up on a character before AFK: loadout, pet, card al
 _Avoid_: build, setup, gear
 
 **Run choice**:
-The operator's selection of character, location, difficulty and oaths for an AFK session.
+The operator's selection for an AFK session: character, location, difficulty and oaths for ordinary runs, or a Tower and its start floor.
 _Avoid_: target, arm, preset
 
 **Preset**:

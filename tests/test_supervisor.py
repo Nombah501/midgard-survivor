@@ -223,6 +223,8 @@ def test_clean_finish_uses_character_and_preset_without_restart(farm, location, 
     [], {"location": [], "difficulty": 1}, {"location": True, "difficulty": 1},
     {"location": {}, "difficulty": 1}, {"location": {"mode": "random"}, "difficulty": 1},
     {"location": {"mode": "rotation", "id": "payon"}, "difficulty": 1},
+    {"location": {"mode": "tower", "kind": "unknown", "floor": 1}, "difficulty": None},
+    {"location": {"mode": "tower", "kind": "normal", "floor": True}, "difficulty": None},
     {"location": None, "difficulty": True}, {"location": None},
 ])
 def test_malformed_start_and_resume_are_refused(farm, settings):
@@ -233,6 +235,42 @@ def test_malformed_start_and_resume_are_refused(farm, settings):
             rejection = commands.rejection_path(farm.os_, request)
             row = wait_for(lambda: json.loads(farm.os_.read_shared(rejection)))
             assert row["command"] == command and "settings" in row["reason"]
+    assert not (farm.profile / "farmer.cfg").exists()
+
+
+def test_tower_command_keeps_native_rules_and_normalizes_hel_floor(farm):
+    for kind, floor, expected_floor in (("normal", 11, 11), ("hel", 501, 1)):
+        settings = {"location": {"mode": "tower", "kind": kind, "floor": floor},
+                    "difficulty": 30, "oaths": {"tough": 1}}
+        request = {"command": "start", "character": None, "preset": str(farm.preset), "settings": settings}
+        start = commands.decode(request)
+        assert isinstance(start, commands.Start)
+        choice = {"mode": "tower", "kind": kind, "floor": expected_floor}
+        assert start.payload()["settings"]["location"] == choice
+        config = start.settings.config()
+        assert (config["stage"], config["danger"], config["oaths"]) == (choice, "auto", {})
+
+
+@pytest.mark.parametrize(("kind", "floor", "reason"), [
+    ("normal", 6, "not an available Endless Tower checkpoint"),
+    ("hel", 1, "Clear floor 100 to unlock Torre de Hel."),
+])
+def test_service_refuses_invalid_tower_start_before_launch(farm, kind, floor, reason):
+    from fake_smoke_game import CATALOG
+
+    tower = {"open": True, "hel_unlocked": False, "hel_reason": "Clear floor 100 to unlock Torre de Hel.",
+             "checkpoints": [1, 11], "snapshots": [
+                 {"index": 0, "id": "saved-hero", "class": "archer", "job": "Sniper",
+                  "level": 40, "xp_progress": 0.3, "saved_at": 1767225600.0, "locked": False, "farmer": False},
+             ]}
+    (farm.profile / "farmer_catalog.json").write_text(json.dumps(CATALOG | {"tower": tower}), encoding="utf-8")
+    with farm.service():
+        request = farm.send("start", character={"class": "archer", "job_path": 1}, preset=str(farm.preset),
+                            settings={"location": {"mode": "tower", "kind": kind, "floor": floor},
+                                      "difficulty": None})
+        rejection = commands.rejection_path(farm.os_, request)
+        row = wait_for(lambda: json.loads(farm.os_.read_shared(rejection)))
+        assert row["command"] == "start" and reason in row["reason"]
     assert not (farm.profile / "farmer.cfg").exists()
 
 
