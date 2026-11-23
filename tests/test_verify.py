@@ -197,6 +197,7 @@ def test_windowed_scenario_finishes_one_supervised_attempt(verification, monkeyp
     ("late-valkyrie", "no Valkyrie kill before endless continued after MVP 3"),
     ("missing-mvp-log", "MVP count does not match"),
     ("uncounted-finale-mvp", "MVP count does not match"),
+    ("wrong-job", "wrong job: expected assassin_cross, got stalker"),
 ])
 def test_hell_rotation_requires_a_real_finale_win(verification, monkeypatch, fault, reason):
     monkeypatch.setenv("FAKE_VERIFY_FAULT", fault)
@@ -447,7 +448,7 @@ def test_direct_deadline_kills_only_the_sandbox_game(verification, monkeypatch):
     assert not verification[0].game_running()
 
 
-@pytest.mark.parametrize("custom", [False, True])
+@pytest.mark.parametrize("custom", [None, "strategy", "character"])
 def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, custom):
     os_, _, _, _, out, root = verification
     if os_.release_os != "linux":
@@ -455,10 +456,14 @@ def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, cus
             execute(verification, "soak", hours=0.00001)
         return
     preset = None
-    if custom:
+    if custom == "strategy":
         preset = tmp_path / "custom.json"
         preset.write_text(json.dumps({"builds": {"archer": {"job_path": 1}},
                                       "job_paths": {"swordsman": 2}}))
+    elif custom == "character":
+        preset = tmp_path / "character.json"
+        preset.write_text(json.dumps({"class": "acolyte", "job_paths": {"acolyte": 1}, "stage": "payon",
+                                      "danger": 12, "experimental_speed": True}))
     row = execute(verification, "soak", hours=0.00001, soak_preset=preset)
     assert row["verdict"] == "FAIL" and row["exit"] == 0  # No post-warmup RSS in this intentionally short run.
     verdict = (out / "soak.verdict.log").read_text()
@@ -466,8 +471,13 @@ def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, cus
     summary = json.loads(verdict.splitlines()[0])
     assert summary["runs"] == 1
     config = json.loads(next(root.glob("*/farmer.cfg")).read_text())
-    assert config["stage"] == "" and config["danger"] == "auto" and config["max_minutes"] == 0.00001 * 60
-    if custom:
+    if custom == "character":
+        assert (config["class"], config["job_paths"], config["stage"], config["danger"]) == (
+            "acolyte", {"acolyte": 1}, "payon", 12)
+        assert config["experimental_speed"] is True and config["max_minutes"] == 0.00001 * 60
+    else:
+        assert config["stage"] == "" and config["danger"] == "auto" and config["max_minutes"] == 0.00001 * 60
+    if custom == "strategy":
         assert config["builds"] == {"archer": {"job_path": 1}}
         assert config["job_paths"] == {"swordsman": 2} and not config["display"]
     samples = [json.loads(line) for line in (out / "soak.samples.jsonl").read_text().splitlines()]

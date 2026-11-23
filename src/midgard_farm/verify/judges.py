@@ -247,7 +247,19 @@ def location_rotation(run: Run, driven: Driven, status: dict, count: int) -> Non
     need((game.get("stage"), game.get("danger")) == expected[-1], "the game ended at the wrong location or difficulty")
 
 
+# Rebirth jobs by class and job path (game_data.gd CLASSES job2/job2_alt.trans).
+_REBIRTH_JOBS = {
+    "swordsman": ("lord_knight", "paladin"), "mage": ("high_wizard", "professor"), "archer": ("sniper", "clown"),
+    "thief": ("assassin_cross", "stalker"), "acolyte": ("high_priest", "champion"), "merchant": ("whitesmith", "creator"),
+}
+
+
 def hell_rotation(run: Run, driven: Driven, status: dict, *, stage: str | None = None) -> None:
+    config = json.loads(run.artifact("json").read_bytes())
+    cid = config["class"]
+    path = config.get("job_paths", {}).get(cid, 0)
+    job = _REBIRTH_JOBS.get(cid, ())[path:path + 1]
+    need(job, f"no rebirth job known for {cid} path {path}")
     _exit(driven)
     _done(status)
     totals = status["totals"]
@@ -267,7 +279,7 @@ def hell_rotation(run: Run, driven: Driven, status: dict, *, stage: str | None =
             cause = next((line for line in reversed(log.splitlines()) if "PLAYER_DIED " in line), "")
             detail = cause or f"t={result.get('game_s')} s; no death cause logged"
             raise VerificationFailure(f"run ended in defeat: {detail}")
-        need(result.get("job") == "assassin_cross", "wrong job: expected Assassin Cross")
+        need(result.get("job") == job[0], f"wrong job: expected {job[0]}, got {result.get('job')}")
         need(result.get("endless") and result.get("finale_won"), "did not defeat the final boss in endless")
         need(result.get("victory") is True, "victory missing")
     need(totals.get("wins") == 1, "victory missing from totals")

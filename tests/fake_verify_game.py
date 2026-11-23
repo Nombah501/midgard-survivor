@@ -341,7 +341,8 @@ def settle(force, *, wait_at_keep=False):
         assert cfg["endless"] and cfg["endless_minutes"] == cfg["endless_mvps"] == 0
         assert cfg["altar_policy"] == "map-wide" and cfg["karma_route"] == "valhalla"
         hell_evidence(row)
-        row.update(game_s=2451, job="assassin_cross", finale_won=fault not in {"no-victory", "no-finale"})
+        row.update(game_s=2451, job="stalker" if fault == "wrong-job" else "assassin_cross",
+                   finale_won=fault not in {"no-victory", "no-finale"})
         if fault == "forced-finale":
             row.update(forced=True, force_reason="run_timeout")
     if fault == "wrong-oath-journal-points":
