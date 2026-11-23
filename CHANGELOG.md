@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.2] - 2026-11-23
 
 - Champion (Acolyte, Monk branch) in the character list.
 - Experimental: 8× speed switch in the window; overrides the preset's speed from the next run. Tower keeps its native speed.
