@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- Champion (Acolyte, Monk branch) in the character list.
+- Experimental: 8× speed switch in the window; overrides the preset's speed from the next run. Tower keeps its native speed.
+
 ## [0.4.1] - 2026-11-22
 
 - App update checks reach the signed channel: the update host rejected the default Python User-Agent (Cloudflare error 1010), so 0.4.0 could not check for updates. Everything else is as in 0.4.0.

@@ -996,6 +996,30 @@ ApplicationWindow {
                                         wrapMode: Text.Wrap
                                     }
                                 }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    Layout.alignment: Qt.AlignTop
+                                    spacing: 0
+                                    StoneSwitch {
+                                        id: speedSwitch
+                                        objectName: "experimentalSpeed"
+                                        text: qsTr("Experimental: 8× speed")
+                                        Accessible.description: speedWarning.text
+                                        checked: shell.session.experimental_speed
+                                        enabled: shell.session.can_pick_run_choice
+                                        onToggled: shell.backend.setExperimentalSpeed(checked)
+                                    }
+                                    Caption {
+                                        id: speedWarning
+                                        objectName: "experimentalSpeedWarning"
+                                        Layout.fillWidth: true
+                                        visible: speedSwitch.checked
+                                        color: shell.warning
+                                        text: qsTr("Overrides the preset speed from the next run. Dodging is coarser; Tower keeps its own speed.")
+                                        wrapMode: Text.Wrap
+                                    }
+                                }
                             }
 
                             Rule {}

@@ -18,7 +18,8 @@ from .commands import MAINTENANCE_CONFIG_KEYS
 
 
 _OBSOLETE_KEYS = farmer_inputs() / "obsolete_config_keys.json"
-_SESSION_CONFIG_KEYS = ("stage", "danger", "class", "oaths", "wishlist", "keep_unowned_legendaries", "display")
+_SESSION_CONFIG_KEYS = ("stage", "danger", "class", "oaths", "wishlist", "keep_unowned_legendaries",
+                        "experimental_speed", "display")
 
 
 class PreflightError(Exception):

@@ -240,7 +240,7 @@ cd ../gui
 
 Пресет задаёт стратегию, а не выбор забега и не переключатели обслуживания.
 Служба отклоняет пресеты с `stage`, `danger`, `class`, `builds.class`,
-`oaths`, `wishlist`, `keep_unowned_legendaries`, `auto_upgrades`, `auto_sage`, `auto_fuse`,
+`oaths`, `wishlist`, `keep_unowned_legendaries`, `experimental_speed`, `auto_upgrades`, `auto_sage`, `auto_fuse`,
 `auto_potential` или `auto_storage_prune`: это настройки запуска, а не стратегии.
 Служба и `run.sh` отклоняют удалённые поля из `obsolete_config_keys.json`
 как в готовом конфиге, так и в пресетах, и называют поля, которые нужно удалить.
@@ -324,6 +324,7 @@ AFK-цикл: забег идёт до смерти/победы (на SinX D25 
 | `danger_ceiling` | 30 | верхняя граница автоподбора |
 | `explore_every` | 5 | как часто пробовать соседнюю руку |
 | `speed` | 4.0 | `Engine.time_scale` (реальное ускорение) |
+| `experimental_speed` | false | переключатель окна «Experimental: 8× speed»: `speed` = 8 вместо значения пресета; Tower по-прежнему задаёт скорость сам |
 | `game_speed` | 3 | штатный режим игры 1–3 (frenzy/game_fast) |
 | `run_minutes` | 12 | таймаут забега по игровому времени |
 | `arena_wall_max` | 180 | таймаут арены MVP по реальному времени |

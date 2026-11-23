@@ -3984,6 +3984,7 @@ func _load_cfg() -> bool:
 		"oaths": {},
 		"wishlist": [],
 		"keep_unowned_legendaries": false,
+		"experimental_speed": false,
 		"auto_danger": true, "explore_every": 5, "danger_step": 1,
 		"featured_bonus": true,
 		"speed": 4.0, "game_speed": 3,
@@ -4039,10 +4040,13 @@ func _load_cfg() -> bool:
 			ids[id] = true
 	if not (cfg["keep_unowned_legendaries"] is bool):
 		errors.append("keep_unowned_legendaries must be a boolean")
+	if not (cfg["experimental_speed"] is bool):
+		errors.append("experimental_speed must be a boolean")
 	if not errors.is_empty():
 		_log("CFG invalid: " + str(errors))
 		return false
-	cfg["speed"] = clampf(float(cfg.get("speed", 4.0)), 1.0, 30.0)
+	# Experimental: the window's 8x switch overrides the preset clock.
+	cfg["speed"] = 8.0 if cfg["experimental_speed"] else clampf(float(cfg.get("speed", 4.0)), 1.0, 30.0)
 	cfg["game_speed"] = clampi(int(cfg.get("game_speed", 3)), 1, 3)
 	cfg["run_minutes"] = maxf(0.0, float(cfg.get("run_minutes", 12.0)))
 	cfg["arena_wall_max"] = maxf(0.0, float(cfg.get("arena_wall_max", 180.0)))

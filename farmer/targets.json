@@ -30,6 +30,11 @@
       "job_path": 0,
       "label": "High Priest"
     },
+    "champion": {
+      "class": "acolyte",
+      "job_path": 1,
+      "label": "Champion"
+    },
     "professor": {
       "class": "mage",
       "job_path": 0,

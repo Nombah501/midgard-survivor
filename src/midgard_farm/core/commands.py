@@ -68,12 +68,13 @@ class SessionSettings:
     storage_cleanup: bool = False
     show_game_window: bool = False
     keep_unowned_legendaries: bool = False
+    experimental_speed: bool = False
 
     @classmethod
     def decode(cls, value: object) -> "SessionSettings":
         if (not isinstance(value, dict) or not {"location", "difficulty"} <= value.keys()
                 or value.keys() - {"location", "difficulty", "oaths", "wishlist", "show_game_window",
-                                   "keep_unowned_legendaries", *MAINTENANCE_CONFIG_KEYS}):
+                                   "keep_unowned_legendaries", "experimental_speed", *MAINTENANCE_CONFIG_KEYS}):
             raise ValueError(
                 "settings must be an object with location, difficulty and optional oaths, wishlist and switches"
             )
@@ -93,7 +94,7 @@ class SessionSettings:
                 or len(set(wishlist)) != len(wishlist)):
             raise ValueError("settings.wishlist must be an array of distinct item ids")
         switches = {}
-        for name in (*MAINTENANCE_CONFIG_KEYS, "show_game_window", "keep_unowned_legendaries"):
+        for name in (*MAINTENANCE_CONFIG_KEYS, "show_game_window", "keep_unowned_legendaries", "experimental_speed"):
             enabled = value.get(name, getattr(cls, name))
             if not isinstance(enabled, bool):
                 raise ValueError(f"settings.{name} must be a boolean")
@@ -113,7 +114,8 @@ class SessionSettings:
         tower = self.tower
         return {"stage": self.location or "", "danger": "auto" if tower or self.difficulty is None else self.difficulty,
                 "oaths": {} if tower else self.oaths, "wishlist": self.wishlist,
-                "keep_unowned_legendaries": self.keep_unowned_legendaries, **switches}
+                "keep_unowned_legendaries": self.keep_unowned_legendaries,
+                "experimental_speed": self.experimental_speed, **switches}
 
 
 @dataclass(frozen=True)

@@ -181,6 +181,10 @@ class _Backend(QObject):
     def setKeepUnownedLegendaries(self, enabled: bool) -> None:
         self._enqueue(partial(self._model.set_keep_unowned_legendaries, enabled))
 
+    @Slot(bool)
+    def setExperimentalSpeed(self, enabled: bool) -> None:
+        self._enqueue(partial(self._model.set_experimental_speed, enabled))
+
     @Slot(str, bool)
     def setMaintenance(self, name: str, enabled: bool) -> None:
         self._enqueue(partial(self._model.set_maintenance, name, enabled))

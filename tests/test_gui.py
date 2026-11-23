@@ -283,7 +283,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     assert json.loads(request.read_bytes())["settings"] == {
         "location": "prontera", "difficulty": 2, "oaths": {}, "wishlist": [],
         "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
-        "show_game_window": False, "keep_unowned_legendaries": False,
+        "show_game_window": False, "keep_unowned_legendaries": False, "experimental_speed": False,
     }
     model = SessionModel(farm.platform)
     view = model.poll()
@@ -305,7 +305,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
         "command": "resume", "settings": {
             "location": "orc", "difficulty": 6, "oaths": {}, "wishlist": [],
             "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
-            "show_game_window": False, "keep_unowned_legendaries": False,
+            "show_game_window": False, "keep_unowned_legendaries": False, "experimental_speed": False,
         },
     }
     view = SessionModel(farm.platform).poll()
@@ -1158,6 +1158,7 @@ def test_maintenance_switches_stay_fixed_until_pause_and_are_remembered(open_das
 
 @pytest.mark.parametrize(("control", "setting"), [
     ("showGameWindow", "show_game_window"), ("keepUnownedLegendaries", "keep_unowned_legendaries"),
+    ("experimentalSpeed", "experimental_speed"),
 ])
 def test_session_switch_is_remembered_and_submitted_at_start_and_resume(open_dashboard, farm, control, setting):
     from PySide6.QtCore import Qt
