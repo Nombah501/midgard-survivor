@@ -4,7 +4,7 @@
 
 **Blocked by:** 12 (same files).
 
-**Status:** ready-for-agent
+**Status:** ready-for-agent (2026-11-25: random start existed in code; the log now reads `ROTATION_START stage=<id> selection=random` and the judge requires exactly one; shipped with ADR 0011's change)
 
 - [ ] A new session starts at a random unlocked location (logged), then follows catalog order; covered by a fake-game test over several seeds and the real `location-rotation` scenario adapted to accept any start.
 - [x] A restart within the session continues from the checkpointed position; real `location-rotation-resume` passed, including Pause/Resume with a new difficulty.

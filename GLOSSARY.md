@@ -48,12 +48,16 @@ Everything the operator sets up on a character before AFK: loadout, pet, card al
 _Avoid_: build, setup, gear
 
 **Run choice**:
-The operator's selection for an AFK session: character, location, difficulty and oaths for ordinary runs, or a Tower and its start floor.
+The operator's selection for an AFK session: character, mode, location, difficulty, oaths and route for ordinary runs, or a Tower and its start floor.
 _Avoid_: target, arm, preset
 
-**Preset**:
-A named strategy for an AFK session: objective, speeds, limits and the ceiling for automatic difficulty; never a run choice.
-_Avoid_: profile, config, mode
+**Mode**:
+The built-in strategy for ordinary runs: Endless until the final boss, or Short runs until the MVP. It fixes run length, speeds and the ceiling for automatic difficulty; never a run's location or route.
+_Avoid_: preset, profile, config
+
+**Route**:
+The karma portal the farmer takes after each regular MVP in Endless: Valhalla (Valkyrie Reginleif), Hel (Fallen Randgris, via Niflheim) or a random side per run.
+_Avoid_: karma path, side, alignment
 
 **Wishlist**:
 The operator's list of legendary items to keep at the end screen when offered and not already owned.

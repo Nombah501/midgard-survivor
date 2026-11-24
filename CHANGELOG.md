@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- Presets are gone: pick a **Mode** in the window, *Endless until the final boss* or *Short runs (until the MVP)*. A saved 0.4.x choice opens as Endless with Valhalla.
+- **Route** in the window for the karma portal after each regular MVP: Valhalla, Hel (Fallen Randgris via Niflheim) or Random each run. On the Hel side the farmer also takes Hel altars.
+- All locations in turn starts each new session at a random unlocked location, then continues in order.
+
 ## [0.4.2] - 2026-11-23
 
 - Champion (Acolyte, Monk branch) in the character list.

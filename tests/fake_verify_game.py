@@ -21,6 +21,7 @@ cfg = json.loads((profile / "farmer.cfg").read_bytes())
 assert cfg["display"] is (os.environ.get("FAKE_VERIFY_WATCH_MODE") == "1")
 assert sys.argv[1:] == ([] if cfg["display"] else ["--headless"])
 valkyrie_drill = os.environ.get("FARMER_TEST_VALKYRIE") == "1"
+hel_route_drill = os.environ.get("FARMER_TEST_EARLY_MVP") == "1"
 field_navigation = os.environ.get("FARMER_TEST_FIELD_NAVIGATION") == "1"
 field_charge = os.environ.get("FARMER_TEST_FIELD_CHARGE") == "1"
 mvp_drill = os.environ.get("FARMER_TEST_MVP_MECHANICS") == "1"
@@ -32,8 +33,11 @@ tower_evidence = {}
 tower_intent = {}
 if field_navigation:
     assert cfg["altar_policy"] == "map-wide"
+elif hel_route_drill:
+    assert cfg["karma_route"] == "hel"
 elif cfg.get("run_minutes") != 50 and not verify_progress:
-    assert "altar_policy" not in cfg and "karma_route" not in cfg
+    assert cfg.get("altar_policy", "cautious") in ("cautious", "map-wide")
+    assert cfg.get("karma_route", "natural") in ("natural", "valhalla", "hel", "rotate")
 checkpoint_path = profile / "farmer_session.json"
 journal_path = profile / "farmer_runs.jsonl"
 save = profile / "profile.json"
@@ -69,7 +73,8 @@ def advance_rotation():
     if rotating():
         if rotation_index is None:
             rotation_index = Random(int(os.environ.get("FAKE_VERIFY_ROTATION_SEED", "0"))).randrange(2)
-            log(f"ROTATION_START stage={rotation_location()['id']}")
+            selection = "fixed" if fault == "unlogged-random-start" else "random"
+            log(f"ROTATION_START stage={rotation_location()['id']} selection={selection}")
         else:
             rotation_index = (rotation_index + 1) % 2
 
@@ -266,6 +271,22 @@ def hell_evidence(row):
             log(kill)
 
 
+def hel_evidence(row):
+    route = "KARMA_ROUTE side=dark mvp=randgris_fallen after_mvp=1 t=92.0 revives=3 falls=0 doom=false"
+    if fault == "early-hel-route":
+        log(route)
+    log("BOSS_WON t=91.0 mvps=1 wall_ms=10")
+    if fault != "early-hel-route":
+        log(route)
+    if fault != "no-randgris-kill":
+        boon = "none" if fault == "no-hel-pact" else "hel_pact"
+        log(f"RANDGRIS_KILLED mvp=randgris_fallen after_mvp=1 boons=1 t=92.0 revives=3 falls=0 boon={boon}")
+    row.update(karma_side="dark", randgris_kills=1, randgris_fallen_cards_gain=0, run_mvps=2,
+               arena_timings=[] if fault == "no-randgris-journal" else [
+                   {"kind": "randgris", "boss": "randgris_fallen", "kill_ms": 30},
+               ], died=fault == "hel-death")
+
+
 def settle_progress(row):
     row.update(game_s=510, **{"class": "thief"})
     entry = {key: row[key] for key in ("class", "stage", "danger", "victory")} | {"mvps": 1, "time": 510}
@@ -335,6 +356,8 @@ def settle(force, *, wait_at_keep=False):
            "forced": os.environ.get("FARMER_TEST_FREEZE_RUN_TIME") == "1" and fault != "unforced-stall",
            "falls_by_mechanic": {"Golpe aplastante": 1} if fault == "mvp-fall" else {}}
     row.update(stage=location(), danger=difficulty(), oath_points=oath_points())
+    if hel_route_drill:
+        hel_evidence(row)
     if hell_rotation:
         assert cfg["objective"] == "crumbs" and cfg["class"] == "thief" and cfg["job_paths"] == {"thief": 0}
         assert cfg["danger"] == 30
@@ -604,7 +627,7 @@ if mvp_drill:
             f"strikes={strikes} contacts={hits} hits=0 died=false")
         settle("")
     finish("max_runs")
-settle("" if hell_rotation else "run_timeout")
+settle("" if hell_rotation or hel_route_drill else "run_timeout")
 while (rotating() or verify_wishlist or verify_tower_parity) and runs < cfg["max_runs"]:
     started += 1
     advance_rotation()

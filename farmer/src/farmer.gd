@@ -403,8 +403,19 @@ func _prepare_run() -> void:
 	run_state["route_entered"] = false
 	_altar_seen.clear()
 	_altar_channel = {}
-	if choice.is_empty() and cfg["karma_route"] == "valhalla":
-		run_state["reginleif_cards"] = int(Save.data.get("cards", {}).get("reginleif_card", 0))
+	if choice.is_empty():
+		var side := ""
+		match cfg["karma_route"]:
+			"valhalla":
+				side = "light"
+			"hel":
+				side = "dark"
+			"rotate":
+				side = "light" if randi_range(0, 1) == 0 else "dark"
+		if not side.is_empty():
+			run_state["karma_side"] = side
+			var card := str(GameData.KARMA_ROUTES[side]["mvp"]) + "_card"
+			run_state["route_cards"] = int(Save.data.get("cards", {}).get(card, 0))
 	_time_last = -1.0
 	_time_change_ms = _now()
 	_clock_last = -1.0
@@ -428,6 +439,8 @@ func _prepare_run() -> void:
 			GameData.set_meta("finale_at", GameData.MORROC_FINALE.at)
 		if _test_blocked_portal:
 			GameData.set_meta("mvp_at", 2.0)
+		elif _test_env("EARLY_MVP") == "1":
+			GameData.set_meta("mvp_at", 90.0)
 	# The native start resets this manual-run toggle; don't persist its reset.
 	var settings: Dictionary = Save.data.settings
 	var had_auto_pick := settings.has("endless_auto_pick")
@@ -448,8 +461,9 @@ func _prepare_run() -> void:
 	if not choice.is_empty() and not _flush_profile_verified("tower_launch"):
 		return
 	world.player.farmer_fell.connect(_on_player_fell)
-	if choice.is_empty() and cfg["karma_route"] == "valhalla" and is_instance_valid(world.karma):
-		world.karma.path = "light"
+	var side: String = run_state.get("karma_side", "")
+	if side != "" and is_instance_valid(world.karma):
+		world.karma.path = side
 	active_oath_points = int(world.oath_points())
 	_test_raid_ability = {}
 	_test_mvp_enemy = null
@@ -467,6 +481,8 @@ func _prepare_run() -> void:
 		runs_started, active_class, active_stage, active_danger, float(cfg.get("speed", 4.0))])
 	if not _write_checkpoint("run"):
 		return
+	if choice.is_empty() and cfg["karma_route"] == "rotate":
+		_log("KARMA_SIDE side=%s route=rotate run=%s" % [side, run_id])
 	_test_crash("run")
 	_write_status()
 	if not choice.is_empty():
@@ -630,9 +646,14 @@ func _observe_arena_timing(now: int) -> void:
 			return
 		_arena_map_id = map_id
 		var timings: Array = run_state["arena_timings"]
+		var kind := "mvp"
+		if world.karma.route == "light" and raid.mvp == "reginleif":
+			kind = "valkyrie"
+		elif world.karma.route == "dark" and raid.mvp == "randgris_fallen":
+			kind = "randgris"
 		_arena_timing = {
 			"arena_n": timings.size() + 1,
-			"kind": "valkyrie" if raid.mvp == "reginleif" and world.karma.route == "light" else "mvp",
+			"kind": kind,
 			"boss": raid.mvp,
 			"entry_ms": now,
 			"first_damage_ms": null,
@@ -672,8 +693,8 @@ func _handle_victory(now: int) -> void:
 	# Morroc ends the run itself once the finale's loot has been collected.
 	if world.morroc.finale_won():
 		return
-	var valhalla: bool = cfg["karma_route"] == "valhalla"
-	if valhalla and _wait_for_valhalla(now):
+	var side: String = run_state.get("karma_side", "")
+	if side != "" and _wait_for_karma_route(now, side):
 		return
 	var new_win := false
 	# Count field and arena MVPs alike; raid.state stays "won" after leave().
@@ -699,7 +720,7 @@ func _handle_victory(now: int) -> void:
 		if int(run_state.get("won_at", 0)) == 0:
 			run_state["won_at"] = now
 			_log("BOSS_WON t=%.1f mvps=%d wall_ms=%d" % [float(world.time), mvps, now])
-			if valhalla:
+			if side != "":
 				run_state["regular_mvp"] = mvps
 	# A pending victory must survive frames where `new_win` is false (the MVP
 	# counter does not grow every frame and the arena exit has no menu).
@@ -708,21 +729,21 @@ func _handle_victory(now: int) -> void:
 	world._pull_prizes()
 	if now - int(run_state.get("won_at", now)) < VICTORY_PULL_MS:
 		return
-	if valhalla:
+	if side != "":
 		var regular := int(run_state.get("regular_mvp", 0))
-		if regular > int(run_state.get("valhalla_for", 0)):
-			run_state["valhalla_for"] = regular
-			run_state["valhalla_until"] = now + KARMA_PORTAL_WAIT_MS
-			run_state["valhalla_entered"] = false
+		if regular > int(run_state.get("karma_route_for", 0)):
+			run_state["karma_route_for"] = regular
+			run_state["karma_route_until"] = now + KARMA_PORTAL_WAIT_MS
+			run_state["karma_route_entered"] = false
 			var karma = world.karma
-			run_state["valhalla_boons"] = int(karma.boons) if is_instance_valid(karma) else 0
-			if _wait_for_valhalla(now):
+			run_state["karma_route_boons"] = int(karma.boons) if is_instance_valid(karma) else 0
+			if _wait_for_karma_route(now, side):
 				return
 	elif world.karma != null and is_instance_valid(world.karma) \
 			and world.karma.has_method("can_route") and bool(world.karma.can_route()) \
 			and not bool(run_state.get("route_entered", false)):
 		run_state["route_entered"] = true
-		var side := str(world.karma.route_side())
+		side = str(world.karma.route_side())
 		var route_mvp := str(GameData.KARMA_ROUTES.get(side, {}).get("mvp", ""))
 		_log("KARMA_ROUTE side=%s mvp=%s" % [side, route_mvp])
 		if world.menus != null and is_instance_valid(world.menus) and str(world.menus._mode) == "victory":
@@ -749,36 +770,39 @@ func _handle_victory(now: int) -> void:
 		_end_run_safe(true)
 
 
-# True while the regular MVP's route is pending or its Valkyrie is alive.
-func _wait_for_valhalla(now: int) -> bool:
-	var until := int(run_state.get("valhalla_until", 0))
+# True while the regular MVP's portal is pending or the route MVP is alive.
+func _wait_for_karma_route(now: int, side: String) -> bool:
+	var until := int(run_state.get("karma_route_until", 0))
 	if until == 0:
 		return false
-	var regular := int(run_state["valhalla_for"])
+	var regular := int(run_state["karma_route_for"])
 	var karma = world.karma
 	var raid = world.raid
+	var route: Dictionary = GameData.KARMA_ROUTES[side]
 	var has_karma := is_instance_valid(karma)
-	var valkyrie := is_instance_valid(raid) and str(raid.mvp) == "reginleif"
-	var won: bool = has_karma and valkyrie and raid.state == "won" and karma.route == "" \
-			and bool(karma.won_here) and karma.boon == "valhalla" and int(karma.boons) > int(run_state["valhalla_boons"])
-	if won or (has_karma and valkyrie and karma.route == "light"):
-		if not bool(run_state["valhalla_entered"]):
-			run_state["valhalla_entered"] = true
-			_log("KARMA_ROUTE side=light mvp=reginleif after_mvp=%d t=%.1f revives=%d falls=%d doom=%s" % [
-				regular, float(world.time), world.player.revives, world.player.falls, str(world.player.doom)])
+	var is_route_mvp: bool = is_instance_valid(raid) and raid.mvp == route["mvp"]
+	var won: bool = has_karma and is_route_mvp and raid.state == "won" and karma.route == "" \
+			and bool(karma.won_here) and karma.boon == route["boon"] and int(karma.boons) > int(run_state["karma_route_boons"])
+	if won or (has_karma and is_route_mvp and karma.route == side):
+		if not bool(run_state["karma_route_entered"]):
+			run_state["karma_route_entered"] = true
+			_log("KARMA_ROUTE side=%s mvp=%s after_mvp=%d t=%.1f revives=%d falls=%d doom=%s" % [
+				side, route["mvp"], regular, float(world.time), world.player.revives, world.player.falls, str(world.player.doom)])
 		if not won:
 			return true
-		run_state["valhalla_until"] = 0
+		run_state["karma_route_until"] = 0
 		run_state["last_run_mvps"] = int(world.run_mvps)
 		run_state["won_at"] = now
-		run_state["valkyrie_kills"] = int(run_state.get("valkyrie_kills", 0)) + 1
-		_log("VALKYRIE_KILLED mvp=reginleif after_mvp=%d boons=%d t=%.1f revives=%d falls=%d" % [
-			regular, int(karma.boons), float(world.time), world.player.revives, world.player.falls])
+		run_state["karma_route_kills"] = int(run_state.get("karma_route_kills", 0)) + 1
+		var event := "VALKYRIE_KILLED" if side == "light" else "RANDGRIS_KILLED"
+		var boon := " boon=%s" % karma.boon if side == "dark" else ""
+		_log("%s mvp=%s after_mvp=%d boons=%d t=%.1f revives=%d falls=%d%s" % [
+			event, route["mvp"], regular, int(karma.boons), float(world.time), world.player.revives, world.player.falls, boon])
 		return false
-	if bool(run_state["valhalla_entered"]):
+	if bool(run_state["karma_route_entered"]):
 		return true
 	var reason := ""
-	if not has_karma or not karma.can_route() or karma.route_side() != "light":
+	if not has_karma or not karma.can_route() or karma.route_side() != side:
 		reason = "cannot_route"
 	elif not is_instance_valid(raid):
 		reason = "no_raid"
@@ -787,7 +811,7 @@ func _wait_for_valhalla(now: int) -> bool:
 		world.menus.close()
 		get_tree().paused = false
 		karma.enter_route()
-		if karma.route == "light":
+		if karma.route == side:
 			return true
 		reason = "entry_refused"
 	elif now >= until:
@@ -797,8 +821,8 @@ func _wait_for_valhalla(now: int) -> bool:
 	if reason.is_empty():
 		world._pull_prizes()
 		return true
-	run_state["valhalla_until"] = 0
-	_log("KARMA_ROUTE_SKIP side=light after_mvp=%d reason=%s t=%.1f" % [regular, reason, float(world.time)])
+	run_state["karma_route_until"] = 0
+	_log("KARMA_ROUTE_SKIP side=%s after_mvp=%d reason=%s t=%.1f" % [side, regular, reason, float(world.time)])
 	return false
 
 
@@ -1834,9 +1858,9 @@ func _steer_goal(hero) -> Vector3:
 	var map_wide: bool = cfg["altar_policy"] == "map-wide" and not (raid != null and raid.in_arena())
 	if raid != null and is_instance_valid(raid):
 		var st := str(raid.state)
-		if st == "won" and cfg["karma_route"] == "valhalla" and raid._kportal_pos != Vector3.INF:
+		if st == "won" and run_state.has("karma_side") and raid._kportal_pos != Vector3.INF:
 			_raid_goal = true
-			if int(run_state.get("valhalla_until", 0)) > 0:
+			if int(run_state.get("karma_route_until", 0)) > 0:
 				return _karma_portal_goal(hero, raid)
 			return hero.position
 		if map_wide and st == "portal":
@@ -1968,6 +1992,8 @@ func _best_altar(hero) -> Vector3:
 		if not (a is Dictionary):
 			continue
 		var aid := str(a.get("id", ""))
+		if aid == "hel" and _altar_rejection(aid) != "":
+			continue
 		var d: Dictionary = GameData.ALTARS.get(aid, {})
 		if d.is_empty():
 			continue
@@ -2029,7 +2055,7 @@ func _altar_skip(entry: Dictionary, reason: String) -> void:
 
 
 func _altar_rejection(id: String) -> String:
-	if id == "hel":
+	if id == "hel" and run_state.get("karma_side") != "dark":
 		return "hel"
 	var priority: Array = cfg["altar_priority"]
 	return "" if priority.has(id) and GameData.ALTARS.has(id) and not GameData.ALTARS[id].has("npc") else "not_priority"
@@ -2778,7 +2804,7 @@ func _rotation_stage(difficulty: Variant, choose_start: bool = false) -> String:
 		return ""
 	if choose_start and not GameData.STAGES.has(_last_rotated_stage):
 		var start: String = unlocked[randi_range(0, unlocked.size() - 1)]
-		_log("ROTATION_START stage=" + start)
+		_log("ROTATION_START stage=%s selection=random" % start)
 		return start
 	return next_stage if next_stage != "" else unlocked[0]
 
@@ -3891,10 +3917,13 @@ func _build_result() -> Dictionary:
 	if run_state.has("tower_floor_start"):
 		for key in ["tower_floor_start", "tower_floor_best", "end_cause", "snapshot"]:
 			result[key] = run_state.get(key)
-	elif cfg["karma_route"] == "valhalla":
-		result["valkyrie_kills"] = int(run_state.get("valkyrie_kills", 0))
-		result["reginleif_cards_gain"] = int(Save.data.get("cards", {}).get("reginleif_card", 0)) \
-				- int(run_state.get("reginleif_cards", 0))
+	elif run_state.has("karma_side"):
+		var side: String = run_state["karma_side"]
+		var card := str(GameData.KARMA_ROUTES[side]["mvp"]) + "_card"
+		var kill_key := "valkyrie_kills" if side == "light" else "randgris_kills"
+		result["karma_side"] = side
+		result[kill_key] = int(run_state.get("karma_route_kills", 0))
+		result[card + "s_gain"] = int(Save.data.get("cards", {}).get(card, 0)) - int(run_state["route_cards"])
 	result["value"] = _run_value(result)
 	result["rate"] = float(result["value"]) / maxf(1.0, wall)
 	return result
@@ -4000,7 +4029,7 @@ func _load_cfg() -> bool:
 		"auto_fuse": true, "fuse_keep": {},
 		"auto_potential": false, "potential_reserve": 20, "potential_max_rolls": 10,
 		"auto_storage_prune": false,
-		"altar_priority": ["freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "odin", "emperium"],
+		"altar_priority": ["freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "hel", "odin", "emperium"],
 		"altar_range": 12.0,
 		"altar_policy": "cautious", "karma_route": "natural",
 		"goals": {}, "goal_stop": false,
@@ -4027,8 +4056,8 @@ func _load_cfg() -> bool:
 		errors.append("goals must be an object")
 	if cfg["altar_policy"] not in ["cautious", "map-wide"]:
 		errors.append("altar_policy must be cautious or map-wide")
-	if cfg["karma_route"] not in ["natural", "valhalla"]:
-		errors.append("karma_route must be natural or valhalla")
+	if cfg["karma_route"] not in ["natural", "valhalla", "hel", "rotate"]:
+		errors.append("karma_route must be natural, valhalla, hel or rotate")
 	if not (cfg["wishlist"] is Array):
 		errors.append("wishlist must be an array of item ids")
 	else:
@@ -4045,7 +4074,7 @@ func _load_cfg() -> bool:
 	if not errors.is_empty():
 		_log("CFG invalid: " + str(errors))
 		return false
-	# Experimental: the window's 8x switch overrides the preset clock.
+	# Experimental: the window's 8x switch overrides the default clock.
 	cfg["speed"] = 8.0 if cfg["experimental_speed"] else clampf(float(cfg.get("speed", 4.0)), 1.0, 30.0)
 	cfg["game_speed"] = clampi(int(cfg.get("game_speed", 3)), 1, 3)
 	cfg["run_minutes"] = maxf(0.0, float(cfg.get("run_minutes", 12.0)))

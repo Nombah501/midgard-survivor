@@ -32,12 +32,10 @@ def update_service(tmp_path, monkeypatch):
     desktop = tmp_path / "desktop.jsonl"
     plan = tmp_path / "plan.txt"
     plan.write_text("clean:goal\n", encoding="utf-8")
-    preset = tmp_path / "preset.json"
-    preset.write_text("{}", encoding="utf-8")
     for name, path in (("FAKE_GAME_PROFILE", profile), ("FAKE_SUPERVISED_PLAN", plan),
                        ("FAKE_FARMER_SOURCES", sources), ("FAKE_DESKTOP_TRACE", desktop)):
         monkeypatch.setenv(name, str(path))
-    return Farm(update.os, profile, preset, plan), update, sources, desktop
+    return Farm(update.os, profile, plan), update, sources, desktop
 
 
 def test_game_update_night_waits_rebuilds_and_runs_one_attempt(update_service):

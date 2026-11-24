@@ -85,14 +85,14 @@ def launcher(tmp_path, monkeypatch, service_game_platform):
     return Launcher(os_, profile, game)
 
 
-def test_manual_launch_uses_preset_keeps_network_and_preserves_spaced_paths(launcher, monkeypatch):
-    preset = launcher.profile / "my preset.json"
-    preset.write_text('{"speed": 10}')
+def test_manual_launch_uses_strategy_keeps_network_and_preserves_spaced_paths(launcher, monkeypatch):
+    strategy = launcher.profile / "my strategy.json"
+    strategy.write_text('{"speed": 10, "karma_route": "natural"}')
     bin_dir = launcher.data / "empty PATH"
     bin_dir.mkdir()
     monkeypatch.setenv("PATH", str(bin_dir))  # unshare unavailable
 
-    launcher.run(0, str(preset))
+    launcher.run(0, str(strategy))
 
     record = launcher.record()
     assert record["netns"] == os.readlink("/proc/self/ns/net")
@@ -100,8 +100,22 @@ def test_manual_launch_uses_preset_keeps_network_and_preserves_spaced_paths(laun
     assert record["args"] == ["--headless"]
     assert record["cwd"] == str(launcher.game.parent)
     assert record["session"] == "1"
-    assert record["config"] == {"speed": 10}
+    assert record["config"] == {"speed": 10, "karma_route": "natural"}
     assert not (launcher.data / "backups/known-good").exists()
+
+
+@pytest.mark.parametrize(("mode", "route", "strategy_fields"), [
+    ("short", "hel", {"endless": False, "danger_ceiling": 20, "altar_policy": "cautious", "run_minutes": 14}),
+    ("endless", "rotate", {"endless": True, "danger_ceiling": 30, "altar_policy": "map-wide", "run_minutes": 50}),
+])
+def test_launch_writes_mode_strategy_and_route(launcher, mode, route, strategy_fields):
+    result = run_attempt(launcher.os_, launcher.profile, None, None, settings=SessionSettings(mode=mode, route=route))
+    assert result.clean(launcher.os_)
+    config = json.loads((launcher.profile / "farmer.cfg").read_bytes())
+    assert launcher.record()["config"] == config
+    assert config["karma_route"] == route
+    assert {key: config[key] for key in strategy_fields} == strategy_fields
+    assert "max_minutes" not in config and "mode" not in config
 
 
 @pytest.fixture
@@ -130,8 +144,8 @@ def test_supervised_game_uses_loopback_only_namespace(supervised):
     (False, "", False), (True, "", True), (False, "1", True),
 ])
 def test_supervised_watch_mode_uses_local_display_socket(supervised, monkeypatch, show_game_window, override, windowed):
-    preset = supervised.profile / "strategy.json"
-    preset.write_text('{"speed": 10}')
+    strategy = supervised.profile / "strategy.json"
+    strategy.write_text('{"speed": 10}')
     monkeypatch.setenv("FARMER_DISPLAY", override)
     monkeypatch.chdir(supervised.game.parent)
     display_path = "display.sock"
@@ -139,7 +153,7 @@ def test_supervised_watch_mode_uses_local_display_socket(supervised, monkeypatch
         display.bind(display_path)
         display.listen()
         monkeypatch.setenv("FAKE_DISPLAY_SOCKET", display_path)
-        result = run_attempt(supervised.os_, supervised.profile, preset, "acceptance-afk-session",
+        result = run_attempt(supervised.os_, supervised.profile, strategy, "acceptance-afk-session",
                              settings=SessionSettings(show_game_window=show_game_window))
         if windowed:
             display.settimeout(2)
@@ -224,10 +238,10 @@ def test_broken_farmer_config_is_unfixable_before_launch(launcher, cfg):
     assert not (launcher.profile / "fake-game.json").exists()
 
 
-def test_bad_preset_does_not_overwrite_config(launcher, tmp_path):
-    preset = tmp_path / "invalid preset.json"
-    preset.write_text("[]")
-    assert "not a JSON object" in launcher.run(78, str(preset)).stderr
+def test_bad_strategy_does_not_overwrite_config(launcher, tmp_path):
+    strategy = tmp_path / "invalid strategy.json"
+    strategy.write_text("[]")
+    assert "not a JSON object" in launcher.run(78, str(strategy)).stderr
     assert (launcher.profile / "farmer.cfg").read_text() == "{}"
     assert not (launcher.profile / "fake-game.json").exists()
 
@@ -238,14 +252,14 @@ def test_bad_preset_does_not_overwrite_config(launcher, tmp_path):
     "auto_rebirth_lv", "override_pick_order", "pet_priority",
     "auto_keep", "class_rotate", "classes", "stage_pool", "keep_on_defeat", "swap_margin",
 ])
-@pytest.mark.parametrize("use_preset", [False, True], ids=["farmer-cfg", "preset"])
-def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_preset):
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["farmer-cfg", "strategy"])
+def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_strategy):
     config = launcher.profile / "farmer.cfg"
-    source = tmp_path / "old preset.json" if use_preset else config
+    source = tmp_path / "old strategy.json" if use_strategy else config
     source.write_text(json.dumps({key: [] if key == "pet_priority" else False}))
     original = config.read_bytes()
 
-    args = (str(source),) if use_preset else ()
+    args = (str(source),) if use_strategy else ()
     assert key in launcher.run(78, *args).stderr
     assert config.read_bytes() == original
     assert not (launcher.profile / "fake-game.json").exists()
@@ -255,12 +269,12 @@ def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_preset)
     "stage", "danger", "class", "builds.class", "oaths", "wishlist", "display",
     "auto_upgrades", "auto_sage", "auto_fuse", "auto_potential", "auto_storage_prune",
 ])
-def test_run_choice_keys_in_presets_are_unfixable(launcher, tmp_path, key):
-    preset = tmp_path / "old preset.json"
+def test_run_choice_keys_in_strategy_files_are_unfixable(launcher, tmp_path, key):
+    strategy = tmp_path / "old strategy.json"
     config = {"builds": {"class": "archer"}} if key == "builds.class" else {key: None}
-    preset.write_text(json.dumps(config))
+    strategy.write_text(json.dumps(config))
 
-    assert key in launcher.run(78, str(preset)).stderr
+    assert key in launcher.run(78, str(strategy)).stderr
     assert (launcher.profile / "farmer.cfg").read_text() == "{}"
     assert not (launcher.profile / "fake-game.json").exists()
 
@@ -308,7 +322,7 @@ def test_unreadable_preflight_input_is_unfixable(launcher, file):
     assert not (launcher.profile / "fake-game.json").exists()
 
 
-@pytest.mark.parametrize("missing", ["game", "patch_info", "preset"])
+@pytest.mark.parametrize("missing", ["game", "patch_info", "strategy"])
 def test_missing_launch_prerequisites_are_unfixable(launcher, missing, tmp_path):
     args = []
     if missing == "game":
@@ -318,8 +332,8 @@ def test_missing_launch_prerequisites_are_unfixable(launcher, missing, tmp_path)
         patch_info.info_path(launcher.os_).unlink()
         detail = "no farmer patch info"
     else:
-        args = [str(tmp_path / "missing preset")]
-        detail = "preset not found"
+        args = [str(tmp_path / "missing strategy")]
+        detail = "strategy not found"
     assert detail in launcher.run(78, *args).stderr
     assert not (launcher.profile / "fake-game.json").exists()
 

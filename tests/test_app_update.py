@@ -303,7 +303,7 @@ def test_service_checks_again_without_restarting_or_redownloading(installed, mon
         assert current(os_) == "1.0.0" and not os_.watchdogs
 
 
-def test_verified_release_waits_for_afk_terminal_outcome_before_handoff(installed, monkeypatch, tmp_path):
+def test_verified_release_waits_for_afk_terminal_outcome_before_handoff(installed, monkeypatch):
     os_, profile, releases = installed
     patches = profile / "patches"
     official = official_state(profile)
@@ -327,7 +327,7 @@ def test_verified_release_waits_for_afk_terminal_outcome_before_handoff(installe
 
     monkeypatch.setattr(_app_releases._HTTPS, "open", wait_for_fake_game)
     monkeypatch.setattr(supervisor, "run_attempt", farm_once)
-    request = commands.submit(os_, commands.Start(None, tmp_path / "preset.json"))
+    request = commands.submit(os_, commands.Start(None))
     with running_service(monkeypatch) as old:
         assert in_run.wait(timeout=5)
         response_allowed.set()

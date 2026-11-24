@@ -31,7 +31,7 @@ def smoke_test(report: Path) -> int:
         loaded = bool(engine.rootObjects())
     finally:
         qInstallMessageHandler(previous)
-    report.write_text(json.dumps({"loaded": loaded, "messages": messages, "presets": view.presets,
+    report.write_text(json.dumps({"loaded": loaded, "messages": messages, "mode": view.mode, "route": view.route,
                                   "characters": view.characters, "version": view.updates.app_version}),
                       encoding="utf-8")
     return 0 if loaded and not messages else 1

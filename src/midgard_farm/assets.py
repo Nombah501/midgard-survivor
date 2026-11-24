@@ -21,8 +21,8 @@ def farmer_inputs() -> Path:
     return Path(__file__).resolve().with_name("_farmer")
 
 
-def presets_dir() -> Path:
-    return farmer_inputs() / "presets"
+def modes_dir() -> Path:
+    return farmer_inputs() / "modes"
 
 
 def targets_path() -> Path:

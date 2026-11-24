@@ -27,7 +27,7 @@ ALL = (
     "oaths", "oaths-disabled", "invalid-oath", "invalid-oath-rank", "invalid-oath-difficulty", "invalid-location",
     "invalid-difficulty", "invalid-rotation-difficulty", "stop", "endless", "hell-rotation",
     "hell-rotation-payon", "hell-rotation-orc_dun", "hell-rotation-nameless", "hell-rotation-turtle",
-    "valkyrie-drill", "mvp-mechanics-drill",
+    "valkyrie-drill", "hel-route-drill", "mvp-mechanics-drill",
     "blocked-portal", "field-navigation", "field-charge-drill", "flush-fail",
     "crash-run", "crash-settled", "crash-journaled",
     "cmd-finish", "cmd-abort", "cmd-abort-settled", "cmd-pause-resume", "cmd-legacy", "checkpoint-corrupt",
@@ -128,6 +128,8 @@ def test_verifies_every_scenario_against_a_fake_game(verification, name):
         assert (config["altar_policy"], config["karma_route"]) == ("map-wide", "valhalla")
     elif name == "one-run":
         assert "altar_policy" not in config and "karma_route" not in config
+        launched = json.loads((root / source.name / "farmer.cfg").read_bytes())
+        assert "altar_policy" not in launched and "karma_route" not in launched
     if name == "catalog":
         assert (out / "catalog.catalog.json").is_file()
     assert (root / source.name / "patches" / "official.pck").samefile(source / "patches/official.pck")
@@ -151,8 +153,9 @@ def test_rotation_judges_accept_different_seeded_starts(verification, monkeypatc
     row = execute(verification, scenario)
     assert row["verdict"] == "PASS", row
     logs = (out / f"{scenario}.crash.farmer.log", out / f"{scenario}.farmer.log")
-    starts = [line.split(" ROTATION_START stage=")[1] for log in logs if log.is_file()
-              for line in log.read_text().splitlines() if " ROTATION_START stage=" in line]
+    starts = [line.split(" ROTATION_START stage=")[1].removesuffix(" selection=random")
+              for log in logs if log.is_file() for line in log.read_text().splitlines()
+              if " ROTATION_START stage=" in line]
     assert starts == [first]
 
 
@@ -229,6 +232,8 @@ def test_hell_rotation_requires_a_real_finale_win(verification, monkeypatch, fau
     ("keep-unowned-legendaries", "ignored-wishlist-priority", "wrong items added to saved storage"),
     ("run-choice", "wrong-run-journal-target", "wrong location or difficulty in journal"),
     ("location-rotation", "locked-rotation-location", "wrong location or difficulty in journal"),
+    ("location-rotation", "unlogged-random-start", "must log exactly one random start"),
+    ("location-rotation-resume", "unlogged-random-start", "must log exactly one random start"),
     ("oaths", "wrong-oath-journal-points", "wrong oath points in journal"),
     ("oaths", "changed-saved-oaths", "saved oath set changed"),
     ("invalid-location", "no-choice-diagnostic", "failure detail did not name the invalid field and value"),
@@ -242,6 +247,11 @@ def test_hell_rotation_requires_a_real_finale_win(verification, monkeypatch, fau
     ("valkyrie-drill", "meteor-hit", "Caída de Valhalla hit or killed the hero"),
     ("valkyrie-drill", "meteor-contact", "Caída de Valhalla hit or killed the hero"),
     ("valkyrie-drill", "meteor-incomplete", "expected ten complete six-mark"),
+    ("hel-route-drill", "early-hel-route", "Niflheim route was not entered after the regular MVP"),
+    ("hel-route-drill", "no-randgris-kill", "Fallen Randgris was not killed after entering Niflheim"),
+    ("hel-route-drill", "no-hel-pact", "Pact of Hel was not applied"),
+    ("hel-route-drill", "hel-death", "hero died or fell in the Hel route drill"),
+    ("hel-route-drill", "no-randgris-journal", "journal did not record the Fallen Randgris arena kill"),
     ("mvp-mechanics-drill", "mvp-contact", "MVP drill mechanic hit or killed the hero"),
     ("mvp-mechanics-drill", "mvp-incomplete", "MVP drill did not witness every strike"),
     ("mvp-mechanics-drill", "mvp-fall", "MVP drill journal has missing or nonzero fall counts"),
@@ -455,22 +465,25 @@ def test_soak_samples_real_supervisor_with_fake_game(verification, tmp_path, cus
         with pytest.raises(ValueError, match="Linux only"):
             execute(verification, "soak", hours=0.00001)
         return
-    preset = None
+    strategy = None
     if custom == "strategy":
-        preset = tmp_path / "custom.json"
-        preset.write_text(json.dumps({"builds": {"archer": {"job_path": 1}},
-                                      "job_paths": {"swordsman": 2}}))
+        strategy = tmp_path / "custom.json"
+        strategy.write_text(json.dumps({"builds": {"archer": {"job_path": 1}},
+                                        "job_paths": {"swordsman": 2}, "karma_route": "natural"}))
     elif custom == "character":
-        preset = tmp_path / "character.json"
-        preset.write_text(json.dumps({"class": "acolyte", "job_paths": {"acolyte": 1}, "stage": "payon",
-                                      "danger": 12, "experimental_speed": True}))
-    row = execute(verification, "soak", hours=0.00001, soak_preset=preset)
+        strategy = tmp_path / "character.json"
+        strategy.write_text(json.dumps({"class": "acolyte", "job_paths": {"acolyte": 1}, "stage": "payon",
+                                        "danger": 12, "experimental_speed": True}))
+    row = execute(verification, "soak", hours=0.00001, soak_preset=strategy)
     assert row["verdict"] == "FAIL" and row["exit"] == 0  # No post-warmup RSS in this intentionally short run.
     verdict = (out / "soak.verdict.log").read_text()
     assert "no game RSS sample after the first hour" in verdict
     summary = json.loads(verdict.splitlines()[0])
     assert summary["runs"] == 1
     config = json.loads(next(root.glob("*/farmer.cfg")).read_text())
+    assert config["karma_route"] == ("natural" if custom == "strategy" else "valhalla")
+    if custom is None:
+        assert (config["endless"], config["danger_ceiling"], config["altar_policy"]) == (False, 20, "cautious")
     if custom == "character":
         assert (config["class"], config["job_paths"], config["stage"], config["danger"]) == (
             "acolyte", {"acolyte": 1}, "payon", 12)
@@ -492,7 +505,7 @@ def test_supervisor_recovers_only_its_configured_session_prefix(verification, mo
     os_, _, _, _, out, root = verification
     profile = make_profile(root, "Sandbox Profile")
     session = f"{saved}-{'1' * 32}"
-    request = commands.submit(os_, commands.Start(commands.Character("swordsman", 0), out / "preset.json"))
+    request = commands.submit(os_, commands.Start(commands.Character("swordsman", 0)))
     session_path = os_.app_data_dir() / "session.json"
     session_path.write_text(json.dumps({"id": session, "profile": str(profile),
                                         "start": json.loads(request.read_text()), "request": request.name}))

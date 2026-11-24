@@ -61,7 +61,7 @@ def test_service_waits_for_a_missing_profile_and_discovers_it(tmp_path, monkeypa
             unavailable = read_state(os_)
             assert unavailable.kind is StateKind.FARMER_UNAVAILABLE
             assert unavailable.reason == "start the game and accept the update"
-            request = submit(os_, Start(Character("archer", 1), tmp_path / "preset.json"))
+            request = submit(os_, Start(Character("archer", 1)))
             wait_for("refused start")
             refusal, = read_state(os_).command_refusals
             assert refusal["request"] == request.name and refusal["reason"] == unavailable.reason
@@ -119,8 +119,7 @@ def test_corrupt_or_foreign_saved_session_is_quarantined(tmp_path, monkeypatch, 
         "id": "afk-" + uuid.uuid4().hex,
         "request": "consumed-request.json",
         "profile": str(profile.with_name("Different profile")),
-        "start": {"command": "start", "character": {"class": "thief", "job_path": 0},
-                  "preset": str(tmp_path / "preset.json")},
+        "start": Start(Character("thief", 0)).payload(),
     }) if foreign else "{corrupt"
     marker.write_text(saved)
     output = tmp_path / "quarantine.log"
@@ -167,7 +166,7 @@ def test_service_reports_both_ambiguous_profiles_in_state_and_refusal(tmp_path, 
     os_ = platform.current()
     make_profile(godot_root(tmp_path), "First game profile")
     make_profile(godot_root(tmp_path), "Second game profile")
-    request = submit(os_, Start(Character("archer", 1), tmp_path / "preset.json"))
+    request = submit(os_, Start(Character("archer", 1)))
     with subprocess.Popen(SERVICE, env=service_env(tmp_path), stdout=subprocess.DEVNULL) as child:
         try:
             deadline = time.monotonic() + 5

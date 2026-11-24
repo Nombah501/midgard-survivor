@@ -1,6 +1,6 @@
 # The window owns the run choice; a preset owns only strategy
 
-Status: accepted
+Status: accepted; the preset half is superseded by ADR 0011 (fixed Mode, Route in the window)
 
 The app spec had a preset carry location and difficulty and the window never edit presets, so choosing where and how hard to play meant picking or writing a preset. The operator wants to choose like in the game. The window is now the single source of the run choice: character, location (or Automatic), difficulty (or Automatic, else a fixed level in the location's range), oaths, the keep wishlist and the maintenance switches, fixed at Start or Resume and stored per machine. A preset keeps only strategy: objective, speeds, session limits and the ceiling Automatic may reach; `stage`, `danger` and `class` leave the presets.
 

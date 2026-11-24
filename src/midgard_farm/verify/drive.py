@@ -252,27 +252,26 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
     if crash_at:
         hooks["FARMER_TEST_CRASH_AT"] = crash_at
     config = json.loads(run.artifact("json").read_bytes())
-    if sample and "class" not in config:
-        start = Start(None, run.artifact("json"))  # A strategy-only soak preset leaves the choice to the farmer.
-    else:
-        # Session keys (character, run choice, switches) go to Start, as the window sends them.
-        cid = config.pop("class")
-        danger = config.pop("danger")
-        switches = {}
-        defaults = SessionSettings().maintenance()
-        for name, keys in MAINTENANCE_CONFIG_KEYS.items():
-            enabled, *paired = (config.pop(key, defaults[name]) for key in keys)
-            if any(value != enabled for value in paired):
-                raise ValueError(f"verify config disagrees on the {name} switch")
-            switches[name] = enabled
-        settings = SessionSettings(config.pop("stage") or None, None if danger == "auto" else danger,
-                                   config.pop("oaths", {}), config.pop("wishlist", []),
-                                   show_game_window=config.pop("display", False),
-                                   keep_unowned_legendaries=config.pop("keep_unowned_legendaries", False),
-                                   experimental_speed=config.pop("experimental_speed", False), **switches)
-        strategy = run.artifact("strategy.json")
-        strategy.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        start = Start(Character(cid, config.get("job_paths", {}).get(cid, 0)), strategy, settings)
+    # Session keys go to Start; the sandbox-only strategy stays outside the command protocol.
+    cid = config.pop("class", None)
+    danger = config.pop("danger", "auto")
+    switches = {}
+    defaults = SessionSettings().maintenance()
+    for name, keys in MAINTENANCE_CONFIG_KEYS.items():
+        enabled, *paired = (config.pop(key, defaults[name]) for key in keys)
+        if any(value != enabled for value in paired):
+            raise ValueError(f"verify config disagrees on the {name} switch")
+        switches[name] = enabled
+    settings = SessionSettings(config.pop("stage", None) or None, None if danger == "auto" else danger,
+                               config.pop("oaths", {}), config.pop("wishlist", []),
+                               show_game_window=config.pop("display", False),
+                               keep_unowned_legendaries=config.pop("keep_unowned_legendaries", False),
+                               experimental_speed=config.pop("experimental_speed", False),
+                               mode="endless" if config.get("endless") else "short", **switches)
+    strategy = run.artifact("strategy.json")
+    strategy.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    character = Character(cid, config.get("job_paths", {}).get(cid, 0)) if cid is not None else None
+    start = Start(character, settings)
     pause_sent = resume_sent = False
 
     with (run.os.acquire_lock(app_data / "service.lock"),
@@ -318,7 +317,7 @@ def supervised(run: Run, timeout: float, *, kill_run: bool = False, crash_at: st
 
         policy = replace(run.policy, stop_grace=120 if sample else 30)
         Supervisor(run.os, run.profile, policy, stop_requested_at, lambda *_: None,
-                   state=state, session_prefix="verify").run()
+                   state=state, session_prefix="verify", strategy=strategy).run()
 
     logs = run.artifact("supervisor") / log_dir.name
     outcome: dict = {}

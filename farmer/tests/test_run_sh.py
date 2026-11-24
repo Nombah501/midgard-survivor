@@ -115,14 +115,14 @@ def test_manual_launch_keeps_network_and_needs_no_unshare(launcher):
     "auto_rebirth_lv", "override_pick_order", "pet_priority", "auto_keep",
     "class_rotate", "classes", "stage_pool", "keep_on_defeat", "swap_margin",
 ])
-@pytest.mark.parametrize("use_preset", [False, True], ids=["farmer-cfg", "preset"])
-def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_preset):
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["farmer-cfg", "strategy"])
+def test_obsolete_config_key_refuses_launch(launcher, tmp_path, key, use_strategy):
     run, data, _ = launcher
     cfg = data / "farmer.cfg"
-    source = tmp_path / "old preset.json" if use_preset else cfg
+    source = tmp_path / "old strategy.json" if use_strategy else cfg
     source.write_text(json.dumps({key: False}))
     original = cfg.read_bytes()
-    args = [source] if use_preset else []
+    args = [source] if use_strategy else []
 
     result = subprocess.run([run, *args], capture_output=True, text=True, timeout=10)
 

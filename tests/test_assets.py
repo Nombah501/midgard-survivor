@@ -16,7 +16,8 @@ _REPO = Path(__file__).resolve().parents[1]
 def test_checkout_resolves_farmer_and_project_version():
     expected = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     assert assets.farmer_inputs() == _REPO / "farmer"
-    assert assets.presets_dir() == _REPO / "farmer" / "presets"
+    assert assets.modes_dir() == _REPO / "farmer" / "modes"
+    assert sorted(path.name for path in assets.modes_dir().glob("*.json")) == ["endless.json", "short.json"]
     assert assets.targets_path() == _REPO / "farmer" / "targets.json"
     assert assets.version() == expected
 
@@ -27,7 +28,8 @@ def test_bundled_assets_and_version_without_a_checkout(tmp_path, monkeypatch, fr
     bundled = package / "_farmer"
     checkout = _REPO / "farmer"
     for name in ("src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py",
-                 "scenarios/one-run.json", "targets.json", "obsolete_config_keys.json"):
+                 "modes/endless.json", "modes/short.json", "scenarios/one-run.json", "targets.json",
+                 "obsolete_config_keys.json"):
         target = bundled / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(checkout / name, target)
@@ -40,7 +42,7 @@ def test_bundled_assets_and_version_without_a_checkout(tmp_path, monkeypatch, fr
     monkeypatch.chdir(tmp_path)
 
     assert assets.farmer_inputs() == bundled
-    assert assets.presets_dir() == bundled / "presets"
+    assert assets.modes_dir() == bundled / "modes"
     assert assets.targets_path() == bundled / "targets.json"
     assert assets.version() == "12.34.5"
     assert farmer_hash(assets.farmer_inputs()) == farmer_hash(checkout)
@@ -96,7 +98,7 @@ def test_onedir_smoke_accepts_an_aliased_extraction_path(tmp_path, monkeypatch):
         target = inputs / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(checkout / name, target)
-    shutil.copytree(checkout / "presets", inputs / "presets")
+    shutil.copytree(checkout / "modes", inputs / "modes")
     plugins = onedir / "_internal" / "PySide6" / "Qt" / "plugins" / "platforms"
     plugins.mkdir(parents=True)
     for platform in ("qoffscreen", "qwayland", "qxcb"):
@@ -138,7 +140,7 @@ def test_onedir_smoke_accepts_an_aliased_extraction_path(tmp_path, monkeypatch):
                     "farmer_hash": farmer_hash(selected), "registration": ""}
         targets = json.loads((inputs / "targets.json").read_bytes())
         return {"version": assets.version(), "loaded": True, "messages": [],
-                "presets": sorted(path.name for path in (inputs / "presets").glob("*.json")),
+                "mode": "endless", "route": "valhalla",
                 "characters": [row["label"] for row in targets["characters"].values()]}
 
     monkeypatch.setattr(check_onedir.subprocess, "run", run_command)

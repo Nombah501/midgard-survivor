@@ -14,11 +14,11 @@ One person: the Operator, who owns the Midgard Survivors profile and runs the fa
 
 ## Product Purpose
 
-Midgard Farm runs Midgard Survivors unattended (AFK) for hours through a background service and a farmer patch. The window does not play; it lets the Operator choose the run (character, preset, location, difficulty, oaths, wishlist, maintenance switches), start/pause/finish/abort the session, see what the farm earns and did (history, last night), keep the game and the App updated, and understand quarantine when something is refused. Success: setup is fast and unambiguous, and one look tells whether the farm is working and what it earned.
+Midgard Farm runs Midgard Survivors unattended (AFK) for hours through a background service and a farmer patch. The window does not play; it lets the Operator choose the run (character, mode, location, difficulty, oaths, route, wishlist, maintenance switches), start/pause/finish/abort the session, see what the farm earns and did (history, last night), keep the game and the App updated, and understand quarantine when something is refused. Success: setup is fast and unambiguous, and one look tells whether the farm is working and what it earned.
 
 ## Positioning
 
-A personal tool that plays the game exactly as it is, never changes the Operator's prepared character (ADR 0008) and lets the window own the run choice while presets own strategy (ADR 0009). It never submits farmer runs online.
+A personal tool that plays the game exactly as it is, never changes the Operator's prepared character (ADR 0008) and lets the window own the whole run choice, including a fixed Mode and the karma Route (ADR 0009, ADR 0011). It never submits farmer runs online.
 
 ## Operating Context
 
@@ -32,7 +32,7 @@ A personal tool that plays the game exactly as it is, never changes the Operator
 - Screens today: AFK session, History, Updates, Quarantine; abort confirmation dialog.
 - Controls are addressed by `objectName` in GUI tests (`tests/test_gui.py`); renamed or removed object names break tests and must be migrated with them.
 - QML resources are compiled into `src/midgard_farm/gui/_resources.py` with `pyside6-rcc`; regenerate after QML edits.
-- Copy is English; game terms (Location, Difficulty, Oath, Preset, Wishlist, Keep, Valkyrie, MVP) follow `GLOSSARY.md`.
+- Copy is English; game terms (Location, Difficulty, Oath, Mode, Route, Wishlist, Keep, Valkyrie, MVP) follow `GLOSSARY.md`.
 - Must render identically under Linux and Windows Qt styles; no web fonts or network assets.
 
 ## Evidence on Hand

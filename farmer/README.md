@@ -20,7 +20,7 @@ cd /home/n501/orca/projects/midgard-survivor/farmer
 ./tools/farm.py --list          # персонажи и локации
 ./tools/farm.py --char sinx --stage prontera --danger 25
 ./tools/farm.py --char sniper --stage payon --danger 20
-./run.sh presets/steady.json    # бесконечный авто-фарм
+./run.sh modes/short.json      # короткие забеги до MVP
 ```
 
 Команды `finish`, `abort`, `pause`, `resume` описаны в
@@ -37,7 +37,7 @@ tail -f "$HOME/.local/share/godot/app_userdata/Midgard Survivors/farmer.log"
 SHA официального патча и установленного фермерского патча; при обновлении игры
 нужно пересобрать (`./build.sh && ./install.sh`). Exit `run.sh`: 0 — чистый
 финиш, 78 — ошибка, которую рестарт не исправит (нет игры/патча, обновился
-официальный патч, устаревшая сборка, плохой пресет, `farmer.cfg` не JSON-объект,
+официальный патч, устаревшая сборка, `farmer.cfg` не JSON-объект,
 каталог профиля недоступен на запись или на его диске меньше
 `FARMER_MIN_FREE_MB`, по умолчанию 200 MiB), 1 — второй `run.sh` или уже
 запущенная игра, прочее — сбой.
@@ -45,8 +45,8 @@ SHA официального патча и установленного ферм
 ## AFK-сессия (supervisor)
 
 ```bash
-./tools/supervisor.py presets/night.json   # на переднем плане
-./tools/supervisor.py --print-unit presets/night.json \
+./tools/supervisor.py modes/short.json   # на переднем плане
+./tools/supervisor.py --print-unit modes/short.json \
   > ~/.config/systemd/user/midgard-farmer.service
 systemctl --user daemon-reload && systemctl --user start midgard-farmer
 journalctl --user -fu midgard-farmer
@@ -109,13 +109,13 @@ tmp="$(mktemp "$data/.farmer-command.XXXXXX")" &&
 | `pause` | Текущий run продолжается до settlement, keep и maintenance. Новые run не стартуют; `phase=paused` и heartbeat продолжают обновляться. |
 | `resume` | Снимает pause без перезапуска процесса. |
 
-Служба приложения принимает JSON-запросы. `start` передаёт абсолютный
-путь `preset`, `character` (`class` и `job_path`) и объект `settings`:
-`{"location":"prontera","difficulty":2}`. `null` в любом из двух полей
-означает Automatic. `resume` принимает тот же объект `settings`, но не
-меняет персонажа и пресет; `{"command":"resume"}` по-прежнему продолжает
-с прежними настройками. Служба атомарно обновляет `farmer.cfg`, затем
-передаёт фермеру `resume_settings`; изменения действуют со следующего забега.
+Служба приложения принимает JSON-запросы. `start` передаёт `character`
+(`class` и `job_path`) и объект `settings`, например:
+`{"location":"prontera","difficulty":2,"mode":"endless","route":"valhalla"}`.
+`null` в `location` или `difficulty` означает Automatic. `resume` принимает
+тот же объект `settings`, но не меняет персонажа; `{"command":"resume"}`
+продолжает с прежними настройками. Служба атомарно обновляет `farmer.cfg`,
+затем передаёт фермеру `resume_settings`; изменения действуют со следующего забега.
 
 «All locations in turn» передаётся как `settings.location: {"mode":"rotation"}`
 и записывается тем же объектом в `stage` в `farmer.cfg`. Строка `stage`
@@ -203,8 +203,8 @@ backup может отсутствовать.
 терминальную причину, журнал при `abort` до и после settlement, heartbeat во
 время pause и `resume` с тем же PID.
 
-`--soak=HOURS [--soak-preset=PRESET]` запускает пресет (по умолчанию
-`presets/night.json`, `max_minutes=HOURS×60`) под supervisor'ом и каждые 5 с
+`--soak=HOURS [--soak-preset=JSON]` запускает стратегию (по умолчанию
+`modes/short.json`, `max_minutes=HOURS×60`) под supervisor'ом и каждые 5 с
 пишет heartbeat, RSS игры и занятый диск в `soak.samples.jsonl`. Вердикт —
 `tools/soak_check.py`: FAIL при heartbeat gap > 15 с, росте RSS > 50% после
 первого часа, росте диска > 200 MiB, дубле `run_id`, расхождении totals с
@@ -227,30 +227,27 @@ cd ../gui
 Панель запускает `tools/farm.py`, показывает `farmer_status.json` и
 `farmer.log`, а при закрытии окна штатно останавливает фермера.
 
-## Пресеты
+## Режимы
 
 | Файл | Что делает |
 |---|---|
-| `presets/steady.json` | сбалансированный фарм, автоматическая сложность до 20 |
-| `presets/zeny.json` | цель — зеньги; авто-подбор сложности по измеренной доходности |
-| `presets/crumbs.json` | цель — Star Crumb, endless до 6 минут / 8 MVP |
-| `presets/hell-rotation.json` | цель — Star Crumb, endless до финального босса без лимита MVP; страховочный лимит 50 игровых минут |
-| `presets/progress.json` | продвижение на максимальной открытой сложности |
-| `presets/night.json` | ночной сбалансированный фарм, 8 часов, короткий endless |
+| `modes/short.json` | забеги до MVP, автоматическая сложность до 20, осторожный выбор алтарей |
+| `modes/endless.json` | забеги до финального босса, страховочный лимит 50 игровых минут |
 
-Пресет задаёт стратегию, а не выбор забега и не переключатели обслуживания.
-Служба отклоняет пресеты с `stage`, `danger`, `class`, `builds.class`,
+Маршрут в Endless выбирается отдельно: Valhalla, Hel или случайный маршрут
+на каждый забег. Tower не использует Mode и Route.
+Служба отклоняет файлы стратегий с `stage`, `danger`, `class`, `builds.class`,
 `oaths`, `wishlist`, `keep_unowned_legendaries`, `experimental_speed`, `auto_upgrades`, `auto_sage`, `auto_fuse`,
 `auto_potential` или `auto_storage_prune`: это настройки запуска, а не стратегии.
 Служба и `run.sh` отклоняют удалённые поля из `obsolete_config_keys.json`
-как в готовом конфиге, так и в пресетах, и называют поля, которые нужно удалить.
-`scenarios/one-run.json` — готовый конфиг smoke и verify, а не пресет:
+как в готовом конфиге, так и в файлах стратегий, и называют поля, которые нужно удалить.
+`scenarios/one-run.json` — готовый конфиг smoke и verify:
 один забег Swordsman/Prontera/D1.
 
 ## Выбор персонажа и локации
 
-В приложении персонаж и пресет фиксируются при Start. Локацию и сложность
-можно выбрать перед Start или в Pause перед Resume. Диапазон сложности
+В приложении персонаж фиксируется при Start. Локацию, сложность, режим и
+маршрут можно выбрать перед Start или в Pause перед Resume. Диапазон сложности
 берётся из каталога для выбранной локации; закрытые локации не выбираются,
 без каталога доступен только Automatic. Приложение запоминает выбор на
 этой машине. Если каталог пропал или выбор больше не доступен, Resume
@@ -258,7 +255,7 @@ cd ../gui
 их на Automatic. Если в каталоге больше нет сохранённой клятвы или её ранга,
 Start и Resume недоступны: откройте Show oaths и сбросьте клятву на Off.
 
-Для разового запуска `tools/farm.py` берёт базу `presets/crumbs.json`,
+Для разового запуска `tools/farm.py` берёт базу `modes/endless.json`,
 подставляет персонажа, локацию и сложность и запускает `run.sh`:
 
 ```bash
@@ -324,7 +321,7 @@ AFK-цикл: забег идёт до смерти/победы (на SinX D25 
 | `danger_ceiling` | 30 | верхняя граница автоподбора |
 | `explore_every` | 5 | как часто пробовать соседнюю руку |
 | `speed` | 4.0 | `Engine.time_scale` (реальное ускорение) |
-| `experimental_speed` | false | переключатель окна «Experimental: 8× speed»: `speed` = 8 вместо значения пресета; Tower по-прежнему задаёт скорость сам |
+| `experimental_speed` | false | переключатель окна «Experimental: 8× speed»: `speed` = 8 вместо значения режима; Tower по-прежнему задаёт скорость сам |
 | `game_speed` | 3 | штатный режим игры 1–3 (frenzy/game_fast) |
 | `run_minutes` | 12 | таймаут забега по игровому времени |
 | `arena_wall_max` | 180 | таймаут арены MVP по реальному времени |
@@ -507,7 +504,7 @@ tools/drive_supervisor.py  supervisor в sandbox: SIGKILL или сэмплы д
 tools/soak_check.py  вердикт soak по сэмплам, журналу и статусу
 tests/               pytest supervisor'а, run.sh и soak_check без игры
 tools/install_hooks.sh  git core.hooksPath=.githooks
-presets/*.json       конфиги
+modes/*.json         конфиги режимов
 patch_farmer.pck     собранный патч
 patch_farmer.info    манифест (SHA, bytecode, API)
 backups/             профили и baseline state.json

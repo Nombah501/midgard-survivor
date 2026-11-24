@@ -52,7 +52,7 @@ def farm(tmp_path, monkeypatch):
     return FarmFiles(platform, data, profile)
 
 
-def test_start_writes_only_a_request_and_remembers_both_picks(farm):
+def test_start_writes_only_a_request_and_remembers_run_choices(farm):
     from midgard_farm.gui.model import SessionModel
 
     farm.state()
@@ -61,14 +61,15 @@ def test_start_writes_only_a_request_and_remembers_both_picks(farm):
     assert view.phase == "Ready to start"
     assert view.can_start
     model.select_character(view.characters.index("Bard"))
-    model.select_preset(view.presets.index("steady.json"))
+    model.select_route("hel")
+    model.select_mode("short")
     assert model.start()
 
     [request] = list(commands.directory(farm.platform).glob("*.json"))
     command = commands.decode(json.loads(request.read_bytes()))
     assert isinstance(command, commands.Start)
     assert command.character == commands.Character("archer", 1)
-    assert command.preset.name == "steady.json"
+    assert command.settings.mode == "short" and command.settings.route == "hel"
     assert not model.poll().can_start
     assert model.start() is None  # Do not queue a second Start before the service responds.
     assert (farm.profile / "profile.json").read_bytes() == b"GDEC synthetic opaque profile"
@@ -77,7 +78,7 @@ def test_start_writes_only_a_request_and_remembers_both_picks(farm):
 
     view = SessionModel(farm.platform).poll()
     assert view.characters[view.character_index] == "Bard"
-    assert view.presets[view.preset_index] == "steady.json"
+    assert view.mode == "short" and view.route == "hel"
 
 
 def test_poll_displays_only_matching_run_and_uses_farmer_rates(farm, monkeypatch):
@@ -245,22 +246,12 @@ def test_idle_rebuild_quarantine_does_not_reuse_an_older_sessions_record(farm):
     assert view.quarantine.paths == [log]
 
 
-def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
+def test_catalog_gates_run_choice(farm):
     from midgard_farm.gui.model import SessionModel
 
     farm.state()
     model = SessionModel(farm.platform)
     view = model.poll()
-    assert view.presets == ["crumbs.json", "hell-rotation.json", "night.json", "progress.json", "steady.json", "zeny.json"]
-    assert "Balanced" in view.preset_description
-    assert "ceiling: 20" in view.preset_description
-    assert "480 min" in view.preset_description
-    model.select_preset(view.presets.index("hell-rotation.json"))
-    description = model.poll().preset_description
-    assert "Objective: Crumbs" in description
-    assert "Endless until the final boss" in description
-    assert "50 min per run" in description
-    model.select_preset(view.preset_index)
     assert [row["label"] for row in view.locations] == ["Automatic", "Endless Tower", "Torre de Hel"]
     assert [row["enabled"] for row in view.locations] == [True, False, False]
     assert view.difficulties == ["Automatic"]
@@ -284,6 +275,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
         "location": "prontera", "difficulty": 2, "oaths": {}, "wishlist": [],
         "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
         "show_game_window": False, "keep_unowned_legendaries": False, "experimental_speed": False,
+        "mode": "endless", "route": "valhalla",
     }
     model = SessionModel(farm.platform)
     view = model.poll()
@@ -293,7 +285,9 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
     assert not model.poll().can_pick_run_choice
     farm.state("active", session_id="afk-fixture", farmer_phase="paused")
     assert model.poll().can_pick_run_choice
-    assert not model.poll().can_pick_preset and not model.poll().can_pick_character
+    assert model.poll().can_pick_mode and model.poll().can_pick_route and not model.poll().can_pick_character
+    model.select_route("rotate")
+    model.select_mode("short")
     model.select_location("orc")
     view = model.poll()
     assert view.difficulties == ["Automatic", "4", "5", "6"]
@@ -306,6 +300,7 @@ def test_only_strategies_are_selectable_and_catalog_gates_run_choice(farm):
             "location": "orc", "difficulty": 6, "oaths": {}, "wishlist": [],
             "upgrades": True, "card_fusion": True, "star_smith": False, "storage_cleanup": False,
             "show_game_window": False, "keep_unowned_legendaries": False, "experimental_speed": False,
+            "mode": "short", "route": "rotate",
         },
     }
     view = SessionModel(farm.platform).poll()
@@ -371,19 +366,23 @@ def test_service_start_uses_only_the_platform_service_tool(farm, monkeypatch):
     assert not commands.directory(farm.platform).exists()
 
 
-def test_retired_preset_and_implicit_character_fall_back_to_window_choices(farm):
+def test_legacy_saved_choice_preserves_character_and_location_and_defaults_mode_and_route(farm):
     from midgard_farm.gui.model import SessionModel
 
     farm.state()
-    (farm.data / "window-settings.json").write_text(json.dumps({"class": None, "preset": "one-run.json"}))
+    (farm.profile / "farmer_catalog.json").write_text(json.dumps(CATALOG), encoding="utf-8")
+    (farm.data / "window-settings.json").write_text(json.dumps({
+        "class": "archer", "job_path": 1, "preset": "one-run.json",
+        "settings": {"location": "prontera", "difficulty": 3},
+    }), encoding="utf-8")
     model = SessionModel(farm.platform)
     request = model.start()
     assert request
     result = commands.decode(json.loads(request.read_bytes()))
     assert isinstance(result, commands.Start)
-    assert result.character is not None and result.preset.name == "night.json"
-    view = SessionModel(farm.platform).poll()
-    assert view.characters[view.character_index] == view.characters[0]
+    assert result.character == commands.Character("archer", 1)
+    assert result.settings == commands.SessionSettings("prontera", 3, mode="endless", route="valhalla")
+    assert not model.poll().action_error
 
 
 def history_fixture(farm, today=None):
@@ -814,6 +813,40 @@ def tower_catalog_fixture(*, hel_unlocked=False):
     return CATALOG | {"tower": {"open": True, "hel_unlocked": hel_unlocked,
                                "hel_reason": "" if hel_unlocked else "Clear floor 100 to unlock Torre de Hel.",
                                "checkpoints": [1, 11, 51], "snapshots": snapshots}}
+
+
+def test_afk_mode_and_route_pickers_follow_run_choice(open_dashboard, farm):
+    from PySide6.QtCore import Qt
+
+    (farm.profile / "farmer_catalog.json").write_text(json.dumps(tower_catalog_fixture(hel_unlocked=True)),
+                                                     encoding="utf-8")
+    farm.state()
+    window = open_dashboard("afkTab")
+    mode = ready_item(window, "modePicker")
+    route = ready_item(window, "routePicker")
+    assert mode.property("currentText") == "Endless until the final boss"
+    assert route.property("currentText") == "Valhalla"
+    key_click(window, "routePicker", Qt.Key.Key_Down)
+    wait_until(lambda: route.property("currentText") == "Hel")
+    key_click(window, "modePicker", Qt.Key.Key_Down)
+    wait_until(lambda: mode.property("currentText") == "Short runs (until the MVP)" and not route.property("enabled"))
+    key_click(window, "modePicker", Qt.Key.Key_Up)
+    wait_until(lambda: route.property("enabled"))
+    assert route.property("currentText") == "Hel"
+
+    for option in ("locationOption4", "locationOption5"):
+        click(window, "locationPicker")
+        click(window, option)
+        wait_until(lambda: not mode.property("enabled") and not route.property("enabled"))
+        click(window, "locationPicker")
+        click(window, "locationOption1")
+        wait_until(lambda: mode.property("enabled") and route.property("enabled"))
+
+    farm.state("active", session_id="afk-fixture", farmer_phase="run")
+    wait_until(lambda: not mode.property("enabled") and not route.property("enabled"))
+    farm.state("active", session_id="afk-fixture", farmer_phase="paused")
+    wait_until(lambda: mode.property("enabled") and route.property("enabled"))
+    assert not qml_item(window, "characterPicker").property("enabled")
 
 
 def test_afk_tower_picker_shows_snapshot_replaces_rules_and_sends_floor(open_dashboard, farm):

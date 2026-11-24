@@ -37,7 +37,7 @@ def setup_smoke(tmp_path, monkeypatch, fake_game_name):
     home = tmp_path / "real data"
     for name in ("XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"):
         monkeypatch.setenv(name, str(home))
-    monkeypatch.setenv("FARMER_DISPLAY", "1")  # Never overrides the smoke preset.
+    monkeypatch.setenv("FARMER_DISPLAY", "1")  # Never overrides the smoke config.
     monkeypatch.setenv("GAME_DIR", str(tmp_path / "fake game install"))
     os_ = FakeGamePlatform()
     os_.game_exe_name = fake_game_name
@@ -110,8 +110,8 @@ def test_smoke_mounts_and_plays_only_in_sandbox(setup_smoke, farmer_mounted):
     }
     assert record["official_linked"] and record["bridge_linked"]
     assert record["args"] == ["--headless"] and record["farmer_enabled"] == "1"
-    preset = Path(__file__).resolve().parents[1] / "farmer" / "scenarios" / "one-run.json"
-    assert record["config"] == json.loads(preset.read_text(encoding="utf-8")) | {
+    scenario = Path(__file__).resolve().parents[1] / "farmer" / "scenarios" / "one-run.json"
+    assert record["config"] == json.loads(scenario.read_text(encoding="utf-8")) | {
         "speed": 10.0, "max_runs": 1, "hard_exit": True, "endless": False, "display": False,
     }
     assert not record["stale_files"]

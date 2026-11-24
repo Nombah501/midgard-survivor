@@ -34,7 +34,7 @@ include-package-data = false
 "midgard_farm._farmer" = [
     "src/farmer.gd", "src/save_hook.gd",
     "tools/inject_hook.py", "tools/patch_player.py",
-    "presets/*.json", "scenarios/one-run.json", "targets.json",
+    "modes/*.json", "scenarios/one-run.json", "targets.json",
     "obsolete_config_keys.json",
 ]
 

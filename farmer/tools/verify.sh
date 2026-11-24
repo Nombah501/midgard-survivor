@@ -11,7 +11,7 @@
 #                          [--cmd-pause-resume] [--cmd-legacy] [--checkpoint-corrupt]
 #                          [--supervised-kill-run] [--supervised-crash-settled]
 #                          [--all] [--keep]
-#        ./tools/verify.sh --soak=HOURS [--soak-preset=PRESET] [--keep]
+#        ./tools/verify.sh --soak=HOURS [--soak-preset=JSON] [--keep]
 # Default: --all (every scenario except the soak).
 #
 # --crash-* kill the farmer at one checkpoint boundary (run start, after
@@ -24,7 +24,7 @@
 # (from outside) or after it (one-shot in-farmer hook); the supervisor restarts
 # the farmer, which must continue the session without a second settlement.
 #
-# --soak=HOURS runs PRESET (default presets/night.json, max_minutes=HOURS*60)
+# --soak=HOURS uses modes/short.json by default, with max_minutes=HOURS*60,
 # under the supervisor, samples heartbeat, game RSS and disk every 5 s and
 # judges the result with tools/soak_check.py (heartbeat gap, RSS after the
 # first hour, disk growth, duplicate run_id, totals == journal).
@@ -51,7 +51,7 @@ KEEP=0
 FAILED=0
 SCENARIOS=()
 SOAK_HOURS=""
-SOAK_PRESET="$FARMER_DIR/presets/night.json"
+SOAK_STRATEGY="$FARMER_DIR/modes/short.json"
 ALL_SCENARIOS=(one-run stop endless flush-fail crash-run crash-settled crash-journaled
 	cmd-finish cmd-abort cmd-abort-settled cmd-pause-resume cmd-legacy checkpoint-corrupt
 	supervised-kill-run supervised-crash-settled)
@@ -79,7 +79,7 @@ for arg in "$@"; do
 		--supervised-kill-run|--supervised-crash-settled)
 			SCENARIOS+=("${arg#--}") ;;
 		--soak=*) SOAK_HOURS="${arg#--soak=}"; SCENARIOS+=(soak) ;;
-		--soak-preset=*) SOAK_PRESET="$(realpath -- "${arg#--soak-preset=}")" ;;
+		--soak-preset=*) SOAK_STRATEGY="$(realpath -- "${arg#--soak-preset=}")" ;;
 		--all) SCENARIOS=("${ALL_SCENARIOS[@]}") ;;
 		--keep) KEEP=1 ;;
 		-h|--help) usage; exit 0 ;;
@@ -91,7 +91,7 @@ if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
 fi
 if [[ -n "$SOAK_HOURS" ]]; then
 	[[ "$SOAK_HOURS" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--soak needs a number of hours, got: $SOAK_HOURS"
-	[[ -f "$SOAK_PRESET" ]] || die "soak preset not found: $SOAK_PRESET"
+	[[ -f "$SOAK_STRATEGY" ]] || die "soak strategy not found: $SOAK_STRATEGY"
 fi
 
 # One game process per machine: concurrent verifications queue here instead
@@ -551,7 +551,7 @@ need(int(tot.get("zeny") or 0) == sum(int(r.get("zeny_gain") or 0) for r in rows
      "totals.zeny != journal zeny_gain sum")
 need(int(tot.get("started") or 0) == 2, "totals.started %s != 2" % tot.get("started"))
 # Independent of the journal: the profile's zeny moved exactly by the
-# accounted gains (the one-run preset spends nothing in maintenance).
+# accounted gains (the one-run config spends nothing in maintenance).
 with open(boot_log, encoding="utf-8") as fh:
     boot = re.search(r" BOOT .* zeny=(\d+)", fh.read())
 need(boot is not None, "no BOOT zeny in the crash launch log")
@@ -693,10 +693,10 @@ run_soak() {
 	local minutes deadline
 	minutes="$(python3 -c 'import sys; print(float(sys.argv[1]) * 60)' "$hours")"
 	deadline="$(python3 -c 'import sys; print(int(float(sys.argv[1]) * 3600) + 1800)' "$hours")"
-	write_cfg soak "{\"max_minutes\":$minutes,\"max_runs\":0,\"hard_exit\":true,\"display\":false}" "$SOAK_PRESET"
+	write_cfg soak "{\"max_minutes\":$minutes,\"max_runs\":0,\"hard_exit\":true,\"display\":false}" "$SOAK_STRATEGY"
 
 	reset_profile
-	echo "=== soak (${hours} h of $(basename "$SOAK_PRESET"), deadline ${deadline}s) ==="
+	echo "=== soak (${hours} h of $(basename "$SOAK_STRATEGY"), deadline ${deadline}s) ==="
 	printf '%s\n' "$session" >"$SB_DATA/farmer_supervisor_session"
 	set +e
 	env XDG_DATA_HOME="$SB" GAME_DIR="$GAME_DIR" timeout --foreground -k 120 "$deadline" \

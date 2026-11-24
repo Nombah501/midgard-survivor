@@ -26,6 +26,8 @@ class LocationTower(TypedDict):
 
 
 type LocationChoice = str | LocationRotation | LocationTower | None
+Mode = Literal["short", "endless"]
+Route = Literal["valhalla", "hel", "rotate"]
 
 
 def _decode_location(value: object) -> LocationChoice:
@@ -69,19 +71,27 @@ class SessionSettings:
     show_game_window: bool = False
     keep_unowned_legendaries: bool = False
     experimental_speed: bool = False
+    mode: Mode = "endless"
+    route: Route = "valhalla"
 
     @classmethod
     def decode(cls, value: object) -> "SessionSettings":
         if (not isinstance(value, dict) or not {"location", "difficulty"} <= value.keys()
-                or value.keys() - {"location", "difficulty", "oaths", "wishlist", "show_game_window",
+                or value.keys() - {"location", "difficulty", "mode", "route", "oaths", "wishlist", "show_game_window",
                                    "keep_unowned_legendaries", "experimental_speed", *MAINTENANCE_CONFIG_KEYS}):
             raise ValueError(
-                "settings must be an object with location, difficulty and optional oaths, wishlist and switches"
+                "settings must be an object with location, difficulty and optional mode, route, oaths, wishlist and switches"
             )
         location = _decode_location(value["location"])
         difficulty = value["difficulty"]
         if difficulty is not None and type(difficulty) is not int:
             raise ValueError("settings.difficulty must be an integer or null for Automatic")
+        mode = value.get("mode", cls.mode)
+        if mode not in ("short", "endless"):
+            raise ValueError('settings.mode must be "short" or "endless"')
+        route = value.get("route", cls.route)
+        if route not in ("valhalla", "hel", "rotate"):
+            raise ValueError('settings.route must be "valhalla", "hel" or "rotate"')
         oaths = value.get("oaths", {})
         if not isinstance(oaths, dict) or any(
             not isinstance(oath, str) or not oath.strip() or "\0" in oath or type(rank) is not int or rank <= 0
@@ -99,7 +109,7 @@ class SessionSettings:
             if not isinstance(enabled, bool):
                 raise ValueError(f"settings.{name} must be a boolean")
             switches[name] = enabled
-        return cls(location, difficulty, oaths, wishlist, **switches)
+        return cls(location, difficulty, oaths, wishlist, mode=mode, route=route, **switches)
 
     @property
     def tower(self) -> LocationTower | None:
@@ -113,6 +123,7 @@ class SessionSettings:
         switches = {key: enabled for name, enabled in self.maintenance().items() for key in MAINTENANCE_CONFIG_KEYS[name]}
         tower = self.tower
         return {"stage": self.location or "", "danger": "auto" if tower or self.difficulty is None else self.difficulty,
+                "karma_route": self.route,
                 "oaths": {} if tower else self.oaths, "wishlist": self.wishlist,
                 "keep_unowned_legendaries": self.keep_unowned_legendaries,
                 "experimental_speed": self.experimental_speed, **switches}
@@ -120,15 +131,14 @@ class SessionSettings:
 
 @dataclass(frozen=True)
 class Start:
-    character: Character | None  # Legacy clients may leave character selection to the farmer.
-    preset: Path
+    character: Character | None  # Verification may leave character selection to the farmer.
     settings: SessionSettings = field(default_factory=SessionSettings)
 
     def payload(self) -> dict:
         character = self.character
         return {"command": "start", "character": None if character is None else {
             "class": character.class_id, "job_path": character.job_path,
-        }, "preset": str(self.preset.absolute()), "settings": asdict(self.settings)}
+        }, "settings": asdict(self.settings)}
 
 
 @dataclass(frozen=True)
@@ -148,24 +158,27 @@ def decode(payload: object) -> Command:
         raise ValueError("command must be a JSON object")
     match payload.get("command"):
         case "resume":
+            if payload.keys() - {"command", "settings"}:
+                raise ValueError("resume only accepts optional settings")
             return Resume(SessionSettings.decode(payload["settings"])) if "settings" in payload else "resume"
         case "pause" | "finish" | "abort" | "check_again" | "restore_official" | "rollback_app" as action:
+            if payload.keys() != {"command"}:
+                raise ValueError(f"{action} does not accept additional fields")
             return action
         case "start":
-            preset = payload.get("preset")
-            if not isinstance(preset, str) or "\0" in preset or not Path(preset).is_absolute():
-                raise ValueError("start needs an absolute preset path")
+            if "character" not in payload or payload.keys() - {"command", "character", "settings"}:
+                raise ValueError("start needs character and accepts optional settings only")
             character = payload.get("character")
             settings = SessionSettings.decode(payload["settings"]) if "settings" in payload else SessionSettings()
-            if "character" in payload and character is None:
-                return Start(None, Path(preset), settings)
-            if not isinstance(character, dict):
-                raise ValueError("start needs a character with class and job_path")
-            class_id, job_path = character.get("class"), character.get("job_path")
-            if (not isinstance(class_id, str) or not class_id.strip()
+            if character is None:
+                return Start(None, settings)
+            if not isinstance(character, dict) or character.keys() != {"class", "job_path"}:
+                raise ValueError("start.character must be null or an object with class and job_path")
+            class_id, job_path = character["class"], character["job_path"]
+            if (not isinstance(class_id, str) or not class_id.strip() or "\0" in class_id
                     or type(job_path) is not int or job_path < 0):
                 raise ValueError("character needs a class and a nonnegative integer job_path")
-            return Start(Character(class_id, job_path), Path(preset), settings)
+            return Start(Character(class_id, job_path), settings)
         case _:
             raise ValueError("unknown service command")
 

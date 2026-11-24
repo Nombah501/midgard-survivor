@@ -7,7 +7,7 @@ Examples:
   ./tools/farm.py --char sniper --stage ra_san --danger 25
   ./tools/farm.py --class archer --job-path 0 --stage orc --danger 15
 
-The config is generated from presets/crumbs.json; the preset is not edited.
+The config is generated from modes/endless.json without editing the base strategy.
 The farmer still uses the selected class's profile pick_order/pick_limits.
 """
 import argparse
@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGETS_PATH = ROOT / "targets.json"
-BASE_PRESET = ROOT / "presets" / "crumbs.json"
+BASE_STRATEGY = ROOT / "modes" / "endless.json"
 
 
 def load_targets():
@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--speed", type=float, help="override Engine.time_scale")
     parser.add_argument("--run-minutes", type=float, help="override run timeout in game minutes")
     parser.add_argument("--max-runs", type=int, help="override session run cap")
-    parser.add_argument("--preset", default=str(BASE_PRESET), help="base preset JSON")
+    parser.add_argument("--preset", dest="strategy", default=str(BASE_STRATEGY), help="base strategy JSON")
     parser.add_argument("--dry-run", action="store_true", help="write and print config, do not run")
     args = parser.parse_args()
 
@@ -80,9 +80,9 @@ def main():
     if job_path < 0:
         parser.error("--job-path must be >= 0")
 
-    base = Path(args.preset)
+    base = Path(args.strategy)
     if not base.is_file():
-        parser.error(f"preset not found: {base}")
+        parser.error(f"strategy not found: {base}")
     with base.open(encoding="utf-8") as fh:
         cfg = json.load(fh)
 

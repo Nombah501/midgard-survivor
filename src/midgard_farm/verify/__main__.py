@@ -56,7 +56,7 @@ def _worker(argv: list[str]) -> int:
     if len(argv) != 7 or not auth or auth != argv[0]:
         print("verify: internal worker must be launched by the verification CLI", file=sys.stderr)
         return 2
-    _, source, candidate, work, name, hours, preset = argv
+    _, source, candidate, work, name, hours, strategy = argv
     work_path = Path(work)
     out = work_path.parents[1]
     interrupted_at = None
@@ -71,7 +71,7 @@ def _worker(argv: list[str]) -> int:
 
         try:
             result = run_scenario(platform.current(), Path(source), Path(candidate), work_path, out, name,
-                                  hours=float(hours), soak_preset=Path(preset) if preset else None,
+                                  hours=float(hours), soak_preset=Path(strategy) if strategy else None,
                                   stop_requested_at=requested)
         except InterruptedError as exc:
             print(f"verify: {exc}", file=sys.stderr)
@@ -84,7 +84,7 @@ def _worker(argv: list[str]) -> int:
 
 
 def _launch_worker(os_: platform.Platform, out: Path, source: Path, candidate: Path, game: Path,
-                   name: str, hours: float, preset: Path | None, stop: Callable[[], float | None]) -> int:
+                   name: str, hours: float, strategy: Path | None, stop: Callable[[], float | None]) -> int:
     work = out / "sandbox" / name
     work.mkdir(parents=True)
     env = os_.app_sandbox_environment(work)
@@ -93,7 +93,7 @@ def _launch_worker(os_: platform.Platform, out: Path, source: Path, candidate: P
     # Only the parent, which holds both verification locks, launches this worker.
     env[_WORKER_AUTH] = token
     argv = [sys.executable, "-B", "-m", "midgard_farm.verify", "_worker", token, str(source), str(candidate),
-            str(work), name, str(hours), str(preset) if preset else ""]
+            str(work), name, str(hours), str(strategy) if strategy else ""]
     with (out / f"{name}.worker.log").open("wb") as log, subprocess.Popen(
             argv, env=env, stdout=log, stderr=subprocess.STDOUT) as worker:
         while True:
@@ -116,7 +116,7 @@ def _print_summary(rows: list[dict]) -> None:
 
 
 def _suite(os_: platform.Platform, out: Path, source: Path, candidate: Path, game: Path, names: tuple[str, ...], *,
-           hours: float, preset: Path | None, keep: bool, stop: Callable[[], float | None]) -> int:
+           hours: float, strategy: Path | None, keep: bool, stop: Callable[[], float | None]) -> int:
     # Pin one build for the suite, even if the app publishes another candidate meanwhile.
     staged = out / "sandbox" / "candidate"
     staged.mkdir(parents=True)
@@ -142,7 +142,7 @@ def _suite(os_: platform.Platform, out: Path, source: Path, candidate: Path, gam
             exit_code = 2
             break
         print(f"=== {name} ===", flush=True)
-        code = _launch_worker(os_, out, source, staged, game, name, hours, preset, stop)
+        code = _launch_worker(os_, out, source, staged, game, name, hours, strategy, stop)
         result_path = out / f"{name}.result.json"
         if result_path.exists():
             row = json.loads(result_path.read_bytes())
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                       help="one bounded scenario (repeatable)")
     mode.add_argument("--all", action="store_true", help="all supported headless bounded scenarios")
     mode.add_argument("--soak", type=_hours, metavar="HOURS", help="run a Linux soak")
-    parser.add_argument("--soak-preset", type=Path, metavar="JSON", help="override the built-in night preset")
+    parser.add_argument("--soak-preset", type=Path, metavar="JSON", help="override the built-in short mode strategy")
     parser.add_argument("--candidate-dir", type=Path, metavar="DIR", help="read a built patch and its app metadata from DIR")
     parser.add_argument("--keep", action="store_true", help="retain sandbox profiles even on success")
     args = parser.parse_args(argv)
@@ -238,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         source = find_profile(os_.godot_user_data_root()).absolute()
         real_app = os_.app_data_dir().resolve()
         candidate = (args.candidate_dir or patch_info.farmer_dir(os_)).resolve()
-        preset = args.soak_preset.resolve(strict=True) if args.soak_preset else None
+        strategy = args.soak_preset.resolve(strict=True) if args.soak_preset else None
         game = os_.game_executable().absolute()
         if not game.is_file() or not os.access(game, os.X_OK):
             raise ValueError(f"game not found or not executable at {game}")
@@ -264,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             out = Path(tempfile.mkdtemp(dir=root, prefix=f"verify-{stamp}-"))
             try:
                 return _suite(os_, out, source, candidate, game, names, hours=args.soak or 0.0,
-                              preset=preset, keep=args.keep, stop=stop)
+                              strategy=strategy, keep=args.keep, stop=stop)
             finally:
                 _prune_failed_sandboxes(out)
     except InterruptedError as exc:

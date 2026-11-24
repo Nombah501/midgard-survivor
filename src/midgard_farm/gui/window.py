@@ -151,9 +151,13 @@ class _Backend(QObject):
     def selectCharacter(self, index: int) -> None:
         self._enqueue(partial(self._model.select_character, index))
 
-    @Slot(int)
-    def selectPreset(self, index: int) -> None:
-        self._enqueue(partial(self._model.select_preset, index))
+    @Slot(str)
+    def selectMode(self, mode: str) -> None:
+        self._enqueue(partial(self._model.select_mode, mode))
+
+    @Slot(str)
+    def selectRoute(self, route: str) -> None:
+        self._enqueue(partial(self._model.select_route, route))
 
     @Slot(int)
     def selectLocation(self, index: int) -> None:

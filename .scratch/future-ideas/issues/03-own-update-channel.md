@@ -1,6 +1,6 @@
 # 03: Own update channel with "Check for updates" and changelog
 
-**Status:** needs-triage (needs grilling)
+**Status:** resolved (shipped in 0.4.0: signed own channel, Check for updates and changelog in Updates; see CHANGELOG and ADR 0010)
 
 **Idea (Operator, 2026-11-22):** rethink App updates. No GitHub token, no dependence on a public repo. The App has its own update channel, a **Check for updates** button, a changelog for the new version, and a more human update flow overall.
 

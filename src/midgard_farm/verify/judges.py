@@ -229,9 +229,9 @@ def _unlocked_locations(run: Run) -> list[dict]:
 def _rotation_start(run: Run, locations: list[dict]) -> int:
     logs = (run.artifact("crash.farmer.log"), run.artifact("farmer.log"))
     starts = [start for log in logs if log.is_file()
-              for start in re.findall(r" ROTATION_START stage=(\S+)$",
+              for start in re.findall(r"^FARMER \S+ ROTATION_START stage=(\S+) selection=random$",
                                       log.read_text(encoding="utf-8"), re.MULTILINE)]
-    need(len(starts) == 1, "rotation must choose its start exactly once per session")
+    need(len(starts) == 1, "rotation must log exactly one random start per session")
     ids = [row["id"] for row in locations]
     need(starts[0] in ids, "rotation started at a locked or unknown location")
     return ids.index(starts[0])
@@ -341,6 +341,35 @@ def valkyrie_drill(run: Run, driven: Driven, status: dict, *, count: int) -> Non
     need(not failures, f"Caída de Valhalla hit or killed the hero: {failures}")
     need(len(waves) >= 10 and all(marks == "6" for _, marks, *_ in waves),
          "expected ten complete six-mark Caída de Valhalla waves")
+
+
+def hel_route_drill(run: Run, driven: Driven, status: dict) -> None:
+    _exit(driven)
+    _done(status)
+    need(status["totals"]["started"] == status["totals"]["runs"] == 1, "expected one completed Hel run")
+    log = run.artifact("farmer.log").read_text(encoding="utf-8")
+    mvps = list(re.finditer(r"^FARMER \S+ BOSS_WON t=\S+ mvps=1 ", log, re.MULTILINE))
+    routes = list(re.finditer(r"^FARMER \S+ KARMA_ROUTE side=dark mvp=randgris_fallen after_mvp=1 ", log, re.MULTILINE))
+    kills = list(re.finditer(
+        r"^FARMER \S+ RANDGRIS_KILLED mvp=randgris_fallen after_mvp=1 boons=(\d+) "
+        r"t=\S+ revives=\d+ falls=\d+ boon=(\w+)$", log, re.MULTILINE,
+    ))
+    need(len(mvps) == len(routes) == 1 and mvps[0].end() < routes[0].start(),
+         "Niflheim route was not entered after the regular MVP")
+    need(len(kills) == 1 and routes[0].end() < kills[0].start(),
+         "Fallen Randgris was not killed after entering Niflheim")
+    need(kills[0].groups() == ("1", "hel_pact"), "Pact of Hel was not applied")
+    rows = _journal(run.artifact("journal.jsonl"))
+    need(len(rows) == 1 and rows[0].get("run_id") == f"{run.session}-r1", "expected one Hel run in the journal")
+    row = rows[0]
+    need(row.get("died") is False and row.get("falls_by_mechanic") == {}
+         and not re.search(r"^FARMER \S+ PLAYER_(?:DIED|FELL) ", log, re.MULTILINE),
+         "hero died or fell in the Hel route drill")
+    need(row.get("victory") is True and not row.get("forced"), "Hel run did not settle normally as a win")
+    need(row.get("karma_side") == "dark" and row.get("randgris_kills") == 1
+         and any(timing.get("kind") == "randgris" and timing.get("boss") == "randgris_fallen"
+                 and timing.get("kill_ms") is not None for timing in row.get("arena_timings", [])),
+         "journal did not record the Fallen Randgris arena kill")
 
 
 def mvp_mechanics(run: Run, driven: Driven, status: dict, *, trials: int) -> None:

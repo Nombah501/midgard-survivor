@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
-from ..assets import presets_dir
+from ..assets import modes_dir
 from ..core import catalog, farmer_patch, patch_info, smoke
 from ..core.commands import LocationRotation, SessionSettings
 from ..core.supervisor import Policy
@@ -25,7 +25,7 @@ class Scenario:
     driver: Callable[[drive.Run, float], drive.Driven]
     judge: Callable[[drive.Run, drive.Driven, dict], None]
     linux_only: bool = False
-    preset: str | None = None
+    mode: str | None = None
 
 
 _SHORT: dict[str, object] = {"run_minutes": 0.2, "stall_seconds": 10.0}
@@ -124,7 +124,7 @@ SCENARIOS = {
         "stage": "prontera", "endless": False, "run_minutes": 12.0, "karma_route": "natural",
         "auto_achievements": False,
     }, partial(drive.supervised, crash_at="settled", FARMER_TEST_PROGRESS="1"),
-       judges.native_progress_parity, preset="hell-rotation.json"),
+       judges.native_progress_parity, mode="endless"),
     "tower-snapshot-parity": Scenario(300, {
         "class": "thief", "danger": 30, "max_runs": 2, "auto_achievements": False,
     }, partial(drive.direct, FARMER_TEST_TOWER_PARITY="1"), judges.tower_snapshot_parity),
@@ -156,11 +156,11 @@ SCENARIOS = {
     # Done + terminal metadata, endless victory with an MVP and kills, ENDLESS_DONE.
     "endless": Scenario(360, {"endless": True, "endless_minutes": 1.0, "endless_mvps": 2}, drive.direct, judges.endless),
     "hell-rotation": Scenario(1800, _HELL_RUN | {"stage": _ROTATION},
-                              drive.direct, judges.hell_rotation, preset="hell-rotation.json"),
+                              drive.direct, judges.hell_rotation, mode="endless"),
     **{
         f"hell-rotation-{stage}": Scenario(
             1800, _HELL_RUN | {"stage": stage}, drive.direct,
-            partial(judges.hell_rotation, stage=stage), preset="hell-rotation.json",
+            partial(judges.hell_rotation, stage=stage), mode="endless",
         )
         for stage in ("payon", "orc_dun", "nameless", "turtle")
     },
@@ -168,11 +168,13 @@ SCENARIOS = {
         "class": "thief", "stage": "prontera", "danger": 30, "oaths": _HELL_OATHS,
         "max_runs": _VALKYRIE_RUNS, "restart_seconds": 0, "endless": False,
     }, partial(drive.direct, FARMER_TEST_VALKYRIE="1"),
-       partial(judges.valkyrie_drill, count=_VALKYRIE_RUNS), preset="hell-rotation.json"),
+       partial(judges.valkyrie_drill, count=_VALKYRIE_RUNS), mode="endless"),
+    "hel-route-drill": Scenario(180, {"karma_route": "hel"},
+                                partial(drive.direct, FARMER_TEST_EARLY_MVP="1"), judges.hel_route_drill),
     "mvp-mechanics-drill": Scenario(240, _HELL_RUN | {
         "stage": "prontera", "max_runs": 3 * _MVP_DRILL_TRIALS, "restart_seconds": 0, "endless": False,
     }, partial(drive.direct, FARMER_TEST_MVP_MECHANICS="1"),
-       partial(judges.mvp_mechanics, trials=_MVP_DRILL_TRIALS), preset="hell-rotation.json"),
+       partial(judges.mvp_mechanics, trials=_MVP_DRILL_TRIALS), mode="endless"),
     "blocked-portal": Scenario(45, {"class": "thief", "danger": 30, "run_minutes": 0.1},
                                partial(drive.direct, FARMER_TEST_BLOCKED_PORTAL="1"), judges.blocked_portal),
     "field-navigation": Scenario(45, {
@@ -181,7 +183,7 @@ SCENARIOS = {
     "field-charge-drill": Scenario(90, {
         "class": "thief", "job_paths": {"thief": 0}, "stage": "prontera", "danger": 30,
         "oaths": _HELL_OATHS, "max_runs": 4, "restart_seconds": 0, "endless": False,
-    }, partial(drive.direct, FARMER_TEST_FIELD_CHARGE="1"), judges.field_charge, preset="hell-rotation.json"),
+    }, partial(drive.direct, FARMER_TEST_FIELD_CHARGE="1"), judges.field_charge, mode="endless"),
     # Fail the native save during keep; do not advance the checkpoint or journal rewards.
     "flush-fail": Scenario(180, _SHORT, partial(drive.direct, FARMER_TEST_FLUSH_FAIL="keep"), judges.flush_failed_keep),
     # Hook crash, same session, 2 started / 1 lost, only r2 journaled, totals and saved zeny agree, RUN_LOST.
@@ -265,13 +267,16 @@ def run_scenario(os_: Platform, source: Path, candidate: Path, work: Path, out: 
     if name == "soak":
         if not math.isfinite(hours * 3600) or hours <= 0:
             raise ValueError("--soak needs a positive, finite number of hours")
-        preset = json.loads((soak_preset or presets_dir() / "night.json").read_bytes())
-        if not isinstance(preset, dict):
-            raise ValueError("soak preset must be a JSON object")
-        config = preset | {"max_minutes": hours * 60, "max_runs": 0, "hard_exit": True}
+        strategy = json.loads((soak_preset or modes_dir() / "short.json").read_bytes())
+        if not isinstance(strategy, dict):
+            raise ValueError("soak strategy must be a JSON object")
+        config = strategy | {"max_minutes": hours * 60, "max_runs": 0, "hard_exit": True}
         timeout = int(hours * 3600) + scenario.timeout
     else:
-        strategy = json.loads((presets_dir() / scenario.preset).read_bytes()) if scenario.preset else {}
+        strategy = {}
+        if scenario.mode is not None:
+            # These existing scenarios expect Valhalla unless they explicitly choose another route.
+            strategy = {"karma_route": "valhalla"} | json.loads((modes_dir() / f"{scenario.mode}.json").read_bytes())
         config = smoke.one_run_config() | strategy | scenario.cfg
         timeout = scenario.timeout
 

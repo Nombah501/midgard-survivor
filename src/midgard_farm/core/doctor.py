@@ -43,7 +43,7 @@ _QUARANTINE_FIXES = {
     "anchors_broken": "Install an App release compatible with this Game update, then use Game update → Check again.",
     "smoke_failed": "Review the sandbox smoke log, then use Game update → Check again after fixing the cause.",
     "preflight_failed": "Fix the failed Doctor checks and review the last attempt log before starting a new session.",
-    "cfg_invalid": "Correct the AFK preset or choose a built-in preset before starting a new session.",
+    "cfg_invalid": "Check the run choices and start a new AFK session.",
     "checkpoint_corrupt": "Preserve the logs and checkpoint; inspect the game save before starting a new session.",
     "flush_failed": "Check free space and profile access; verify the save in the game before starting again.",
 }

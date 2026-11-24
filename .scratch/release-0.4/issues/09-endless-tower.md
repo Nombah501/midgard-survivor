@@ -1,6 +1,6 @@
 # 09: Endless Tower and Torre de Hel as run choices
 
-**Status:** ready-for-agent (after wave 1: shares farmer.gd and the window)
+**Status:** resolved (shipped in 0.4.0: Endless Tower and Torre de Hel as run choices; see CHANGELOG)
 
 ## Operator decisions (2026-11-22)
 

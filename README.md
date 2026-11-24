@@ -18,9 +18,11 @@ If the legacy checkout mounted the farmer patch on Linux, restore the official p
 
 ## AFK settings
 
-Open **Maintenance** on the **AFK session** screen to choose Kafra/Sage upgrades, spare-card fusion, Star Smith for unworn items, and storage cleanup. Upgrades and fusion start enabled; Star Smith and cleanup start disabled. The window remembers these choices on this machine and applies them on **Start** or **Resume**. Presets tune limits and reserves, not which actions are enabled.
+Pick **Mode** and **Route** under **Run choice**. *Endless until the final boss* plays each run to the game's finale; *Short runs (until the MVP)* ends after the map MVP. **Route** picks the karma portal after each regular MVP in Endless: *Valhalla*, *Hel* (the farmer then also takes Hel altars) or *Random each run*. Towers ignore both. Preparing the character (gear, cards, stats, skills) is always the Operator's job; the farmer plays it as it is.
 
-**Show game window** on the **AFK session** screen is off by default and remembered on this machine. It applies the next time the game launches; changing it before **Resume** does not reopen the running game. The farmer plays the same way and Linux still isolates its network. Closing the game window is a game exit and may trigger a restart; use **Finish** to settle the current run and stop normally. Remove `display` from any old app preset. Developers can still force watch mode with `FARMER_DISPLAY=1` in the launcher's environment.
+Open **Maintenance** on the **AFK session** screen to choose Kafra/Sage upgrades, spare-card fusion, Star Smith for unworn items, and storage cleanup. Upgrades and fusion start enabled; Star Smith and cleanup start disabled. The window remembers these choices on this machine and applies them on **Start** or **Resume**.
+
+**Show game window** on the **AFK session** screen is off by default and remembered on this machine. It applies the next time the game launches; changing it before **Resume** does not reopen the running game. The farmer plays the same way and Linux still isolates its network. Closing the game window is a game exit and may trigger a restart; use **Finish** to settle the current run and stop normally. Developers can still force watch mode with `FARMER_DISPLAY=1` in the launcher's environment.
 
 ## App updates
 
@@ -97,16 +99,11 @@ With the service running, start `MidgardSurvivors.exe` manually once, accept any
 
    ```powershell
    @'
-   import json, tempfile
-   from pathlib import Path
    from midgard_farm.core.commands import Character, SessionSettings, Start, submit
    from midgard_farm.platform import current
 
-   preset = {"objective": "balanced", "max_runs": 3, "run_minutes": 12}
-   path = Path(tempfile.mkdtemp()) / "three-runs.json"
-   path.write_text(json.dumps(preset), encoding="utf-8")
-   print(submit(current(), Start(Character("swordsman", 0), path, SessionSettings("prontera", 1))))
+   print(submit(current(), Start(Character("swordsman", 0), SessionSettings("prontera", 1, mode="short"))))
    '@ | ..\.venv\Scripts\python.exe -
    ```
 
-   Close the window after the first run starts. Under `%LOCALAPPDATA%\MidgardFarm`, the newest `logs\supervisor-*\outcome.json` must report `kind: finished`, `reason: max_runs`, and `totals.runs: 3`. Check the matching entry in `history.jsonl`, a completion toast, and that `Get-Process MidgardSurvivors -ErrorAction SilentlyContinue` returns nothing. The matching farmer terminal status, not the Windows game exit code, proves the finish.
+   Close the window after the first run starts. When the third run has started, request **Finish** the same way with `submit(current(), "finish")`. Under `%LOCALAPPDATA%\MidgardFarm`, the newest `logs\supervisor-*\outcome.json` must report `kind: finished`, `reason: finish`, and `totals.runs: 3`. Check the matching entry in `history.jsonl`, a completion toast, and that `Get-Process MidgardSurvivors -ErrorAction SilentlyContinue` returns nothing. The matching farmer terminal status, not the Windows game exit code, proves the finish.

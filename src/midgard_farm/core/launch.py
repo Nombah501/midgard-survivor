@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..assets import modes_dir
 from ..platform import LockHeld, NetworkIsolationError, Platform
 from .backup import backup_directory, publish_known_good, snapshot_profile
 from .commands import Character, SessionSettings
@@ -100,14 +101,16 @@ def _select_character(config: dict, character: Character) -> None:
 
 
 def run_attempt(
-    os_: Platform, profile: Path, preset: Path | None, session_id: str | None, *,
+    os_: Platform, profile: Path, strategy: Path | None, session_id: str | None, *,
     take_service_lock: bool = False, character: Character | None = None,
-    settings: SessionSettings | None = None,
+    settings: SessionSettings | None = None, use_strategy_route: bool = False,
     paused: bool = False,
     log_path: Path | None = None, watch: Callable[[dict | None], str | None] | None = None,
     poll_interval: float = 0.05,
 ) -> AttemptExit:
     """Run one attempt; a watcher may return a reason to force-stop its tree."""
+    if strategy is None and settings is not None:
+        strategy = modes_dir() / f"{settings.mode}.json"
     game, info = check_prerequisites(os_, profile)
     with ExitStack() as locks:
         if take_service_lock:
@@ -124,7 +127,7 @@ def run_attempt(
             raise GameBusy("another farmer launcher holds the lock") from exc
         if os_.game_running():
             raise GameBusy("the game is already running; close it first")
-        plan = preflight(game, info, profile, preset, show_game_window=settings.show_game_window if settings else None)
+        plan = preflight(game, info, profile, strategy, show_game_window=settings.show_game_window if settings else None)
         if session_id:
             warning = os_.check_network_isolation()
             if warning:
@@ -133,12 +136,15 @@ def run_attempt(
         snapshot_profile(profile, backups)
         config = plan.config
         if character is not None or settings is not None:
-            assert preset is not None and config is not None, "session settings require a preset"
+            assert strategy is not None and config is not None, "session settings require strategy"
             selected = json.loads(config)
             if character is not None:
                 _select_character(selected, character)
             if settings is not None:
-                selected.update(settings.config())
+                choices = settings.config()
+                if use_strategy_route and "karma_route" in selected:
+                    del choices["karma_route"]
+                selected.update(choices)
             config = json.dumps(selected, indent=2).encode()
         if config is not None:
             os_.write_atomic(profile / "farmer.cfg", config)

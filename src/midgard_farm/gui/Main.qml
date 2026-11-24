@@ -760,14 +760,20 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     Layout.minimumWidth: 0
                                     spacing: 4
-                                    Caption { id: presetLabel; text: qsTr("Preset") }
+                                    Caption { id: modeLabel; text: qsTr("Mode") }
                                     StoneCombo {
-                                        objectName: "presetPicker"
-                                        Accessible.name: presetLabel.text
-                                        model: shell.session.presets
-                                        currentIndex: shell.session.preset_index
-                                        enabled: shell.session.can_pick_preset
-                                        onActivated: index => shell.backend.selectPreset(index)
+                                        objectName: "modePicker"
+                                        Accessible.name: modeLabel.text
+                                        model: [
+                                            { value: "endless", label: qsTr("Endless until the final boss") },
+                                            { value: "short", label: qsTr("Short runs (until the MVP)") }
+                                        ]
+                                        textRole: "label"
+                                        valueRole: "value"
+                                        currentValue: shell.session.mode
+                                        displayText: shell.session.tower_selected ? qsTr("Not used in Tower") : currentText
+                                        enabled: shell.session.can_pick_mode
+                                        onActivated: index => shell.backend.selectMode(valueAt(index))
                                     }
                                 }
                                 ColumnLayout {
@@ -856,6 +862,28 @@ ApplicationWindow {
                                         displayText: currentIndex < 0 ? qsTr("Saved floor unavailable") : currentText
                                         enabled: shell.session.can_pick_location && count > 0 && (count > 1 || currentIndex < 0)
                                         onActivated: index => shell.backend.selectTowerFloor(Number(textAt(index)))
+                                    }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    spacing: 4
+                                    Caption { id: routeLabel; text: qsTr("Route") }
+                                    StoneCombo {
+                                        objectName: "routePicker"
+                                        Accessible.name: routeLabel.text
+                                        model: [
+                                            { value: "valhalla", label: qsTr("Valhalla") },
+                                            { value: "hel", label: qsTr("Hel") },
+                                            { value: "rotate", label: qsTr("Random each run") }
+                                        ]
+                                        textRole: "label"
+                                        valueRole: "value"
+                                        currentValue: shell.session.route
+                                        displayText: shell.session.tower_selected ? qsTr("Not used in Tower")
+                                            : shell.session.mode === "short" ? qsTr("Endless only") : currentText
+                                        enabled: shell.session.can_pick_route
+                                        onActivated: index => shell.backend.selectRoute(valueAt(index))
                                     }
                                 }
                             }
@@ -1016,7 +1044,7 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         visible: speedSwitch.checked
                                         color: shell.warning
-                                        text: qsTr("Overrides the preset speed from the next run. Dodging is coarser; Tower keeps its own speed.")
+                                        text: qsTr("Overrides the default speed from the next run. Dodging is coarser; Tower keeps its own speed.")
                                         wrapMode: Text.Wrap
                                     }
                                 }
@@ -1156,12 +1184,6 @@ ApplicationWindow {
                                         onToggled: shell.backend.setMaintenance(modelData.key, checked)
                                     }
                                 }
-                            }
-                            Caption {
-                                Layout.fillWidth: true
-                                visible: text.length > 0
-                                text: shell.session.preset_description
-                                wrapMode: Text.Wrap
                             }
                             Caption {
                                 objectName: "catalogRefresh"

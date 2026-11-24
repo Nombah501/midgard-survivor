@@ -10,12 +10,13 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from ..assets import modes_dir
 from ..platform import NetworkIsolationError, Platform
 from . import catalog, commands, farmer_patch, game_update
 from .commands import Start
 from .history import append_event, read_history, session_summary
 from .launch import SHUTDOWN_GRACE_SECONDS, GameBusy, request_finish, run_attempt
-from .preflight import PreflightError
+from .preflight import PreflightError, read_launch_config
 from .run_progress import (
     HEARTBEAT_INTERVAL,
     RAID_STALL_WINDOW,
@@ -148,7 +149,7 @@ class Supervisor:
     def __init__(self, os_: Platform, profile: Path, policy: Policy,
                  stop_requested_at: Callable[[], float | None], notify: Callable[[str, str], None],
                  *, state: StateReporter, session_prefix: Literal["afk", "verify"] = "afk",
-                 before_start: Callable[[], bool] = lambda: False):
+                 before_start: Callable[[], bool] = lambda: False, strategy: Path | None = None):
         self.os = os_
         self.profile = profile
         self.policy = policy
@@ -157,6 +158,8 @@ class Supervisor:
         self.state = state
         self.session_prefix = session_prefix
         self._before_start = before_start
+        self._strategy = strategy  # Explicit strategy is for the sandbox verifier, not a service command.
+        self._use_strategy_route = strategy is not None
         self._last_totals: dict = {}
         self.session_path = os_.app_data_dir() / "session.json"
         self.queue = commands.directory(os_)
@@ -307,6 +310,7 @@ class Supervisor:
             if start.settings.tower != command.settings.tower:
                 refuse_command(self.os, self.state, path, "resume", "Finish this session and Start to change a Tower choice.")
                 return
+            previous_mode = start.settings.mode
             start = replace(start, settings=command.settings)
             if live:
                 config_path = self.profile / "farmer.cfg"
@@ -314,8 +318,13 @@ class Supervisor:
                     config = json.loads(self.os.read_shared(config_path))
                     if not isinstance(config, dict):
                         raise ValueError("farmer.cfg must be a JSON object")
+                    if self._strategy is None and previous_mode != command.settings.mode:
+                        strategy, _ = read_launch_config(modes_dir() / f"{command.settings.mode}.json", strategy=True)
+                        # The running child keeps its character and effective display mode.
+                        strategy.update({key: config[key] for key in ("class", "job_paths", "display") if key in config})
+                        config = strategy
                     self._write(config_path, config | command.settings.config())
-                except (OSError, ValueError, RecursionError) as exc:
+                except (OSError, ValueError, RecursionError, PreflightError) as exc:
                     # Settings are not committed or delivered if the config could not be prepared.
                     refuse_command(self.os, self.state, path, "resume", f"Cannot update farmer.cfg: {exc}")
                     return
@@ -323,6 +332,8 @@ class Supervisor:
         # Commit before acknowledgement or delivery: the next child can boot
         # with the same intent even if this child never sees its mailbox.
         self._save_session(updated)
+        if isinstance(command, commands.Resume):
+            self._use_strategy_route = False
         session.start, session.paused, session.control_request = start, updated.paused, path.name
         path.unlink()
         if live:
@@ -662,13 +673,14 @@ class Supervisor:
                  *, preflight_error: PreflightError | None) -> Attempt:
         start = session.start
         log_path = log_dir / f"attempt-{number:02d}.log"
-        log(f"attempt {number}: {start.preset}")
+        log(f"attempt {number}: {self._strategy or start.settings.mode}")
         launcher_detail = ""
         try:
             if preflight_error is not None:
                 raise preflight_error
-            result = run_attempt(self.os, self.profile, start.preset, session.id, character=start.character,
-                                 settings=start.settings, paused=session.paused, log_path=log_path,
+            result = run_attempt(self.os, self.profile, self._strategy, session.id, character=start.character,
+                                 settings=start.settings, use_strategy_route=self._use_strategy_route,
+                                 paused=session.paused, log_path=log_path,
                                  watch=self._watcher(session),
                                  poll_interval=max(0.05, min(POLL, self.policy.heartbeat_interval / 5)))
         except (PreflightError, NetworkIsolationError) as exc:

@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .. import assets
 from ..core import _app_releases, app_update, catalog, commands, doctor, game_update
@@ -19,12 +19,6 @@ from ..core.profile import ProfileNotFound, find_profile
 from ..core.state import ServiceState, StateKind, read_state
 from ..core.supervisor import session_log_dir
 from ..platform import Platform
-
-
-@dataclass(frozen=True)
-class _Preset:
-    path: Path
-    description: str
 
 
 def _mapping(value: object) -> dict[str, Any]:
@@ -44,7 +38,7 @@ def _character(class_id: object, job_path: object) -> commands.Character | None:
     return None
 
 
-def _catalog(os_: Platform) -> tuple[dict[commands.Character, str], list[_Preset], dict[str, str]]:
+def _catalog(os_: Platform) -> tuple[dict[commands.Character, str], dict[str, str]]:
     targets = _object(os_, assets.targets_path())
     characters: dict[commands.Character, str] = {}
     for value in _mapping(targets.get("characters")).values():
@@ -53,22 +47,7 @@ def _catalog(os_: Platform) -> tuple[dict[commands.Character, str], list[_Preset
         if character and isinstance(label := row.get("label"), str):
             characters[character] = label
     stages = {key: value for key, value in _mapping(targets.get("stages")).items() if isinstance(value, str)}
-    presets = []
-    for path in sorted(assets.presets_dir().glob("*.json")):
-        if not (data := _object(os_, path)):
-            continue
-        objective = _label(data.get("objective", "balanced"))
-        limits = [label.format(value) for key, label in (
-            ("run_minutes", "{:g} min per run"), ("max_runs", "{:g} runs"),
-            ("max_minutes", "{:g} min per session"), ("stop_after_wins", "{:g} wins"),
-        ) if (value := _number(data.get(key))) is not None and value > 0]
-        description = " · ".join((f"Objective: {objective}",
-                                  f"Automatic difficulty ceiling: {data.get('danger_ceiling', 30)}",
-                                  ", ".join(limits) if limits else "No run limits"))
-        if data.get("endless") is True and data.get("endless_minutes") == data.get("endless_mvps") == 0:
-            description += " · Endless until the final boss"
-        presets.append(_Preset(path, description))
-    return characters, presets, stages
+    return characters, stages
 
 
 _PHASES = {
@@ -556,9 +535,11 @@ class SessionView:
     can_resume: bool = False
     can_control: bool = False
     characters: list[str] = field(default_factory=list)
-    presets: list[str] = field(default_factory=list)
     character_index: int = -1
-    preset_index: int = -1
+    mode: commands.Mode = "endless"
+    route: commands.Route = "valhalla"
+    can_pick_mode: bool = False
+    can_pick_route: bool = False
     locations: list[dict[str, Any]] = field(default_factory=list)
     location_index: int = 0
     can_pick_location: bool = False
@@ -584,8 +565,6 @@ class SessionView:
     can_change_show_game_window: bool = False
     can_start: bool = False
     can_pick_character: bool = False
-    can_pick_preset: bool = False
-    preset_description: str = ""
     catalog_refresh: str = ""
     start_reason: str = ""
     start_refusal: str = ""
@@ -602,15 +581,11 @@ class SessionModel:
     def __init__(self, os_: Platform):
         self._os = os_
         self._settings = os_.app_data_dir() / "window-settings.json"
-        self._characters, self._presets, self._stages = _catalog(os_)
+        self._characters, self._stages = _catalog(os_)
         saved = _object(os_, self._settings)
         self._character = _character(saved.get("class"), saved.get("job_path"))
         if self._character not in self._characters:
             self._character = next(iter(self._characters), None)
-        self._preset = next((p for p in self._presets if p.path.name == saved.get("preset")), None)
-        if self._preset is None:
-            self._preset = next((p for p in self._presets if p.path.name == "night.json"),
-                                self._presets[0] if self._presets else None)
         try:
             self._session_settings = commands.SessionSettings.decode(saved["settings"])
         except (KeyError, ValueError):
@@ -706,10 +681,8 @@ class SessionModel:
         oath_points = sum(oath["ranks"][i]["points"] for oath in oaths
                           if (i := oath["selected_index"]) >= 0) if oath_difficulty else 0
         status = self._read_status(state, profile)
-        preset = self._preset
         options = list(self._characters)
         characters = list(self._characters.values())
-        presets = [p.path.name for p in self._presets]
         updates = self._updates(state, busy)
         quarantine = self._quarantine(state, not updates.action_blocker)
         farmer_phase = state.farmer_phase or ""
@@ -767,6 +740,7 @@ class SessionModel:
         resume_refusal, resume_pending = self._resume_feedback(state, paused)
         can_resume = paused and can_control and not resume_pending
         can_pick_run_choice = (not busy and not self._pending_start) or can_resume
+        can_pick_mode = can_pick_run_choice and tower_choice is None
         choice_blocker = tower_blocker or oath_blocker
         wishlist = self._session_settings.wishlist
         return SessionView(
@@ -781,12 +755,12 @@ class SessionModel:
             session_id=state.session_id or "", active=busy, paused=paused,
             can_control=can_control, can_pause=can_control and bool(farmer_phase),
             can_resume=can_resume and not choice_blocker,
-            characters=characters, presets=presets,
+            characters=characters,
             character_index=options.index(self._character) if self._character in self._characters else -1,
-            preset_index=self._presets.index(preset) if preset else -1,
+            mode=self._session_settings.mode, route=self._session_settings.route,
+            can_pick_mode=can_pick_mode, can_pick_route=can_pick_mode and self._session_settings.mode == "endless",
             can_start=not (reason or choice_blocker),
             can_pick_character=not busy and not tower_choice and bool(characters),
-            can_pick_preset=not busy and bool(presets), preset_description=preset.description if preset else "",
             locations=locations, location_index=location_index, difficulties=difficulties,
             difficulty_index=difficulty_index, can_pick_run_choice=can_pick_run_choice,
             can_pick_location=can_pick_run_choice and not active_tower,
@@ -1116,8 +1090,6 @@ class SessionModel:
             return "An AFK session is already active."
         if state.kind is not StateKind.IDLE:
             return state.reason or state.kind.value.replace("_", " ").capitalize()
-        if self._preset is None:
-            return "No presets found."
         if self._character is None:
             return "No character available."
         return ""
@@ -1127,9 +1099,14 @@ class SessionModel:
             self._character = list(self._characters)[index]
             self._save_picks()
 
-    def select_preset(self, index: int) -> None:
-        if self.poll().can_pick_preset and 0 <= index < len(self._presets):
-            self._preset = self._presets[index]
+    def select_mode(self, mode: str) -> None:
+        if mode in ("endless", "short") and self.poll().can_pick_mode:
+            self._session_settings = replace(self._session_settings, mode=cast(commands.Mode, mode))
+            self._save_picks()
+
+    def select_route(self, route: str) -> None:
+        if route in ("valhalla", "hel", "rotate") and self.poll().can_pick_route:
+            self._session_settings = replace(self._session_settings, route=cast(commands.Route, route))
             self._save_picks()
 
     def select_location(self, location: commands.LocationChoice) -> None:
@@ -1214,8 +1191,7 @@ class SessionModel:
         return settings if settings.difficulty == 30 else replace(settings, oaths={})
 
     def _save_picks(self) -> None:
-        choice: dict[str, Any] = {"preset": self._preset.path.name if self._preset else None, "class": None,
-                                  "settings": asdict(self._session_settings)}
+        choice: dict[str, Any] = {"class": None, "settings": asdict(self._session_settings)}
         if self._character is not None:
             choice.update({"class": self._character.class_id, "job_path": self._character.job_path})
         try:
@@ -1237,9 +1213,9 @@ class SessionModel:
 
     def start(self) -> Path | None:
         view = self.poll()
-        if not view.can_start or self._preset is None:
+        if not view.can_start:
             return None
-        request = self._submit(commands.Start(self._character, self._preset.path, self._selected_settings(view)))
+        request = self._submit(commands.Start(self._character, self._selected_settings(view)))
         if request is not None:
             self._last_start = request
             self._patch_request = None

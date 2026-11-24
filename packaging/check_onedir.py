@@ -91,11 +91,11 @@ def check(onedir: Path) -> None:
     size_mib = check_qt_files(onedir)
     checkout = _ROOT / "farmer"
     version = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    presets = sorted(checkout.glob("presets/*.json"))
+    modes = [checkout / "modes" / name for name in ("endless.json", "short.json")]
     expected_assets = [checkout / name for name in (
         "src/farmer.gd", "src/save_hook.gd", "tools/inject_hook.py", "tools/patch_player.py",
         "scenarios/one-run.json", "targets.json", "obsolete_config_keys.json",
-    )] + presets
+    )] + modes
     expected_hash = farmer_hash(checkout)
     expected_characters = {row["label"] for row in json.loads((checkout / "targets.json").read_bytes())["characters"].values()}
     suffix = ".exe" if os.name == "nt" else ""
@@ -148,7 +148,7 @@ def check(onedir: Path) -> None:
         window = run_role(onedir / f"midgard-farm{suffix}", "--smoke-test", home, env)
         assert window["loaded"] and not window["messages"], window
         assert window["version"] == version, window
-        assert window["presets"] == [path.name for path in presets], window
+        assert window["mode"] == "endless" and window["route"] == "valhalla", window
         assert expected_characters <= set(window["characters"]), window
     print(f"{version}: {size_mib:.1f} MiB onedir; setup, launcher, service, registration command and "
           f"offscreen QML passed; Farmer hash {expected_hash}")

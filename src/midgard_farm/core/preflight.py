@@ -86,9 +86,27 @@ def check_prerequisites(os_: Platform, profile: Path) -> tuple[Path, patch_info.
     return game, info
 
 
-def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, preset: Path | None, *,
+def read_launch_config(cfg: Path, *, strategy: bool) -> tuple[dict[str, Any], bytes]:
+    contents = _read_preflight_input(cfg, Path.read_bytes)
+    try:
+        config = _json_object(contents)
+    except ValueError as exc:
+        raise PreflightError(f"farmer.cfg is not a JSON object: {cfg}") from exc
+    obsolete = json.loads(_read_preflight_input(_OBSOLETE_KEYS, Path.read_bytes))
+    removed = [key for key in obsolete if key in config]
+    if strategy:
+        removed.extend(key for key in _SESSION_CONFIG_KEYS if key in config)
+        removed.extend(key for keys in MAINTENANCE_CONFIG_KEYS.values() for key in keys if key in config)
+        if isinstance(builds := config.get("builds"), dict) and "class" in builds:
+            removed.append("builds.class")
+    if removed:
+        raise PreflightError(f"remove unsupported keys from {cfg}: {', '.join(removed)}")
+    return config, contents
+
+
+def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, strategy: Path | None, *,
               show_game_window: bool | None = None) -> LaunchPlan:
-    """Check the mounted patch and preset under the launcher lock."""
+    """Check the mounted patch and launch configuration under the launcher lock."""
     patches = profile / "patches"
     state = patches / "state.json"
 
@@ -111,25 +129,11 @@ def preflight(game: Path, info: patch_info.PatchInfo, profile: Path, preset: Pat
     if mounted != patch_info.INSTALLED_PACK:
         raise PreflightError(f"state.json does not mount {patch_info.INSTALLED_PACK}; reinstall the farmer patch")
 
-    cfg = preset if preset is not None else profile / "farmer.cfg"
+    cfg = strategy if strategy is not None else profile / "farmer.cfg"
     if not cfg.is_file():
-        raise PreflightError(f"preset not found: {preset}" if preset else "no farmer.cfg; pass a preset or create one")
-    contents = _read_preflight_input(cfg, Path.read_bytes)
-    try:
-        config = _json_object(contents)
-    except ValueError as exc:
-        raise PreflightError(f"farmer.cfg is not a JSON object: {cfg}") from exc
-    obsolete = json.loads(_read_preflight_input(_OBSOLETE_KEYS, Path.read_bytes))
-    removed = [key for key in obsolete if key in config]
-    if preset is not None:
-        removed.extend(key for key in _SESSION_CONFIG_KEYS if key in config)
-        removed.extend(key for keys in MAINTENANCE_CONFIG_KEYS.values() for key in keys if key in config)
-        if isinstance(builds := config.get("builds"), dict) and "class" in builds:
-            removed.append("builds.class")
-    if removed:
-        source = f"preset {cfg}" if preset is not None else str(cfg)
-        raise PreflightError(f"remove unsupported keys from {source}: {', '.join(removed)}")
-    write_config = preset is not None
+        raise PreflightError(f"strategy not found: {cfg}" if strategy else "no farmer.cfg; pass a strategy or create one")
+    config, contents = read_launch_config(cfg, strategy=strategy is not None)
+    write_config = strategy is not None
     if os.environ.get("FARMER_DISPLAY") in {"1", "true"}:
         show_game_window = True
     if show_game_window is not None:

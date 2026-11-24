@@ -181,7 +181,8 @@ def main(argv: Sequence[str] | None = None, *, policy: Policy = Policy()) -> int
     parser.add_argument("--dry-run", action="store_true", help="render the service definition without registering it")
     subcommands = parser.add_subparsers(dest="command")
     launch = subcommands.add_parser("launch", help="launch one attempt with the installed farmer patch")
-    launch.add_argument("preset", nargs="?", type=Path, help="JSON preset; defaults to the profile's farmer.cfg")
+    launch.add_argument("strategy", nargs="?", type=Path, metavar="JSON",
+                        help="strategy JSON override; defaults to the profile's farmer.cfg")
     launch.add_argument("--session-id", default=os.environ.get("FARMER_SESSION_ID"),
                         help="run a supervised attempt (defaults to FARMER_SESSION_ID)")
     subcommands.add_parser("rollback-app", help="request rollback to the previous app version")
@@ -224,7 +225,7 @@ def main(argv: Sequence[str] | None = None, *, policy: Policy = Policy()) -> int
     if args.command == "launch":
         try:
             profile = find_profile(os_.godot_user_data_root())
-            result = run_attempt(os_, profile, args.preset, args.session_id, take_service_lock=True)
+            result = run_attempt(os_, profile, args.strategy, args.session_id, take_service_lock=True)
             status = result.status or {}
             code = result.normalized_code
             reason = status.get("finish_reason") or ""
