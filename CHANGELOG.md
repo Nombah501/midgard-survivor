@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.4] - 2026-11-25
 
 - Altars come first: the farmer heads for the best altar before the golden runner and pickups, and takes Baldur as soon as it can (an interrupted Baldur gets one more try at the MVP portal).
 - No more detours for loot: the magnet pulls gems, zeny and ores, the pet fetches chests and an MVP win pulls cards, so the farmer only walks to pet eggs (and to chests when no pet fetches them).
