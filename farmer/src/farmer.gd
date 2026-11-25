@@ -36,6 +36,7 @@ const FIELD_OPEN := 3
 const FIELD_NEIGHBORS := [Vector2i.RIGHT, Vector2i.DOWN, Vector2i.LEFT, Vector2i.UP]
 const PORTAL_CLEARANCE := 1.4
 const ALTAR_NO_PROGRESS := 5.0 # Allows Baldur's four-second calm window.
+const PICKUP_RANGE := 22.0
 const FIELD_CHARGE_SPEED := 17.0
 const FIELD_CHARGE_DURATION := 0.85
 const HAZARD_MARGIN := 0.3
@@ -1888,25 +1889,18 @@ func _steer_goal(hero) -> Vector3:
 	if morroc_goal != Vector3.INF:
 		_raid_goal = true
 		return morroc_goal
+	# Altars speed up the run and raise drops: take them before anything optional.
+	var altar := _map_altar_goal(hero) if map_wide else _best_altar(hero)
+	if altar != Vector3.INF:
+		return altar
 	var runner = world.runner
 	if runner != null and is_instance_valid(runner) and not bool(runner.dead):
 		var rp: Vector3 = runner.position
 		if _field_goal_available(rp) and (_flat_distance(rp, hero.position) <= 40.0 or _following_field_goal(rp)):
 			return rp
-	if map_wide:
-		var close_pick := _best_pickup(hero, GameData.ALTAR_RADIUS)
-		if close_pick != Vector3.INF:
-			return close_pick
-		var altar := _map_altar_goal(hero)
-		if altar != Vector3.INF:
-			return altar
 	var pick := _best_pickup(hero)
 	if pick != Vector3.INF:
 		return pick
-	if cfg["altar_policy"] != "map-wide":
-		var altar := _best_altar(hero)
-		if altar != Vector3.INF:
-			return altar
 	if world.quest != null and is_instance_valid(world.quest):
 		var qg: Vector3 = world.quest.autopilot_goal()
 		if _field_goal_available(qg):
@@ -1924,57 +1918,28 @@ func _following_field_goal(goal: Vector3) -> bool:
 
 
 
-func _best_pickup(hero, max_dist := INF) -> Vector3:
+# The magnet pulls gems, zeny and ores, the pet fetches every chest and an MVP
+# victory pulls cards, so only pet eggs are worth a detour (and chests when no
+# pet fetches them).
+func _best_pickup(hero) -> Vector3:
 	var best := Vector3.INF
-	var best_score := -1.0e30
-	var pickups: Array = world.pickups
-	for pk in pickups:
+	var best_dist := PICKUP_RANGE
+	var fetched: bool = hero.pet_fetch and world.pet_of(hero) != null
+	for pk in world.pickups:
 		if not (pk is Dictionary):
+			continue
+		var kind := str(pk.get("kind", ""))
+		if kind != "tame" and (kind != "chest" or fetched):
 			continue
 		var node = pk.get("node", null)
 		if node == null or not is_instance_valid(node):
 			continue
-		var kind := str(pk.get("kind", ""))
-		var prio := _pickup_priority(kind)
-		if prio <= 0.0:
-			continue
 		var at: Vector3 = node.position
-		var dist := Vector2(at.x - hero.position.x, at.z - hero.position.z).length()
-		var limit := 10.0
-		if kind == "chest":
-			limit = 25.0
-		elif kind == "card" or kind == "tame" or kind == "unique" or kind == "branch" or kind == "power":
-			limit = 22.0
-		elif kind == "ore":
-			limit = 14.0
-		if dist > minf(limit, max_dist) and not (max_dist == INF and _following_field_goal(at)):
-			continue
-		if not _field_goal_available(at):
-			continue
-		var score := prio - dist * 2.0
-		if kind == "chest":
-			score += float(pk.get("value", 1)) * 2.0
-		if score > best_score:
-			best_score = score
+		var dist := _flat_distance(at, hero.position)
+		if (dist <= best_dist or _following_field_goal(at)) and _field_goal_available(at):
 			best = at
+			best_dist = dist
 	return best
-
-
-func _pickup_priority(kind: String) -> float:
-	match kind:
-		"chest":
-			return 120.0
-		"card", "tame", "unique":
-			return 110.0
-		"branch", "power":
-			return 80.0
-		"ore":
-			return 60.0
-		"loot":
-			return 30.0
-		"xp":
-			return 8.0
-	return 0.0
 
 
 func _best_altar(hero) -> Vector3:
@@ -2041,7 +2006,7 @@ func _avoid_portal(start: Vector3, goal: Vector3, normal: Vector3) -> Vector3:
 
 
 func _altar_skip(entry: Dictionary, reason: String) -> void:
-	if reason == "baldur_waits_portal" or reason == "expires_first" or reason == "unreachable":
+	if reason == "expires_first" or reason == "unreachable":
 		# Position and speed can change while we pursue another altar.
 		if entry.has(reason):
 			return
@@ -2075,8 +2040,6 @@ func _observe_altars() -> void:
 			var reason := _altar_rejection(str(a.id))
 			if reason != "":
 				_altar_skip(entry, reason)
-			elif a.id == "baldur" and world.raid.state == "idle":
-				_altar_skip(entry, "baldur_waits_portal")
 	for key in _altar_seen.keys():
 		var entry: Dictionary = _altar_seen[key]
 		var a: Dictionary = entry.altar
@@ -2108,7 +2071,7 @@ func _altar_hold_goal(hero, baldur_only := false) -> Vector3:
 	if not baldur_only:
 		for a in world.altars.waiting:
 			if _flat_distance(hero.position, a.pos) < GameData.ALTAR_RADIUS \
-					and (a.id == "baldur" or _altar_rejection(str(a.id)) != "" \
+					and (_altar_rejection(str(a.id)) != "" \
 					or _altar_seen.get(a.node.get_instance_id(), {}).has("skip")):
 				# Proximity alone channels altars, even if they aren't a goal.
 				var away: Vector3 = hero.position - a.pos
@@ -2138,10 +2101,12 @@ func _map_altar_goal(hero, baldur_only := false) -> Vector3:
 	# Altars.waiting is the entire map; "near" in the game only drives visuals.
 	for a in world.altars.waiting:
 		var aid := str(a.id)
-		if (aid == "baldur") != baldur_only or _altar_rejection(aid) != "":
+		if (baldur_only and aid != "baldur") or _altar_rejection(aid) != "":
 			continue
 		var entry := _altar_entry(hero, a)
-		if entry.has("skip"):
+		# Baldur needs four seconds without a hit; a calm portal window gets one more try.
+		var retry: bool = baldur_only and entry.get("skip") == "channel_interrupted" and not entry.has("portal_retry")
+		if entry.has("skip") and not retry:
 			continue
 		var pos: Vector3 = a.pos
 		var target := _altar_target(hero, pos, avoid)
@@ -2161,6 +2126,8 @@ func _map_altar_goal(hero, baldur_only := false) -> Vector3:
 		_altar_channel = best
 		_altar_fill_peak = float(best.fill)
 		_altar_progress_clock = float(world.clock)
+		if baldur_only:
+			_altar_entry(hero, best)["portal_retry"] = true
 	return best_goal
 
 
@@ -3486,7 +3453,8 @@ func _test_tick_navigation() -> bool:
 			var altar: Dictionary = _test_nav.altar
 			if float(altar.fill) >= GameData.ALTAR_CHANNEL:
 				hero.position = Vector3(start.x, map.height_at(start), start.z)
-				world._drop_item(map.cell_center(237, 50), "card", "poring_card")
+				# Only pet eggs are worth a detour; the magnet and pet handle the rest.
+				world._drop_item(map.cell_center(237, 50), "tame", "poring", str(GameData.PETS["poring"].tame))
 				_test_nav = {"stage": "loot", "pickup": world.pickups.back(),
 					"until": now + 24.0, "progress": now, "at": start}
 		"loot":

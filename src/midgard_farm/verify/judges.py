@@ -292,13 +292,11 @@ def hell_rotation(run: Run, driven: Driven, status: dict, *, stage: str | None =
     need(any(float(distance) > 12 for _, distance, _, _ in altars), "no map-wide altar taken")
     priority = {"freyja", "loki", "niflheim", "thor", "yggdrasil", "valkyrie", "baldur", "odin", "emperium"}
     need(all(altar in priority for altar, _, _, _ in altars), "took an altar not allowed by Hell policy")
-    need(all(raid == "portal" for altar, _, raid, _ in altars if altar == "baldur"),
-         "Baldur taken outside portal window")
     skips = re.findall(r"ALTAR_SKIP id=(\w+) reason=(\w+) t=[\d.]+ raid=(\w+) ref=(\d+)$", log, re.MULTILINE)
-    need(all(altar == "baldur" and raid == "idle" for altar, reason, raid, _ in skips
-             if reason == "baldur_waits_portal"), "invalid Baldur field skip")
     interrupted = {ref for _, reason, _, ref in skips if reason == "channel_interrupted"}
-    need(not any(ref in interrupted for _, _, _, ref in altars), "took an altar after its channel was interrupted")
+    # An interrupted Baldur gets one more try in the calm portal window.
+    need(not any(ref in interrupted for altar, _, raid, ref in altars if not (altar == "baldur" and raid == "portal")),
+         "took an altar after its channel was interrupted")
 
     mvps = list(re.finditer(r"^FARMER \S+ BOSS_WON .* mvps=(\d+) ", log, re.MULTILINE))
     routes = list(re.finditer(r"^FARMER \S+ KARMA_ROUTE side=light mvp=reginleif after_mvp=(\d+) ", log, re.MULTILINE))

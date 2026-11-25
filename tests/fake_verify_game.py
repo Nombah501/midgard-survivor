@@ -250,10 +250,11 @@ def hell_evidence(row):
         log("ALTAR_TAKE id=hel from=25.0 nearby=11 t=120.0 raid=idle ref=2")
     else:
         log("ALTAR_SKIP id=hel reason=hel t=120.0 raid=idle ref=2")
-    skip_raid = "portal" if fault == "wrong-baldur-skip" else "idle"
-    take_raid = "idle" if fault == "baldur-in-field" else "portal"
-    log(f"ALTAR_SKIP id=baldur reason=baldur_waits_portal t=440.0 raid={skip_raid} ref=3")
-    log(f"ALTAR_TAKE id=baldur from=8.0 nearby=0 t=480.0 raid={take_raid} ref=3")
+    if fault != "no-altars":
+        log("ALTAR_TAKE id=baldur from=27.0 nearby=0 t=200.0 raid=idle ref=5")
+    log("ALTAR_SKIP id=baldur reason=channel_interrupted t=440.0 raid=idle ref=3")
+    retake_raid = "idle" if fault == "interrupted-baldur-in-field" else "portal"
+    log(f"ALTAR_TAKE id=baldur from=8.0 nearby=0 t=480.0 raid={retake_raid} ref=3")
     log("ALTAR_SKIP id=thor reason=channel_interrupted t=520.0 raid=idle ref=4")
     if fault == "interrupted-altar-taken":
         log("ALTAR_TAKE id=thor from=8.0 nearby=0 t=521.0 raid=idle ref=4")
