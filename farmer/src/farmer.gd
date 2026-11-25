@@ -44,10 +44,28 @@ const EARLY_ALTAR_RANGE := 12.0
 const EARLY_ALTAR_CROWD := 12
 const COMBAT_CANDIDATES := 8
 # Open ground the hero holds between errands: HOLD_CLEAR free tiles on every
-# side, searched up to HOLD_SEARCH tiles away; HOLD_RADIUS counts as arrived.
+# side, searched on a HOLD_STRIDE grid up to HOLD_SEARCH tiles away; HOLD_RADIUS
+# counts as arrived.
 const HOLD_CLEAR := 3
-const HOLD_SEARCH := 24
+const HOLD_SEARCH := 32
+# When no spot within HOLD_SEARCH reaches HOLD_GOOD_REACH, search this far.
+const HOLD_SEARCH_FAR := 64
+const HOLD_GOOD_REACH := 0.6
+const HOLD_STRIDE := 4
 const HOLD_RADIUS := 1.5
+# Farther than this from the spot after an errand, pick a new one from there.
+const HOLD_REPICK := 10.0
+# A new spot must beat staying put by this much reach after its walking cost.
+const HOLD_MARGIN := 0.1
+# Spot score: share of the spawn ring in a straight line, minus this per step
+# walked to it; a better spot is worth a walk, holding it lasts minutes.
+const HOLD_TRAVEL_COST := 0.002
+const FLOW_STEPS_X: Array[int] = [1, -1, 0, 0]
+const FLOW_STEPS_Y: Array[int] = [0, 0, 1, -1]
+# World._offscreen_point spawns at a random walkable point 15-22 tiles out.
+const SPAWN_NEAR := 15
+const SPAWN_FAR := 22
+const SPAWN_RAYS := 24
 const FIELD_CHARGE_SPEED := 17.0
 const FIELD_CHARGE_DURATION := 0.85
 const HAZARD_MARGIN := 0.3
@@ -173,6 +191,8 @@ var _field_path_map_id := 0
 var _field_path_portal := Vector3.INF
 var _field_progress := 0.0
 var _hold_spot := Vector3.INF
+var _spawn_reach_cache := {}
+var _hold_errand := false
 var _field_best_dist := INF
 var _field_replanned := false
 var _field_failed: Dictionary = {}
@@ -1521,12 +1541,12 @@ func _steer_movement(hero) -> Vector2:
 		_field_exit.clear()
 		_altar_routes.clear()
 		_hold_spot = Vector3.INF
+		_spawn_reach_cache.clear()
 	_raid_goal = false
 	_field_portal = Vector3.INF
 	var goal := _steer_goal(hero)
 	if goal != Vector3.INF:
-		# After any errand, hold a spot near where it ended instead of walking back.
-		_hold_spot = Vector3.INF
+		_hold_errand = true
 	if _raid_goal:
 		_field_path.clear()
 		var to := goal - at
@@ -1834,9 +1854,11 @@ func _steer_open_ground(hero: Player, map: RoMap) -> Vector2:
 		_field_clearance.clear()
 		return Vector2.ZERO
 	# The horde comes to a hero that stands still on open ground: no chasing,
-	# no mobs stuck behind walls, and every kill lands near the hero.
-	if _hold_spot == Vector3.INF:
+	# no mobs stuck behind walls, and every kill lands near the hero. A short
+	# errand walks back; one that ended far away picks again from there.
+	if _hold_spot == Vector3.INF or (_hold_errand and _flat_distance(at, _hold_spot) > HOLD_REPICK):
 		_hold_spot = _pick_hold_spot(hero, map)
+	_hold_errand = false
 	if _flat_distance(at, _hold_spot) > HOLD_RADIUS:
 		var move := _steer_field(hero, map, _hold_spot)
 		if not move.is_zero_approx():
@@ -1845,35 +1867,121 @@ func _steer_open_ground(hero: Player, map: RoMap) -> Vector2:
 	return Vector2.ZERO
 
 
-# The nearest cell with HOLD_CLEAR tiles of open ground on every side, preferring
-# one the hero can walk to in a straight line.
+# Enemies spawn 15-22 tiles out and walk in by a 4-connected flow field, so a
+# spawn with a wall, rock or maze between it and the hero takes the long way
+# round. The best spot sees most of its spawn ring in a straight line.
 func _pick_hold_spot(hero: Player, map: RoMap) -> Vector3:
 	var at := hero.position
 	var c := map.tile_of(at)
-	var fallback := Vector3.INF
-	for r in HOLD_SEARCH + 1:
-		for y in range(c.y - r, c.y + r + 1):
-			for x in range(c.x - r, c.x + r + 1):
-				if maxi(absi(x - c.x), absi(y - c.y)) != r:
+	# Real walking distance: a spot past a wall costs the way round, and a
+	# spot the hero cannot reach at all is never chosen.
+	var walk := _walk_distances(map, c, HOLD_SEARCH_FAR)
+	var side := HOLD_SEARCH_FAR * 2 + 1
+	var best := Vector3.INF
+	var best_score := -INF
+	var best_reach := 0.0
+	var best_walk := 0
+	# Look farther only when nothing nearby is open enough.
+	for search in [HOLD_SEARCH, HOLD_SEARCH_FAR]:
+		if best_reach >= HOLD_GOOD_REACH:
+			break
+		# A grid fixed to the map, so cached scores are reused from any position.
+		var x0: int = c.x - search - posmod(c.x - search, HOLD_STRIDE)
+		var y0: int = c.y - search - posmod(c.y - search, HOLD_STRIDE)
+		for y in range(y0, c.y + search + 1, HOLD_STRIDE):
+			for x in range(x0, c.x + search + 1, HOLD_STRIDE):
+				var dx: int = x - c.x + HOLD_SEARCH_FAR
+				var dy: int = y - c.y + HOLD_SEARCH_FAR
+				if dx < 0 or dy < 0 or dx >= side or dy >= side:
 					continue
-				if x - HOLD_CLEAR < 1 or y - HOLD_CLEAR < 1 \
-						or x + HOLD_CLEAR > map.width - 2 or y + HOLD_CLEAR > map.height - 2:
+				var steps: int = walk[dy * side + dx]
+				if steps < 0 or steps > search * 2:
 					continue
 				if map.blocked_in(x - HOLD_CLEAR, y - HOLD_CLEAR, x + HOLD_CLEAR, y + HOLD_CLEAR) != 0:
 					continue
 				var spot := map.cell_center(x, y)
 				if not _field_goal_available(spot):
 					continue
-				if not _field_line_blocked(map, at, spot, Vector3.INF):
-					_log("HOLD_SPOT tile=%d,%d from=%.1f t=%.1f" % [x, y, _flat_distance(at, spot), float(world.time)])
-					return spot
-				if fallback == Vector3.INF:
-					fallback = spot
-	if fallback != Vector3.INF:
-		_log("HOLD_SPOT tile=%s from=%.1f t=%.1f detour=true" % [
-			str(map.tile_of(fallback)), _flat_distance(at, fallback), float(world.time)])
-		return fallback
-	return at
+				var reach := _spawn_reach(map, x, y)
+				var score := reach - float(steps) * HOLD_TRAVEL_COST
+				if score > best_score:
+					best_score = score
+					best_reach = reach
+					best_walk = steps
+					best = spot
+	var here := _spawn_reach(map, c.x, c.y)
+	# Walking costs kills: move only for a clearly better spot.
+	if best == Vector3.INF or best_score < here + HOLD_MARGIN:
+		_log("HOLD_SPOT stay reach=%.2f t=%.1f" % [here, float(world.time)])
+		return at
+	var tile := map.tile_of(best)
+	_log("HOLD_SPOT tile=%d,%d walk=%d reach=%.2f here=%.2f t=%.1f" % [
+		tile.x, tile.y, best_walk, best_reach, here, float(world.time)])
+	return best
+
+
+# 4-connected walking steps from a tile to every tile within radius (-1 if
+# unreachable inside the square), the way the horde's flow field measures them.
+func _walk_distances(map: RoMap, c: Vector2i, radius: int) -> PackedInt32Array:
+	var side := radius * 2 + 1
+	var dist := PackedInt32Array()
+	dist.resize(side * side)
+	dist.fill(-1)
+	if not map.cell_walkable(c.x, c.y):
+		return dist
+	var queue := PackedInt32Array()
+	queue.resize(side * side)
+	var start := radius * side + radius
+	dist[start] = 0
+	queue[0] = start
+	var head := 0
+	var tail := 1
+	var ox := c.x - radius
+	var oy := c.y - radius
+	while head < tail:
+		var i := queue[head]
+		head += 1
+		var lx := i % side
+		var ly := i / side
+		var d := dist[i] + 1
+		for k in 4:
+			var nx: int = lx + FLOW_STEPS_X[k]
+			var ny: int = ly + FLOW_STEPS_Y[k]
+			if nx < 0 or ny < 0 or nx >= side or ny >= side:
+				continue
+			var n := ny * side + nx
+			if dist[n] >= 0 or not map.cell_walkable(ox + nx, oy + ny):
+				continue
+			dist[n] = d
+			queue[tail] = n
+			tail += 1
+	return dist
+
+
+# Share of walkable spawn-ring cells around a tile with no wall between them
+# and the tile, sampled like the game samples spawns: uniform angle and distance.
+func _spawn_reach(map: RoMap, x: int, y: int) -> float:
+	var key := Vector2i(x, y)
+	if _spawn_reach_cache.has(key):
+		return float(_spawn_reach_cache[key])
+	var direct := 0
+	var total := 0
+	for i in SPAWN_RAYS:
+		var a := TAU * float(i) / SPAWN_RAYS
+		var ux := cos(a)
+		var uy := sin(a)
+		var clear := true
+		for r in range(1, SPAWN_FAR + 1):
+			var walk := map.cell_walkable(x + roundi(ux * r), y + roundi(uy * r))
+			if not walk:
+				clear = false
+			elif r >= SPAWN_NEAR:
+				total += 1
+				if clear:
+					direct += 1
+	var reach := float(direct) / float(total) if total > 0 else 0.0
+	_spawn_reach_cache[key] = reach
+	return reach
 
 
 # Bot.steer treats every class with a cast pose (the whole Acolyte line) as
