@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.4.6] - 2026-11-25
+
+- The farmer holds a spot: between altars and MVPs it picks the nearest open ground (7×7 tiles free, reachable in a straight line), walks there and stands still so the horde comes to it, instead of roaming. After an altar it holds near that altar rather than walking back.
+
 ## [0.4.5] - 2026-11-25
 
 - Melee heroes fight instead of kiting: the game's own steering treats the whole Acolyte line (Monk, Champion) as ranged casters and keeps them 4–7 units from enemies, out of mace reach. The farmer now steers by the basic attack's real reach, picks lone enemies first and skips enemies behind a wall.
