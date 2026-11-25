@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.4.7] - 2026-11-25
+
+- Smarter farming spot: the farmer scores open ground by how much of the area where enemies spawn (15–22 tiles out) has a straight path to it, and holds the best spot within 32 tiles. Enemies then come straight at the hero instead of walking around walls, rocks and mazes. It moves only for a clearly better spot, and after a short errand or dodge it walks back instead of picking a new one.
+
 ## [0.4.6] - 2026-11-25
 
 - The farmer holds a spot: between altars and MVPs it picks the nearest open ground (7×7 tiles free, reachable in a straight line), walks there and stands still so the horde comes to it, instead of roaming. After an altar it holds near that altar rather than walking back.
