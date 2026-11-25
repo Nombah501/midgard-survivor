@@ -37,6 +37,12 @@ const FIELD_NEIGHBORS := [Vector2i.RIGHT, Vector2i.DOWN, Vector2i.LEFT, Vector2i
 const PORTAL_CLEARANCE := 1.4
 const ALTAR_NO_PROGRESS := 5.0 # Allows Baldur's four-second calm window.
 const PICKUP_RANGE := 22.0
+# Until this hero level the farmer fights near where it stands: far altars and
+# the golden runner drag a fragile hero through Hell hordes.
+const EARLY_LEVEL := 20
+const EARLY_ALTAR_RANGE := 12.0
+const EARLY_ALTAR_CROWD := 12
+const COMBAT_CANDIDATES := 8
 const FIELD_CHARGE_SPEED := 17.0
 const FIELD_CHARGE_DURATION := 0.85
 const HAZARD_MARGIN := 0.3
@@ -1529,7 +1535,7 @@ func _steer_movement(hero) -> Vector2:
 			return field_move
 	else:
 		_field_path.clear()
-	return Bot.steer(world, Vector3.INF, hero) if arena else _steer_open_ground(hero, map)
+	return _combat_steer(hero) if arena else _steer_open_ground(hero, map)
 
 
 func _kite_starfall(hero: Player, raid) -> Vector2:
@@ -1807,7 +1813,7 @@ func _steer_open_ground(hero: Player, map: RoMap) -> Vector2:
 	var at := hero.position
 	var cell := map.tile_of(at)
 	if not Rect2i(1, 1, map.width - 2, map.height - 2).has_point(cell):
-		return Bot.steer(world, Vector3.INF, hero)
+		return _combat_steer(hero)
 	var index := cell.y * map.width + cell.x
 	var exit := _field_exit[index]
 	if exit != 0 and _field_clearance[index] == 1:
@@ -1817,7 +1823,7 @@ func _steer_open_ground(hero: Player, map: RoMap) -> Vector2:
 			return _field_input(hero, goal)
 		_field_clearance.clear()
 		return Vector2.ZERO
-	var preferred := Bot.steer(world, Vector3.INF, hero)
+	var preferred := _combat_steer(hero)
 	if preferred != Vector2.ZERO and _open_room_ahead(map, at, preferred) == FIELD_OPEN:
 		return preferred
 	var best := Vector2.ZERO
@@ -1852,6 +1858,73 @@ func _open_room_ahead(map: RoMap, at: Vector3, dir: Vector2) -> int:
 	var end := map.tile_of(ahead)
 	return mini(_field_clearance[mid.y * map.width + mid.x], _field_clearance[end.y * map.width + end.x])
 
+
+# Bot.steer treats every class with a cast pose (the whole Acolyte line) as
+# ranged and holds 4-7 units off, so a melee basic attack and every proc on it
+# never lands. Same scoring, with the stance taken from the basic attack, a
+# preference for lone targets in a straight line (a wall means a detour) and no
+# loot pull (the magnet and pet collect it).
+func _combat_steer(hero: Player) -> Vector2:
+	var pos := hero.position
+	var near: Array[Enemy] = world.enemies_in_radius(pos, Bot.SENSE)
+	var hp_ratio := float(hero.hp) / maxf(1.0, float(hero.max_hp))
+	var ranged := bool(hero.def.basic.get("ranged", false))
+	var bold := not ranged and hp_ratio > 0.5
+	var target: Enemy = null
+	var pack := 0
+	var gap := INF
+	var close: Array = world.enemies_in_radius(pos, 14.0).filter(func(e: Enemy) -> bool: return not e.dead)
+	close.sort_custom(func(a: Enemy, b: Enemy) -> bool:
+		return pos.distance_squared_to(a.position) < pos.distance_squared_to(b.position))
+	# Hordes can hold hundreds of enemies; the nearest few decide the target.
+	for e: Enemy in close.slice(0, COMBAT_CANDIDATES):
+		if _field_line_blocked(world.map, pos, e.position, Vector3.INF):
+			continue
+		var crowd: int = world.enemies_in_radius(e.position, 2.5).size()
+		# A pack counts as farther away, so a lone enemy nearby wins.
+		var score := _flat_distance(pos, e.position) + 2.0 * float(maxi(0, crowd - 1))
+		if score < gap:
+			gap = score
+			target = e
+			pack = crowd
+	var prev: Vector3 = Bot._prev.get(hero.get_instance_id(), Vector3.ZERO)
+	var best := Vector3.ZERO
+	var best_score := -INF
+	for i in Bot.DIRS:
+		var a := TAU * float(i) / Bot.DIRS
+		var d := Vector3(cos(a), 0.0, sin(a))
+		var ahead := pos + d * Bot.LOOK
+		if not world.map.is_walkable(pos + d * 0.8) or not world.map.is_walkable(ahead):
+			continue
+		var score := -Bot._danger(world, near, ahead) * (0.3 if bold else 1.0)
+		var room := 0
+		for k in [-1, 0, 1]:
+			var b: float = a + k * 0.6
+			if world.map.is_walkable(ahead + Vector3(cos(b), 0.0, sin(b)) * 2.5):
+				room += 1
+		score -= (3 - room) * 0.6
+		score -= Bot._shot_danger(world, hero, d)
+		if target != null:
+			var to := (target.position - pos) * Vector3(1, 0, 1)
+			var dist := to.length()
+			to = to.normalized()
+			if bold and pack < 7:
+				score += d.dot(to) * 1.5
+			elif bold and hp_ratio > 0.75:
+				score += d.dot(to) * 0.9
+			elif ranged and dist < 4.0:
+				score -= d.dot(to) * 0.8
+			elif ranged and dist > 7.0:
+				score += d.dot(to) * 0.6
+		score += d.dot(prev) * 0.25
+		score += d.dot((-pos * Vector3(1, 0, 1)).normalized()) * 0.05
+		if score > best_score:
+			best_score = score
+			best = d
+	if best == Vector3.ZERO:
+		return Vector2.ZERO
+	Bot._prev[hero.get_instance_id()] = best
+	return Vector2(best.x, best.z)
 
 
 func _steer_goal(hero) -> Vector3:
@@ -1896,7 +1969,8 @@ func _steer_goal(hero) -> Vector3:
 	var runner = world.runner
 	if runner != null and is_instance_valid(runner) and not bool(runner.dead):
 		var rp: Vector3 = runner.position
-		if _field_goal_available(rp) and (_flat_distance(rp, hero.position) <= 40.0 or _following_field_goal(rp)):
+		if hero.level >= EARLY_LEVEL and _field_goal_available(rp) \
+				and (_flat_distance(rp, hero.position) <= 40.0 or _following_field_goal(rp)):
 			return rp
 	var pick := _best_pickup(hero)
 	if pick != Vector3.INF:
@@ -2006,8 +2080,8 @@ func _avoid_portal(start: Vector3, goal: Vector3, normal: Vector3) -> Vector3:
 
 
 func _altar_skip(entry: Dictionary, reason: String) -> void:
-	if reason == "expires_first" or reason == "unreachable":
-		# Position and speed can change while we pursue another altar.
+	if reason in ["expires_first", "unreachable", "too_early"]:
+		# Position, speed and level can change while we pursue another altar.
 		if entry.has(reason):
 			return
 		entry[reason] = true
@@ -2107,6 +2181,11 @@ func _map_altar_goal(hero, baldur_only := false) -> Vector3:
 		# Baldur needs four seconds without a hit; a calm portal window gets one more try.
 		var retry: bool = baldur_only and entry.get("skip") == "channel_interrupted" and not entry.has("portal_retry")
 		if entry.has("skip") and not retry:
+			continue
+		if not baldur_only and hero.level < EARLY_LEVEL and (
+				_flat_distance(hero.position, a.pos) > EARLY_ALTAR_RANGE
+				or world.enemies_in_radius(a.pos, 5.0).size() > EARLY_ALTAR_CROWD):
+			_altar_skip(entry, "too_early")
 			continue
 		var pos: Vector3 = a.pos
 		var target := _altar_target(hero, pos, avoid)
@@ -3435,6 +3514,8 @@ func _test_tick_navigation() -> bool:
 		_direct_grid = null
 		_field_map_id = 0
 		hero.position = Vector3(start.x, map.height_at(start), start.z)
+		# The maze tests map-wide navigation, which starts after the early levels.
+		hero.level = EARLY_LEVEL
 		var bait := map.cell_center(229, 50)
 		world.altars.spawn("freyja", bait)
 		var short: Dictionary = world.altars.waiting.back()

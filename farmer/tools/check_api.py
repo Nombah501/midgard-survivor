@@ -60,7 +60,7 @@ def members(path: Path) -> set[str]:
     out: set[str] = set()
     for pat in (
         r"^\s*(?:static\s+)?func\s+([A-Za-z_]\w*)",
-        r"^\s*var\s+([A-Za-z_]\w*)",
+        r"^\s*(?:static\s+)?var\s+([A-Za-z_]\w*)",
         r"^\s*const\s+([A-Za-z_]\w*)",
         r"^\s*@export(?:_\w+)?\s+var\s+([A-Za-z_]\w*)",
     ):

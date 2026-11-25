@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- Melee heroes fight instead of kiting: the game's own steering treats the whole Acolyte line (Monk, Champion) as ranged casters and keeps them 4–7 units from enemies, out of mace reach. The farmer now steers by the basic attack's real reach, picks lone enemies first and skips enemies behind a wall.
+- Early game: until hero level 20 the farmer only takes altars close by and not inside a horde, and ignores the golden runner, so a fragile hero levels up near where it stands.
+
 ## [0.4.4] - 2026-11-25
 
 - Altars come first: the farmer heads for the best altar before the golden runner and pickups, and takes Baldur as soon as it can (an interrupted Baldur gets one more try at the MVP portal).
