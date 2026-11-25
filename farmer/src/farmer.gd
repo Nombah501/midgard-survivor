@@ -43,6 +43,11 @@ const EARLY_LEVEL := 20
 const EARLY_ALTAR_RANGE := 12.0
 const EARLY_ALTAR_CROWD := 12
 const COMBAT_CANDIDATES := 8
+# Open ground the hero holds between errands: HOLD_CLEAR free tiles on every
+# side, searched up to HOLD_SEARCH tiles away; HOLD_RADIUS counts as arrived.
+const HOLD_CLEAR := 3
+const HOLD_SEARCH := 24
+const HOLD_RADIUS := 1.5
 const FIELD_CHARGE_SPEED := 17.0
 const FIELD_CHARGE_DURATION := 0.85
 const HAZARD_MARGIN := 0.3
@@ -167,6 +172,7 @@ var _field_tile := Vector2i(-1, -1)
 var _field_path_map_id := 0
 var _field_path_portal := Vector3.INF
 var _field_progress := 0.0
+var _hold_spot := Vector3.INF
 var _field_best_dist := INF
 var _field_replanned := false
 var _field_failed: Dictionary = {}
@@ -1514,9 +1520,13 @@ func _steer_movement(hero) -> Vector2:
 		_field_clearance.clear()
 		_field_exit.clear()
 		_altar_routes.clear()
+		_hold_spot = Vector3.INF
 	_raid_goal = false
 	_field_portal = Vector3.INF
 	var goal := _steer_goal(hero)
+	if goal != Vector3.INF:
+		# After any errand, hold a spot near where it ended instead of walking back.
+		_hold_spot = Vector3.INF
 	if _raid_goal:
 		_field_path.clear()
 		var to := goal - at
@@ -1823,40 +1833,47 @@ func _steer_open_ground(hero: Player, map: RoMap) -> Vector2:
 			return _field_input(hero, goal)
 		_field_clearance.clear()
 		return Vector2.ZERO
-	var preferred := _combat_steer(hero)
-	if preferred != Vector2.ZERO and _open_room_ahead(map, at, preferred) == FIELD_OPEN:
-		return preferred
-	var best := Vector2.ZERO
-	var best_score := -INF
-	for i in 16:
-		var dir := Vector2.RIGHT.rotated(float(i) * TAU / 16.0)
-		var room := _open_room_ahead(map, at, dir)
-		if room == 0:
-			continue
-		var score := float(room) + 1.6 * dir.dot(preferred)
-		if score > best_score:
-			best_score = score
-			best = dir
-	if best != Vector2.ZERO:
-		return best
-	# An entirely cramped component might not have a five-by-five opening.
-	for d in FIELD_NEIGHBORS:
-		var next: Vector2i = cell + d
-		if map.cell_walkable(next.x, next.y):
-			var goal := map.cell_center(next.x, next.y)
-			if not _field_line_blocked(map, at, goal, Vector3.INF):
-				return _field_input(hero, goal)
+	# The horde comes to a hero that stands still on open ground: no chasing,
+	# no mobs stuck behind walls, and every kill lands near the hero.
+	if _hold_spot == Vector3.INF:
+		_hold_spot = _pick_hold_spot(hero, map)
+	if _flat_distance(at, _hold_spot) > HOLD_RADIUS:
+		var move := _steer_field(hero, map, _hold_spot)
+		if not move.is_zero_approx():
+			return move
+		_hold_spot = at
 	return Vector2.ZERO
 
 
-func _open_room_ahead(map: RoMap, at: Vector3, dir: Vector2) -> int:
-	var step := Vector3(dir.x, 0.0, dir.y)
-	var ahead := at + step * 2.5
-	if _field_line_blocked(map, at, ahead, Vector3.INF):
-		return 0
-	var mid := map.tile_of(at + step * 1.25)
-	var end := map.tile_of(ahead)
-	return mini(_field_clearance[mid.y * map.width + mid.x], _field_clearance[end.y * map.width + end.x])
+# The nearest cell with HOLD_CLEAR tiles of open ground on every side, preferring
+# one the hero can walk to in a straight line.
+func _pick_hold_spot(hero: Player, map: RoMap) -> Vector3:
+	var at := hero.position
+	var c := map.tile_of(at)
+	var fallback := Vector3.INF
+	for r in HOLD_SEARCH + 1:
+		for y in range(c.y - r, c.y + r + 1):
+			for x in range(c.x - r, c.x + r + 1):
+				if maxi(absi(x - c.x), absi(y - c.y)) != r:
+					continue
+				if x - HOLD_CLEAR < 1 or y - HOLD_CLEAR < 1 \
+						or x + HOLD_CLEAR > map.width - 2 or y + HOLD_CLEAR > map.height - 2:
+					continue
+				if map.blocked_in(x - HOLD_CLEAR, y - HOLD_CLEAR, x + HOLD_CLEAR, y + HOLD_CLEAR) != 0:
+					continue
+				var spot := map.cell_center(x, y)
+				if not _field_goal_available(spot):
+					continue
+				if not _field_line_blocked(map, at, spot, Vector3.INF):
+					_log("HOLD_SPOT tile=%d,%d from=%.1f t=%.1f" % [x, y, _flat_distance(at, spot), float(world.time)])
+					return spot
+				if fallback == Vector3.INF:
+					fallback = spot
+	if fallback != Vector3.INF:
+		_log("HOLD_SPOT tile=%s from=%.1f t=%.1f detour=true" % [
+			str(map.tile_of(fallback)), _flat_distance(at, fallback), float(world.time)])
+		return fallback
+	return at
 
 
 # Bot.steer treats every class with a cast pose (the whole Acolyte line) as
