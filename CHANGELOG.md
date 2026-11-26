@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.8] - 2026-11-26
+
+- Game 0.2.11: the farmer now meets the Wandering Kafra (Sage upgrade) that the game hides from autopilot. It walks to her as soon as she appears, ahead of altars, and takes the first help she offers from this list: Kafra Sweep, Golden Poring, Level 99 Power, Emperium Blessing.
+- Game 0.2.11: after the 40:00 finale the farmer fights Morroc II, III... instead of ending the run. Each win pays Elunium, Oridecon and Star Crumbs, and a fall still ends the run as a victory.
+- Corrupt Chests are always opened instead of a coin flip between opening and purifying: each Hel mark gives +8% damage and a level. The farmer opens a chest as soon as it drops, waiting until the hero is at half HP or more because opening costs 25% of max HP.
+
 ## [0.4.7] - 2026-11-25
 
 - Smarter farming spot: the farmer scores open ground by how much of the area where enemies spawn (15–22 tiles out) has a straight path to it, and holds the best spot within 32 tiles. Enemies then come straight at the hero instead of walking around walls, rocks and mazes. It moves only for a clearly better spot, and after a short errand or dodge it walks back instead of picking a new one.
