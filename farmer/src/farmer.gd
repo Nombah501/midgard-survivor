@@ -42,6 +42,16 @@ const PICKUP_RANGE := 22.0
 const EARLY_LEVEL := 20
 const EARLY_ALTAR_RANGE := 12.0
 const EARLY_ALTAR_CROWD := 12
+# Wandering Kafra (0.2.11) helps, best first. Emperium is always offered, so a
+# help is always taken; MVP/Valkyrie HP cuts and Ymir are skipped because the
+# farmer's MVPs die within a second anyway.
+const KAFRA_PICKS := ["sweep", "golden", "star", "emperium"]
+# Morroc II, III... after the 40:00 finale (0.2.11): each win pays ores and Star
+# Crumbs, and a fall still ends the run as a victory, so keep fighting.
+const MORROC_REMATCHES := 99
+# Open a Corrupt Chest only at or above this share of max HP; it costs 25%.
+const CORRUPT_OPEN_HP := 0.5
+const CORRUPT_HOLD_MS := 500
 const COMBAT_CANDIDATES := 8
 # Open ground the hero holds between errands: HOLD_CLEAR free tiles on every
 # side, searched on a HOLD_STRIDE grid up to HOLD_SEARCH tiles away; HOLD_RADIUS
@@ -128,6 +138,7 @@ var _altar_progress_clock := 0.0
 var _altar_routes: Dictionary = {}
 var _altar_route_from := Vector2i(-1, -1)
 var _altar_route_at := Vector3.INF
+var _kafra_ref := 0
 var _altar_route_portal := Vector3.INF
 
 var _time_last := -1.0
@@ -459,6 +470,7 @@ func _prepare_run() -> void:
 	_direct_progress_ms = -1
 	_direct_grid = null
 	_field_map_id = 0
+	_kafra_ref = 0
 	_set_autopilot_flags(true)
 	if choice.is_empty():
 		world.set_stage(active_stage)
@@ -470,6 +482,11 @@ func _prepare_run() -> void:
 		# 0.2.5 suppresses the finale on autopilot unless this meta is set.
 		if _want_endless() and not GameData.has_meta("finale_at"):
 			GameData.set_meta("finale_at", GameData.MORROC_FINALE.at)
+		# 0.2.11 ends the run after the first finale on autopilot unless this
+		# meta allows rematches, and hides the Wandering Kafra from autopilot.
+		if _want_endless():
+			GameData.set_meta("morroc_again", MORROC_REMATCHES)
+		GameData.set_meta("kafra_walk_test", true)
 		if _test_blocked_portal:
 			GameData.set_meta("mvp_at", 2.0)
 		elif _test_env("EARLY_MVP") == "1":
@@ -592,6 +609,8 @@ func _tick_run(now: int) -> void:
 	_replace_player_input()
 	_handle_job_change(world.player)
 	_draft_player()
+	_serve_kafra()
+	_open_corrupt_chests()
 	if _test_valkyrie:
 		if world.running:
 			_test_tick_valkyrie()
@@ -1194,13 +1213,83 @@ func _results_forced(reason: String, now: int) -> void:
 # ---------------------------------------------------------------------------
 # Level-up draft
 # ---------------------------------------------------------------------------
-
 func _draft_player() -> void:
 	# Menus.auto_pick is needed for loot and job dialogs, but uses Bot.pick_choice
 	# for levels. Run before the World tick and let its native timer pace picks.
 	if world.running and world.player.pending_levels > 0 and world._level_up_delay <= 0.0 \
 			and not world.busy() and not world.loot_waits_for_me():
 		world._auto_pick()
+
+
+# The Wandering Kafra waits 40 s on the map; reaching her opens a paused choice
+# that the farmer answers the way the native card button does.
+func _serve_kafra() -> void:
+	if not world.running:
+		return
+	var kw = world.kafra_walk
+	var k: Dictionary = kw.kafra
+	if str(world.menus._mode) == "kafra_walk":
+		var opts: Array = k.get("opts", [])
+		var pick := ""
+		for id in KAFRA_PICKS:
+			if opts.has(id):
+				pick = id
+				break
+		get_tree().paused = false
+		world.menus.close()
+		if pick.is_empty():
+			kw.declined()
+		else:
+			kw.pick(pick)
+		_log("KAFRA_PICK id=%s opts=%s t=%.1f" % [pick if pick != "" else "none", str(opts), float(world.time)])
+		_kafra_ref = 0
+		return
+	if k.is_empty():
+		if _kafra_ref != 0:
+			_log("KAFRA_MISSED raid=%s t=%.1f" % [str(world.raid.state), float(world.time)])
+			_kafra_ref = 0
+		return
+	var ref := int((k["node"] as Object).get_instance_id())
+	if ref != _kafra_ref:
+		_kafra_ref = ref
+		_log("KAFRA_SEEN from=%.1f life=%.1f opts=%s t=%.1f" % [
+			_flat_distance(k["pos"], world.player.position), float(k["life"]), str(k["opts"]), float(world.time)])
+
+
+func _kafra_goal() -> Vector3:
+	var k: Dictionary = world.kafra_walk.kafra
+	if k.is_empty():
+		return Vector3.INF
+	var at: Vector3 = k["pos"]
+	return at if _field_goal_available(at) else Vector3.INF
+
+
+# Native autopilot flips a coin between opening and purifying a Corrupt Chest
+# (karma.gd chest_choice). Open each one as soon as it drops, as the Operator
+# does by hand: a Hel mark is +8% damage and a level for 25% of max HP. Below
+# CORRUPT_OPEN_HP the farmer holds all chests so the coin flip cannot take it.
+func _open_corrupt_chests() -> void:
+	if not world.running or world.busy() or not is_instance_valid(world.karma):
+		return
+	var hero = world.player
+	if bool(hero.downed) or bool(hero.fell):
+		return
+	for i in range(world.pickups.size() - 1, -1, -1):
+		var p = world.pickups[i]
+		if not (p is Dictionary) or str(p.get("kind", "")) != "chest" or not bool(p.get("corrupt", false)):
+			continue
+		if float(hero.hp) < float(hero.max_hp) * CORRUPT_OPEN_HP:
+			world._chests_held = maxi(int(world._chests_held), Time.get_ticks_msec() + CORRUPT_HOLD_MS)
+			return
+		var node = p.get("node", null)
+		var at: Vector3 = hero.position
+		if node != null and is_instance_valid(node):
+			at = node.position
+			node.queue_free()
+		world.pickups.remove_at(i)
+		world.karma.open_chest(at, hero)
+		_log("CORRUPT_OPEN marks=%d hp=%.0f%% t=%.1f" % [
+			int(hero.hel_marks), 100.0 * float(hero.hp) / maxf(1.0, float(hero.max_hp)), float(world.time)])
 
 func _handle_job_change(h) -> void:
 	if h == null or not is_instance_valid(h):
@@ -2087,6 +2176,10 @@ func _steer_goal(hero) -> Vector3:
 	if morroc_goal != Vector3.INF:
 		_raid_goal = true
 		return morroc_goal
+	# The Kafra leaves in 40 s and her help outweighs an altar.
+	var kafra := _kafra_goal()
+	if kafra != Vector3.INF:
+		return kafra
 	# Altars speed up the run and raise drops: take them before anything optional.
 	var altar := _map_altar_goal(hero) if map_wide else _best_altar(hero)
 	if altar != Vector3.INF:
