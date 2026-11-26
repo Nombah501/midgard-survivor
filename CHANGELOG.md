@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.4.9] - 2026-11-26
+
+- Fewer deaths at the start of a run: until hero level 20 the farmer fights lone enemies and backs off when hurt, instead of standing on a spot where the horde surrounded the still-weak hero. In 1.5-minute test runs on every location, falls in the first 30 s dropped from 47% of runs to 16%, and deaths in the first 90 s from 23% to 14%.
+
 ## [0.4.8] - 2026-11-26
 
 - Game 0.2.11: the farmer now meets the Wandering Kafra (Sage upgrade) that the game hides from autopilot. It walks to her as soon as she appears, ahead of altars, and takes the first help she offers from this list: Kafra Sweep, Golden Poring, Level 99 Power, Emperium Blessing.
