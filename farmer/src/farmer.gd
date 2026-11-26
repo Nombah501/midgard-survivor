@@ -956,8 +956,8 @@ func _on_player_fell(cause: Dictionary, piercing: bool, revives_left: int) -> vo
 		what = "unknown"
 	var counts: Dictionary = run_state["falls_by_mechanic"]
 	counts[what] = int(counts.get(what, 0)) + 1
-	_log("PLAYER_FELL t=%.1f by=%s what=%s piercing=%s revives_left=%d" % [
-		float(world.time), by if not by.is_empty() else "unknown", what, str(piercing), revives_left])
+	_log("PLAYER_FELL t=%.1f by=%s what=%s piercing=%s revives_left=%d level=%d" % [
+		float(world.time), by if not by.is_empty() else "unknown", what, str(piercing), revives_left, int(world.player.level)])
 
 
 func _begin_settle(now: int) -> void:
@@ -1654,7 +1654,15 @@ func _steer_movement(hero) -> Vector2:
 			return field_move
 	else:
 		_field_path.clear()
-	return _combat_steer(hero) if arena else _steer_open_ground(hero, map)
+	if arena:
+		return _combat_steer(hero)
+	# Holding a spot from the start, a low-level hero is surrounded and falls to
+	# melee hits in the first half minute (47% of short sandbox runs, against
+	# 16% when fighting). Until EARLY_LEVEL it fights lone enemies and backs off
+	# below half HP, then holds open ground.
+	if hero.level < EARLY_LEVEL:
+		return _combat_steer(hero)
+	return _steer_open_ground(hero, map)
 
 
 func _kite_starfall(hero: Player, raid) -> Vector2:
